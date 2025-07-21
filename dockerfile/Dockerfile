@@ -153,10 +153,9 @@ ENV TT_METAL_HOME=/tt-metal
 ENV PYTHONPATH=/tt-metal
 
 # Build tt-metal
-RUN /bin/bash -c "git clone https://github.com/tenstorrent-metal/tt-metal.git ${TT_METAL_HOME} \
+RUN /bin/bash -c "git clone --filter=blob:none --recurse-submodules --tags \
+    https://github.com/tenstorrent/tt-metal.git ${TT_METAL_HOME} \
     && cd ${TT_METAL_HOME} \
-    && git checkout ${TT_METAL_COMMIT_SHA_OR_TAG} \
-    && git submodule update --init --recursive \
     && bash ./build_metal.sh \
     && bash ./create_venv.sh \
     && source ${PYTHON_ENV_DIR}/bin/activate \
