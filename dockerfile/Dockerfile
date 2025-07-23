@@ -152,14 +152,17 @@ ENV PYTHON_ENV_DIR=/opt/venv
 ENV TT_METAL_HOME=/tt-metal
 ENV PYTHONPATH=/tt-metal
 
-# Build tt-metal
+# Clone tt-metal
 RUN /bin/bash -c "git clone --filter=blob:none --recurse-submodules --tags \
     https://github.com/tenstorrent/tt-metal.git ${TT_METAL_HOME} \
-    && cd ${TT_METAL_HOME} \
-    && bash ./build_metal.sh \
-    && bash ./create_venv.sh \
-    && source ${PYTHON_ENV_DIR}/bin/activate \
-    && pip install -r models/tt_transformers/requirements.txt"
+    && cd ${TT_METAL_HOME}"
+
+WORKDIR /tt-metal
+
+# Build tt-metal and venv
+run /bin/bash -c "./build_metal.sh"
+run /bin/bash -c "./create_venv.sh"
+run /bin/bash -c "pip install -r models/tt_transformers/requirements.txt"
 
 # Ensure the virtual environment is used for all Python-related commands
 ENV PATH="$PYTHON_ENV_DIR/bin:$PATH"
