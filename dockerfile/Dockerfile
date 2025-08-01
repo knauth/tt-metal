@@ -145,7 +145,31 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 #############################################################
 
-FROM base AS release
+FROM base AS release-ttnn
+
+# Set up virtual environment
+ENV PYTHON_ENV_DIR=/opt/venv
+RUN python3 -m venv $PYTHON_ENV_DIR
+
+# Ensure the virtual environment is used for all Python-related commands
+ENV PATH="$PYTHON_ENV_DIR/bin:$PATH"
+ENV VIRTUAL_ENV="$PYTHON_ENV_DIR"
+
+# Ensure the virtual environment is activated on shell startup
+RUN echo "source $PYTHON_ENV_DIR/bin/activate" >> /etc/bash.bashrc
+
+RUN mkdir -p /etc && \
+    echo "[global]\nextra-index-url = https://download.pytorch.org/whl/cpu" > /etc/pip.conf
+
+ARG WHEEL_FILENAME
+ADD $WHEEL_FILENAME $WHEEL_FILENAME
+RUN pip3 install $WHEEL_FILENAME
+# Set up virtual environment
+RUN python3 -m venv $PYTHON_ENV_DIR
+
+#############################################################
+
+FROM base AS release-devel
 
 # Set up virtual environment and TT_METAL_HOME
 ENV PYTHON_ENV_DIR=/opt/venv
