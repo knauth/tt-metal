@@ -145,7 +145,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 #############################################################
 
-FROM base AS release-ttnn
+FROM base AS tt-metalium-ttnn
 
 # Set up virtual environment
 ENV PYTHON_ENV_DIR=/opt/venv
@@ -169,7 +169,7 @@ RUN python3 -m venv $PYTHON_ENV_DIR
 
 #############################################################
 
-FROM base AS release-devel
+FROM base AS tt-metalium-devel
 
 # Set up virtual environment and TT_METAL_HOME
 ENV PYTHON_ENV_DIR=/opt/venv
