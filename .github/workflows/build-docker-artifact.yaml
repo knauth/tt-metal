@@ -25,6 +25,12 @@ on:
       dev-tag:
         description: "Docker tag for the dev Docker image for developing TT-Metalium et al"
         value: ${{ jobs.check-docker-images.outputs.dev-tag }}
+      tt-metalium-devel-tag:
+        description: "Docker tag for the public-facing tt-metalium-devel image"
+        value: ${{ jobs.check-docker-images.outputs.tt-metalium-devel-tag }}
+      tt-metalium-ttnn-tag:
+        description: "Docker tag for the public-facing tt-metalium-ttnn image"
+        value: ${{ jobs.check-docker-images.outputs.tt-metalium-ttnn-tag }}
       basic-dev-tag:
         description: "Docker tag for the basic dev Docker image for basic development"
         value: ${{ jobs.check-docker-images.outputs.basic-dev-tag }}
@@ -62,6 +68,8 @@ env:
   DEV_IMAGE_NAME: ${{ inputs.distro }}-${{ inputs.version }}-dev-${{ inputs.architecture }}
   BASIC_DEV_IMAGE_NAME: ${{ inputs.distro }}-${{ inputs.version }}-basic-dev-${{ inputs.architecture }}
   BASIC_TTNN_RUNTIME_IMAGE_NAME: ${{ inputs.distro }}-${{ inputs.version }}-basic-ttnn-runtime-${{ inputs.architecture }}
+  TT_METALIUM_TTNN_IMAGE_NAME: ${{ inputs.distro }}-${{ inputs.version }}-tt-metalium-ttnn-${{ inputs.architecture }}
+  TT_METALIUM_DEVEL_IMAGE_NAME: ${{ inputs.distro }}-${{ inputs.version }}-tt-metalium-devel-${{ inputs.architecture }}
   MANYLINUX_IMAGE_NAME: manylinux-${{ inputs.architecture }}
 
 jobs:
@@ -78,6 +86,10 @@ jobs:
       basic-dev-tag: ${{ steps.tags.outputs.basic-dev-tag }}
       basic-ttnn-runtime-exists: ${{ steps.images.outputs.basic-ttnn-runtime-exists }}
       basic-ttnn-runtime-tag: ${{ steps.tags.outputs.basic-ttnn-runtime-tag }}
+      tt-metalium-ttnn-tag: ${{ steps.tags.outputs.tt-metalium-ttnn-tag }}
+      tt-metalium-ttnn-exists: ${{ steps.images.outputs.tt-metalium-ttnn-exists }}
+      tt-metalium-devel-tag: ${{ steps.tags.outputs.tt-metalium-devel-tag }}
+      tt-metalium-devel-exists: ${{ steps.images.outputs.tt-metalium-devel-exists }}
       manylinux-exists: ${{ steps.images.outputs.manylinux-exists }}
       manylinux-tag: ${{ steps.tags.outputs.manylinux-tag }}
     steps:
@@ -101,6 +113,8 @@ jobs:
           echo "ci-build-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.CI_BUILD_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
           echo "ci-test-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.CI_TEST_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
           echo "dev-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.DEV_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
+          echo "dev-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.TT_METALIUM_TTNN_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
+          echo "dev-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.TT_METALIUM_DEVEL_IMAGE_NAME }}:${HASH}" >> $GITHUB_OUTPUT
 
           BASIC_DEV_HASH=$(cat dockerfile/Dockerfile.basic-dev | sha1sum | cut -d' ' -f1)
           echo "basic-dev-tag=ghcr.io/${{ github.repository }}/tt-metalium/${{ env.BASIC_DEV_IMAGE_NAME }}:${BASIC_DEV_HASH}" >> $GITHUB_OUTPUT
@@ -149,6 +163,23 @@ jobs:
             echo "${{ steps.tags.outputs.basic-ttnn-runtime-tag }} does not exist"
             echo "basic-ttnn-runtime-exists=false" >> $GITHUB_OUTPUT
           fi
+
+          if docker manifest inspect ${{ steps.tags.outputs.tt-metalium-devel-tag }} > /dev/null 2>&1; then
+            echo "${{ steps.tags.outputs.tt-metalium-devel-tag }} exists"
+            echo "tt-metalium-devel-exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "${{ steps.tags.outputs.tt-metalium-devel-tag }} does not exist"
+            echo "tt-metalium-devel-exists=false" >> $GITHUB_OUTPUT
+          fi
+
+          if docker manifest inspect ${{ steps.tags.outputs.tt-metalium-ttnn-tag }} > /dev/null 2>&1; then
+            echo "${{ steps.tags.outputs.tt-metalium-ttnn-tag }} exists"
+            echo "tt-metalium-ttnn-exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "${{ steps.tags.outputs.tt-metalium-ttnn-tag }} does not exist"
+            echo "tt-metalium-ttnn-exists=false" >> $GITHUB_OUTPUT
+          fi
+
 
           if docker manifest inspect ${{ steps.tags.outputs.manylinux-tag }} > /dev/null 2>&1; then
             echo "${{ steps.tags.outputs.manylinux-tag }} exists"
@@ -236,6 +267,30 @@ jobs:
           build-args: UBUNTU_VERSION=${{ inputs.version }}
           cache-to: type=inline
           pull: true
+      - name: Build and push tt-metalium-devel image
+        if: needs.check-docker-images.outputs.tt-metalium-devel-exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}
+          file: dockerfile/Dockerfile
+          target: tt-metalium-devel
+          push: true
+          tags: ${{ needs.check-docker-images.outputs.tt-metalium-devel-tag }}
+          build-args: UBUNTU_VERSION=${{ inputs.version }}
+          cache-to: type=inline
+          pull: true
+      - name: Build and push tt-metalium-ttnn image
+        if: needs.check-docker-images.outputs.tt-metalium-ttnn-exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}
+          file: dockerfile/Dockerfile
+          target: tt-metalium-ttnn
+          push: true
+          tags: ${{ needs.check-docker-images.outputs.tt-metalium-ttnn-tag }}
+          build-args: UBUNTU_VERSION=${{ inputs.version }}
+          cache-to: type=inline
+          pull: true
       - name: Build and push ManyLinux image
         if: needs.check-docker-images.outputs.manylinux-exists != 'true'
         uses: docker/build-push-action@v6
@@ -292,6 +347,20 @@ jobs:
         uses: ./.github/actions/push-latest-image-to-ghcr
         with:
           docker-image-tag: ${{ needs.check-docker-images.outputs.basic-ttnn-runtime-tag }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Push latest tt-metalium-ttnn tag"
+        if: needs.check-docker-images.outputs.tt-metalium-ttnn-exists == 'true'
+        uses: ./.github/actions/push-latest-image-to-ghcr
+        with:
+          docker-image-tag: ${{ needs.check-docker-images.outputs.tt-metalium-ttnn-tag }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Push latest tt-metalium-devel tag"
+        if: needs.check-docker-images.outputs.tt-metalium-devel-exists == 'true'
+        uses: ./.github/actions/push-latest-image-to-ghcr
+        with:
+          docker-image-tag: ${{ needs.check-docker-images.outputs.tt-metalium-devel-tag }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: "Push latest Manylinux tag"

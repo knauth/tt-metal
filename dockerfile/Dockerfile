@@ -164,9 +164,8 @@ RUN echo "source $PYTHON_ENV_DIR/bin/activate" >> /etc/bash.bashrc
 RUN mkdir -p /etc && \
     echo "[global]\nextra-index-url = https://download.pytorch.org/whl/cpu" > /etc/pip.conf
 
-ARG WHEEL_FILENAME
-ADD $WHEEL_FILENAME $WHEEL_FILENAME
-RUN pip3 install $WHEEL_FILENAME
+# TODO @knauth: This needs to change!
+RUN pip3 install ttnn
 # Set up virtual environment
 RUN python3 -m venv $PYTHON_ENV_DIR
 
