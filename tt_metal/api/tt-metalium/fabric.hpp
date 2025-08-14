@@ -13,6 +13,7 @@
 #include <umd/device/types/cluster_descriptor_types.h>  // chip_id_t
 #include <vector>
 #include <umd/device/tt_core_coordinates.h>
+#include <optional>
 
 namespace tt {
 namespace tt_metal {
@@ -210,5 +211,13 @@ private:
 
     size_t memory_map_end_address_;
 };
+
+// Returns the eth direction in which the data should be forwarded from the src to reach the dest
+std::optional<eth_chan_directions> get_eth_forwarding_direction(
+    FabricNodeId src_fabric_node_id, FabricNodeId dst_fabric_node_id);
+
+bool is_1d_fabric_config(tt::tt_fabric::FabricConfig fabric_config);
+
+bool is_2d_fabric_config(tt::tt_fabric::FabricConfig fabric_config);
 
 }  // namespace tt::tt_fabric

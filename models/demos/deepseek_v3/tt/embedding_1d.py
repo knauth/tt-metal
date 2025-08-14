@@ -45,7 +45,7 @@ class Embedding1D(AbstractModule):
             torch_weight,
             dtype=ttnn.bfloat8_b,
             device=mesh_device,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, dims=[-2, -1], mesh_shape=list(mesh_device.shape)),
+            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, dims=[None, -1], mesh_shape=list(mesh_device.shape)),
             layout=ttnn.TILE_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
@@ -99,7 +99,9 @@ class Embedding1D(AbstractModule):
         Returns:
             Output tensor after embedding lookup
         """
-        return ttnn.embedding(x, **cfg)
+
+        embeddings = ttnn.embedding(x, **cfg)
+        return ttnn.reshape(embeddings, (1, *embeddings.shape))
 
     @classmethod
     def forward_decode(cls, x, cfg):
@@ -112,4 +114,5 @@ class Embedding1D(AbstractModule):
         Returns:
             Output tensor after embedding lookup
         """
-        return ttnn.embedding(x, **cfg)
+        embeddings = ttnn.embedding(x, **cfg)
+        return ttnn.reshape(embeddings, (1, *embeddings.shape))

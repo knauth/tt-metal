@@ -75,6 +75,9 @@ target_sources(
         indexed_fill/device/indexed_fill_op.cpp
         indexed_fill/device/indexed_fill_op_multi_core_program_factory.cpp
         indexed_fill/indexed_fill.cpp
+        moe_expert_token_remap/moe_expert_token_remap.cpp
+        moe_expert_token_remap/device/moe_expert_token_remap_device_operation.cpp
+        moe_expert_token_remap/device/moe_expert_token_remap_program_factory.cpp
         move/device/move_device_operation.cpp
         move/device/move_program_factory.cpp
         move/move.cpp
@@ -100,6 +103,10 @@ target_sources(
         reshape_view/device/reshape_device_operation.cpp
         reshape_view/reshape.cpp
         roll/roll.cpp
+        scatter/scatter.cpp
+        scatter/tosa_scatter.cpp
+        scatter/device/scatter_device_operation.cpp
+        scatter/device/scatter_program_factory.cpp
         sharded/interleaved_to_sharded/device/interleaved_to_sharded_op.cpp
         sharded/interleaved_to_sharded/device/interleaved_to_sharded_program_factory.cpp
         sharded/interleaved_to_sharded/interleaved_to_sharded.cpp
