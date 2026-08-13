@@ -1,7 +1,8 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
 import pytest
 import torch
 import ttnn
@@ -15,15 +16,119 @@ from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import (
     comp_equal,
     comp_pcc,
 )
-from models.utility_functions import is_grayskull, is_wormhole_b0, is_blackhole
 
-from tests.tt_eager.python_api_testing.unit_testing.misc.test_matmul_1d_gather_in0 import (
+from tests.ttnn.nightly.unit_tests.operations.matmul.test_matmul_1d_gather_in0 import (
     run_multi_core_matmul_1d,
     num_cores_to_rectangle_grid,
     round_up,
 )
 from tracy import signpost
 from models.demos.llama3_70b_galaxy.tt.prefetcher_common import get_core_ranges
+
+
+def round_up(n, m):
+    return ((n + m - 1) // m) * m
+
+
+def bytes_per_tile(dtype) -> int:
+    return {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088}[dtype]
+
+
+def ring_grid_cols(num_dram_banks: int, ring_size: int) -> int:
+    """Width (columns) of the receiver ring grid: the largest divisor of
+    ``ring_size`` that is <= ``num_dram_banks``."""
+    return max(c for c in range(min(num_dram_banks, ring_size), 0, -1) if ring_size % c == 0)
+
+
+def bank_receivers_strided(bank_idx: int, recv_per_bank: int, num_dram_banks: int, ring_cols: int):
+    """Strided receivers matching BufferDistributionSpec round-robin placement:
+    bank b -> ring positions [b, b + num_dram_banks, b + 2*num_dram_banks, ...].
+
+    Under ROUND_ROBIN_1D shard distribution, shard s lands on bank
+    (s % num_dram_banks) at bank-local slab (s // num_dram_banks). Pairing that
+    with this GCB topology means shard index == ring position, so the caller can
+    store data in ring-position order without a permutation.
+    """
+    cores = []
+    for s in range(recv_per_bank):
+        ring_pos = bank_idx + s * num_dram_banks
+        col = ring_pos % ring_cols
+        row = ring_pos // ring_cols
+        cores.append(ttnn.CoreRange(ttnn.CoreCoord(col, row), ttnn.CoreCoord(col, row)))
+    return ttnn.CoreRangeSet(cores)
+
+
+def bank_receivers_contiguous(bank_idx: int, recv_per_bank: int, ring_cols: int):
+    """Contiguous receiver arc matching BufferDistributionSpec CONTIGUOUS_1D (shard-contiguous)
+    placement: bank b -> ring positions [b*recv_per_bank .. (b+1)*recv_per_bank - 1].
+
+    Under CONTIGUOUS_1D shard distribution, shard s lands on bank
+    (s // recv_per_bank) at bank-local slab (s % recv_per_bank). Pairing that with
+    this GCB topology means shard index == ring position (no permutation), and each
+    bank feeds a contiguous arc of the ring instead of a strided set.
+    """
+    cores = []
+    for s in range(recv_per_bank):
+        ring_pos = bank_idx * recv_per_bank + s
+        col = ring_pos % ring_cols
+        row = ring_pos // ring_cols
+        cores.append(ttnn.CoreRange(ttnn.CoreCoord(col, row), ttnn.CoreCoord(col, row)))
+    return ttnn.CoreRangeSet(cores)
+
+
+def make_recv_contig_weight(
+    device,
+    pt_weight,
+    num_dram_banks: int,
+    ring_size: int,
+    dtype,
+    distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
+):
+    """Allocate ``pt_weight`` ((1, 1, K, N)) as a DRAM-sharded ND tensor in
+    receiver-contiguous layout: ``num_shards = ring_size`` distributed across
+    ``num_dram_banks`` DRAM cores, each shard ``(K, N // ring_size)``.
+
+    ``distribution_strategy`` selects how shards map to banks: ROUND_ROBIN_1D
+    (shard s -> bank s % num_dram_banks) or CONTIGUOUS_1D (shard s -> bank
+    s // recv_per_bank). The GCB sender->receiver pairing must match (use
+    ``bank_receivers_strided`` for round-robin, ``bank_receivers_contiguous`` for
+    shard-contiguous) so that shard index == ring position.
+
+    With ``ring_size > num_dram_banks`` (bank b stacks ``ring_size //
+    num_dram_banks`` slabs vertically), the prefetcher manager auto-detects this
+    from ``buffer_distribution_spec().num_shards()`` and takes the recv-contig
+    path. The tensor keeps its (K, N) logical shape; only buffer placement changes.
+    """
+    K = pt_weight.shape[-2]
+    N = pt_weight.shape[-1]
+    assert N % ring_size == 0, f"N={N} must divide ring_size={ring_size}"
+    n_per_recv = N // ring_size
+    dram_core_range_set = ttnn.CoreRangeSet(
+        {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(num_dram_banks - 1, 0))}
+    )
+    nd_shard = ttnn.NdShardSpec(
+        ttnn.Shape([K, n_per_recv]),
+        dram_core_range_set,
+        ttnn.ShardOrientation.ROW_MAJOR,
+        distribution_strategy,
+    )
+    mem_config = ttnn.MemoryConfig(ttnn.BufferType.DRAM, nd_shard)
+    return ttnn.as_tensor(pt_weight, device=device, dtype=dtype, memory_config=mem_config, layout=ttnn.TILE_LAYOUT)
+
+
+@contextlib.contextmanager
+def tensor_prefetcher_session(device):
+    """Open a Tensor prefetcher Start/Stop window. Stop (and a device sync)
+    runs even on test failure so the next test sees a clean device, replacing the
+    explicit ``start -> ... -> stop -> synchronize`` callers used to spell out at
+    every test site.
+    """
+    ttnn.experimental.start_tensor_prefetcher(device)
+    try:
+        yield
+    finally:
+        ttnn.experimental.stop_tensor_prefetcher(device)
+        ttnn.synchronize_device(device)
 
 
 def run_prefetcher_mm(
@@ -35,7 +140,6 @@ def run_prefetcher_mm(
     dtypes,
     is_functional_test=False,
     enable_performance_mode=False,
-    batch_weights=False,
 ):
     logger.info(f"Running test_run_prefetcher with num_tensors={num_tensors}, num_layers={num_layers}")
     assert len(input_shapes) == len(dtypes)
@@ -271,9 +375,6 @@ def run_prefetcher_mm(
     prev_in0 = torch.randn(prev_shape)
     for shape, shard_shape in zip(in0_shapes, shard_shapes):
         in0 = torch.randn(shape)
-        if batch_weights and prev_shape == shape:
-            in0 = prev_in0
-            prev_shape = shape
         in0_tensors.append(in0)
 
         _, _, M, _ = shape
@@ -318,7 +419,8 @@ def run_prefetcher_mm(
         )
         program_configs.append(program_config)
 
-    compute_kernel_config = ttnn.WormholeComputeKernelConfig(
+    compute_kernel_config = ttnn.init_device_compute_kernel_config(
+        device.arch(),
         math_fidelity=ttnn.MathFidelity.LoFi,
         math_approx_mode=True,
         fp32_dest_acc_en=True,
@@ -341,33 +443,18 @@ def run_prefetcher_mm(
             t = 0
             while t < num_tensors:
                 idx = l * num_tensors + t
-                if batch_weights and t < num_tensors - 1 and in0_t_tensors[t].shape == in0_t_tensors[t + 1].shape:
-                    logger.info(f"running matmul_batched_weights for layer {l}, tensor {t} and tensor {t+1}")
-                    [output_t1, output_t2] = ttnn.matmul_batched_weights(
-                        in0_t_tensors[t],
-                        [tt_tensors_all[idx], tt_tensors_all[idx + 1]],
-                        program_config=program_configs[t],
-                        memory_config=output_mem_configs[t],
-                        compute_kernel_config=compute_kernel_config,
-                        global_cb=global_circular_buffer,
-                        sub_device_id=worker_sub_device_id,
-                    )
-                    outputs_l1.append(output_t1)
-                    outputs_l1.append(output_t2)
-                    t += 2
-                else:
-                    logger.info(f"running normal matmul for layer {l}, tensor {t}")
-                    output_t = ttnn.matmul(
-                        in0_t_tensors[t],
-                        tt_tensors_all[idx],
-                        program_config=program_configs[t],
-                        memory_config=output_mem_configs[t],
-                        compute_kernel_config=compute_kernel_config,
-                        global_cb=global_circular_buffer,
-                        sub_device_id=worker_sub_device_id,
-                    )
-                    outputs_l1.append(output_t)
-                    t += 1
+                logger.info(f"running normal matmul for layer {l}, tensor {t}")
+                output_t = ttnn.matmul(
+                    in0_t_tensors[t],
+                    tt_tensors_all[idx],
+                    program_config=program_configs[t],
+                    memory_config=output_mem_configs[t],
+                    compute_kernel_config=compute_kernel_config,
+                    global_cb=global_circular_buffer,
+                    sub_device_id=worker_sub_device_id,
+                )
+                outputs_l1.append(output_t)
+                t += 1
             # Send outputs to DRAM to so that we don't run out of L1 memory when testing for large number of layers
             for t in range(num_tensors):
                 outputs_dram.append(ttnn.to_memory_config(outputs_l1[t], ttnn.DRAM_MEMORY_CONFIG))
@@ -413,6 +500,13 @@ def run_prefetcher_mm(
 
             passing, output = comp_pcc(pt_out, tt_out, pcc_threshold)
             logger.info(output)
+
+            if not passing:
+                logger.error(
+                    f"prefetcher_common::run_prefetcher_mm: failue on {output}\n\t"
+                    f"layer {l}, tensor {t}, dtype {dtype}"
+                )
+
             all_passing = passing and all_passing
 
     device.clear_loaded_sub_device_manager()

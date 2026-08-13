@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -19,7 +19,7 @@ from tests.ttnn.utils_for_testing import (
     start_measuring_time,
     stop_measuring_time,
 )
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 from tests.sweep_framework.sweep_utils.roofline_utils import get_run_return
 
 TIMEOUT = 15
@@ -113,7 +113,9 @@ def run_matmul(
             (per_core_height, per_core_width),
             ttnn.ShardOrientation.ROW_MAJOR,
         )
-    input_a_memory_config = input_a_memory_config.with_shard_spec(input_a_shard_spec)
+    input_a_memory_config = ttnn.MemoryConfig(
+        input_a_memory_config.memory_layout, input_a_memory_config.buffer_type, input_a_shard_spec
+    )
 
     input_shape_a = (*batch_sizes, m_size, k_size)
     input_shape_b = (k_size, n_size)

@@ -1,12 +1,11 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
 
 import ttnn
-from models.utility_functions import is_wormhole_b0
-from ttnn import ReplicateTensorToMesh
+from models.common.utility_functions import is_wormhole_b0
 
 
 def get_weights_cached(
@@ -50,7 +49,6 @@ def get_weights_cached(
             layout=tt_layout,
             device=mesh_device,
             memory_config=model_config[f"{weight_config_str}_MEMCFG"],
-            mesh_mapper=ReplicateTensorToMesh(mesh_device) if type(mesh_device) == ttnn.MeshDevice else None,
             cache_file_name=str(path),
             preprocess=preprocess_weights,
         )
@@ -77,11 +75,6 @@ def get_default_hifi2_kernel_config():
             math_approx_mode=False,
             fp32_dest_acc_en=False,
             packer_l1_acc=False,
-        )
-    else:
-        hifi2_kernel_config = ttnn.GrayskullComputeKernelConfig(
-            math_fidelity=ttnn.MathFidelity.HiFi2,
-            math_approx_mode=True,
         )
     return hifi2_kernel_config
 

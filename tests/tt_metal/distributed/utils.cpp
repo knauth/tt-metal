@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -13,24 +13,23 @@
 #include <utility>
 #include <variant>
 
-#include <tt-metalium/assert.hpp>
-#include <tt-metalium/buffer.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/circular_buffer_constants.h>
 #include <tt-metalium/circular_buffer_config.hpp>
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/host_api.hpp>
 #include "hostdevcommon/kernel_structs.h"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
 #include <tt-metalium/mesh_device.hpp>
-#include <tt-metalium/semaphore.hpp>
+#include "impl/buffers/semaphore.hpp"
+#include "impl/kernels/kernel.hpp"
 #include <tt_stl/span.hpp>
 #include "tests/tt_metal/tt_metal/dispatch/dispatch_test_utils.hpp"
 #include <tt-metalium/tt_backend_api_types.hpp>
-#include "umd/device/tt_core_coordinates.h"
-#include "umd/device/types/xy_pair.h"
-#include <tt-metalium/utils.hpp>
+#include <umd/device/types/core_coordinates.hpp>
+#include <umd/device/types/xy_pair.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
 
 namespace tt::tt_metal::distributed::test::utils {
 
@@ -84,14 +83,14 @@ std::vector<std::shared_ptr<Program>> create_eltwise_bin_programs(
             tt_metal::CircularBufferConfig(
                 num_input_tiles * single_tile_size, {{src0_cb_index, tt::DataFormat::Float16_b}})
                 .set_page_size(src0_cb_index, single_tile_size);
-        auto cb_src0 = tt_metal::CreateCircularBuffer(program, full_grid, cb_src0_config);
+        tt_metal::CreateCircularBuffer(program, full_grid, cb_src0_config);
 
         uint32_t src1_cb_index = tt::CBIndex::c_1;
         tt_metal::CircularBufferConfig cb_src1_config =
             tt_metal::CircularBufferConfig(
                 num_input_tiles * single_tile_size, {{src1_cb_index, tt::DataFormat::Float16_b}})
                 .set_page_size(src1_cb_index, single_tile_size);
-        auto cb_src1 = tt_metal::CreateCircularBuffer(program, full_grid, cb_src1_config);
+        tt_metal::CreateCircularBuffer(program, full_grid, cb_src1_config);
 
         uint32_t ouput_cb_index = tt::CBIndex::c_16;
         uint32_t num_output_tiles = 2;
@@ -99,31 +98,38 @@ std::vector<std::shared_ptr<Program>> create_eltwise_bin_programs(
             tt_metal::CircularBufferConfig(
                 num_output_tiles * single_tile_size, {{ouput_cb_index, tt::DataFormat::Float16_b}})
                 .set_page_size(ouput_cb_index, single_tile_size);
-        auto cb_output = tt_metal::CreateCircularBuffer(program, full_grid, cb_output_config);
+        tt_metal::CreateCircularBuffer(program, full_grid, cb_output_config);
 
+        std::vector<uint32_t> reader_compile_time_args;
+        tt::tt_metal::TensorAccessorArgs(src0_bufs.front()).append_to(reader_compile_time_args);
+        tt::tt_metal::TensorAccessorArgs(src1_bufs.front()).append_to(reader_compile_time_args);
         auto binary_reader_kernel = tt_metal::CreateKernel(
             program,
             "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_dual_8bank.cpp",
             full_grid,
             tt_metal::DataMovementConfig{
-                .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = tt_metal::NOC::RISCV_1_default});
+                .processor = tt_metal::DataMovementProcessor::RISCV_1,
+                .noc = tt_metal::NOC::RISCV_1_default,
+                .compile_args = reader_compile_time_args});
 
+        std::vector<uint32_t> writer_compile_time_args = {ouput_cb_index};
+        tt::tt_metal::TensorAccessorArgs(output_bufs.front()).append_to(writer_compile_time_args);
         auto unary_writer_kernel = tt_metal::CreateKernel(
             program,
             "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_unary_8bank.cpp",
             full_grid,
             tt_metal::DataMovementConfig{
-                .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = tt_metal::NOC::RISCV_0_default});
+                .processor = tt_metal::DataMovementProcessor::RISCV_0,
+                .noc = tt_metal::NOC::RISCV_0_default,
+                .compile_args = writer_compile_time_args});
 
         std::vector<uint32_t> compute_kernel_args = {};
 
-        bool fp32_dest_acc_en = false;
-        bool math_approx_mode = false;
         std::map<std::string, std::string> binary_defines = {
             {"ELTWISE_OP", op_id_to_op_define[eltwise_op]}, {"ELTWISE_OP_TYPE", op_id_to_op_type_define[eltwise_op]}};
         auto eltwise_binary_kernel = tt_metal::CreateKernel(
             program,
-            "tt_metal/kernels/compute/eltwise_binary.cpp",
+            "tests/tt_metal/tt_metal/test_kernels/compute/eltwise_binary.cpp",
             full_grid,
             tt_metal::ComputeConfig{.compile_args = compute_kernel_args, .defines = binary_defines});
 
@@ -133,16 +139,16 @@ std::vector<std::shared_ptr<Program>> create_eltwise_bin_programs(
             for (std::size_t row_idx = 0; row_idx < worker_grid_size.y; row_idx++) {
                 CoreCoord curr_core = {col_idx, row_idx};
                 const std::array<uint32_t, 7> reader_args = {
-                    src0_bufs.at(col_idx * worker_grid_size.y + row_idx)->address(),
+                    src0_bufs.at((col_idx * worker_grid_size.y) + row_idx)->address(),
                     0,
                     num_tiles,
-                    src1_bufs.at(col_idx * worker_grid_size.y + row_idx)->address(),
+                    src1_bufs.at((col_idx * worker_grid_size.y) + row_idx)->address(),
                     0,
                     num_tiles,
                     0};
 
                 const std::array<uint32_t, 3> writer_args = {
-                    output_bufs.at(col_idx * worker_grid_size.y + row_idx)->address(), 0, num_tiles};
+                    output_bufs.at((col_idx * worker_grid_size.y) + row_idx)->address(), 0, num_tiles};
 
                 SetRuntimeArgs(program, unary_writer_kernel, curr_core, writer_args);
                 SetRuntimeArgs(program, binary_reader_kernel, curr_core, reader_args);
@@ -155,10 +161,9 @@ std::vector<std::shared_ptr<Program>> create_eltwise_bin_programs(
 std::vector<std::shared_ptr<Program>> create_random_programs(
     uint32_t num_programs,
     CoreCoord worker_grid_size,
-    uint32_t seed,
+    uint32_t /*seed*/,
     const std::unordered_set<CoreCoord>& active_eth_cores) {
     uint32_t MAX_LOOP = 100;
-    uint32_t page_size = 1024;
     uint32_t max_eth_cores = 3;
 
     uint32_t BRISC_OUTER_LOOP, BRISC_MIDDLE_LOOP, BRISC_INNER_LOOP, NUM_CBS, NUM_SEMS;
@@ -175,6 +180,10 @@ std::vector<std::shared_ptr<Program>> create_random_programs(
     std::map<std::string, std::string> data_movement_defines = {{"DATA_MOVEMENT", "1"}};
     std::map<std::string, std::string> compute_defines = {{"COMPUTE", "1"}};
     std::map<std::string, std::string> erisc_defines = {{"ERISC", "1"}};
+    uint32_t max_cbs = MetalContext::instance().hal().get_arch_num_circular_buffers();
+    // Smaller page size for architectures with more CBs to ensure all test CBs fit in L1
+    constexpr uint32_t l1_cb_test_budget = 1024 * 32;
+    uint32_t page_size = l1_cb_test_budget / max_cbs;
 
     for (uint32_t i = 0; i < num_programs; i++) {
         Program& program = *programs.emplace_back(std::make_shared<Program>());
@@ -185,14 +194,14 @@ std::vector<std::shared_ptr<Program>> create_random_programs(
             BRISC_OUTER_LOOP = MAX_LOOP;
             BRISC_MIDDLE_LOOP = MAX_LOOP;
             BRISC_INNER_LOOP = MAX_LOOP;
-            NUM_CBS = NUM_CIRCULAR_BUFFERS;
+            NUM_CBS = max_cbs;
             NUM_SEMS = NUM_SEMAPHORES;
             USE_MAX_RT_ARGS = true;
         } else {
             BRISC_OUTER_LOOP = rand() % (MAX_LOOP) + 1;
             BRISC_MIDDLE_LOOP = rand() % (MAX_LOOP) + 1;
             BRISC_INNER_LOOP = rand() % (MAX_LOOP) + 1;
-            NUM_CBS = rand() % (NUM_CIRCULAR_BUFFERS) + 1;
+            NUM_CBS = rand() % (max_cbs) + 1;
             NUM_SEMS = rand() % (NUM_SEMAPHORES) + 1;
             USE_MAX_RT_ARGS = false;
         }
@@ -200,14 +209,13 @@ std::vector<std::shared_ptr<Program>> create_random_programs(
         for (uint32_t j = 0; j < NUM_CBS; j++) {
             CircularBufferConfig cb_config = CircularBufferConfig(page_size * (j + 1), {{j, tt::DataFormat::Float16_b}})
                                                  .set_page_size(j, page_size * (j + 1));
-            auto cb = CreateCircularBuffer(program, cr_set, cb_config);
+            CreateCircularBuffer(program, cr_set, cb_config);
         }
 
         // Create Semaphores
         for (uint32_t j = 0; j < NUM_SEMS; j++) {
             CreateSemaphore(program, cr_set, j + 1);
-            uint32_t curr_idx = 0;
-            if (active_eth_cores.size()) {
+            if (!active_eth_cores.empty()) {
                 auto active_eth_core = active_eth_cores.begin();
                 for (int k = 0; k < max_eth_cores && active_eth_core != active_eth_cores.end();
                      ++i, ++active_eth_core) {
@@ -349,7 +357,7 @@ std::vector<std::shared_ptr<Program>> create_random_programs(
         }
 
         if (not at_least_one_kernel) {
-            uint32_t random_risc = rand() % 3 + 1;
+            uint32_t random_risc = (rand() % 3) + 1;
             if (random_risc == 1) {
                 auto dummy_brisc_kernel = CreateKernel(
                     program,
@@ -387,7 +395,7 @@ std::vector<std::shared_ptr<Program>> create_random_programs(
                 TT_THROW("Invalid");
             }
         }
-        if (active_eth_cores.size()) {
+        if (!active_eth_cores.empty()) {
             auto active_eth_core = active_eth_cores.begin();
             for (int k = 0; k < max_eth_cores && active_eth_core != active_eth_cores.end(); ++i, ++active_eth_core) {
                 auto dummy_erisc_kernel = CreateKernel(
@@ -399,6 +407,95 @@ std::vector<std::shared_ptr<Program>> create_random_programs(
                 SetRuntimeArgs(program, dummy_erisc_kernel, *active_eth_core, erisc_unique_rtargs);
             }
         }
+    }
+    return programs;
+}
+
+std::vector<std::unique_ptr<Program>> create_benchmark_programs(
+    uint32_t num_programs, CoreCoord worker_grid_size, bool unique_per_program) {
+    uint32_t MAX_LOOP = 100;
+
+    CoreRange cr({0, 0}, {worker_grid_size.x - 1, worker_grid_size.y - 1});
+    CoreRangeSet cr_set(cr);
+
+    std::vector<std::unique_ptr<Program>> programs;
+    programs.reserve(num_programs);
+
+    std::map<std::string, std::string> data_movement_defines = {{"DATA_MOVEMENT", "1"}};
+    std::map<std::string, std::string> compute_defines = {{"COMPUTE", "1"}};
+
+    uint32_t max_cbs = MetalContext::instance().hal().get_arch_num_circular_buffers();
+    constexpr uint32_t l1_cb_test_budget = 1024 * 32;
+    uint32_t page_size = l1_cb_test_budget / max_cbs;
+
+    uint32_t NUM_CBS = max_cbs;
+    uint32_t NUM_SEMS = NUM_SEMAPHORES;
+
+    // Deterministic rt args: use max_runtime_args for unique, 0 for common
+    auto [unique_rtargs, common_rtargs] = create_runtime_args(max_runtime_args, 0, 0, 0);
+    uint32_t num_unique_rtargs = unique_rtargs.size();
+    uint32_t num_common_rtargs = common_rtargs.size();
+
+    for (uint32_t i = 0; i < num_programs; i++) {
+        Program& program = *programs.emplace_back(std::make_unique<Program>());
+
+        // Create CBs
+        for (uint32_t j = 0; j < NUM_CBS; j++) {
+            CircularBufferConfig cb_config = CircularBufferConfig(page_size * (j + 1), {{j, tt::DataFormat::Float16_b}})
+                                                 .set_page_size(j, page_size * (j + 1));
+            CreateCircularBuffer(program, cr_set, cb_config);
+        }
+
+        // Create Semaphores
+        for (uint32_t j = 0; j < NUM_SEMS; j++) {
+            CreateSemaphore(program, cr_set, j + 1);
+        }
+
+        // Program ID as compile-time arg forces unique compilation per program
+        uint32_t program_id = unique_per_program ? i : 0;
+        std::vector<uint32_t> compile_args = {
+            MAX_LOOP,
+            MAX_LOOP,
+            MAX_LOOP,
+            NUM_CBS,
+            NUM_SEMS,
+            num_unique_rtargs,
+            num_common_rtargs,
+            page_size,
+            program_id};
+
+        // Always create all 3 kernels (BRISC, NCRISC, TRISC)
+        auto dummy_brisc_kernel = CreateKernel(
+            program,
+            "tests/tt_metal/tt_metal/test_kernels/dataflow/unit_tests/command_queue/random_program.cpp",
+            cr_set,
+            DataMovementConfig{
+                .processor = DataMovementProcessor::RISCV_0,
+                .noc = NOC::RISCV_0_default,
+                .compile_args = compile_args,
+                .defines = data_movement_defines});
+        SetRuntimeArgs(program, dummy_brisc_kernel, cr_set, unique_rtargs);
+        SetCommonRuntimeArgs(program, dummy_brisc_kernel, common_rtargs);
+
+        auto dummy_ncrisc_kernel = CreateKernel(
+            program,
+            "tests/tt_metal/tt_metal/test_kernels/dataflow/unit_tests/command_queue/random_program.cpp",
+            cr_set,
+            DataMovementConfig{
+                .processor = DataMovementProcessor::RISCV_1,
+                .noc = NOC::RISCV_1_default,
+                .compile_args = compile_args,
+                .defines = data_movement_defines});
+        SetRuntimeArgs(program, dummy_ncrisc_kernel, cr_set, unique_rtargs);
+        SetCommonRuntimeArgs(program, dummy_ncrisc_kernel, common_rtargs);
+
+        auto dummy_trisc_kernel = CreateKernel(
+            program,
+            "tests/tt_metal/tt_metal/test_kernels/dataflow/unit_tests/command_queue/random_program.cpp",
+            cr_set,
+            ComputeConfig{.math_approx_mode = false, .compile_args = compile_args, .defines = compute_defines});
+        SetRuntimeArgs(program, dummy_trisc_kernel, cr_set, unique_rtargs);
+        SetCommonRuntimeArgs(program, dummy_trisc_kernel, common_rtargs);
     }
     return programs;
 }

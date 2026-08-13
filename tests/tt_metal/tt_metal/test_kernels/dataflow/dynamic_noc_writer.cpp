@@ -1,15 +1,17 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "dataflow_api.h"
-#include "debug/dprint.h"
+#include "noc_parameters.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/debug/dprint.h"
 
 void kernel_main() {
     constexpr std::uint32_t iteration = get_compile_time_arg_val(0);
     constexpr std::uint32_t page_size = get_compile_time_arg_val(1);
+    constexpr std::uint32_t num_riscs = get_compile_time_arg_val(2);
 
     std::uint32_t noc_x = get_arg_val<uint32_t>(0);
     std::uint32_t noc_y = get_arg_val<uint32_t>(1);
@@ -19,6 +21,12 @@ void kernel_main() {
     std::uint32_t bottom_right_core_x = get_arg_val<uint32_t>(5);
     std::uint32_t bottom_right_core_y = get_arg_val<uint32_t>(6);
     std::uint32_t num_dests = get_arg_val<uint32_t>(7);
+    std::uint32_t risc_index = get_arg_val<uint32_t>(8);
+
+    volatile tt_l1_ptr uint32_t* semaphore_ptrs[num_riscs];
+    for (uint32_t i = 0; i < num_riscs; i++) {
+        semaphore_ptrs[i] = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(get_arg_val<uint32_t>(9 + i)));
+    }
 
     constexpr uint32_t cb_id = 0;
     uint32_t l1_read_addr = get_read_ptr(cb_id);
@@ -40,7 +48,7 @@ void kernel_main() {
     uint64_t addr_self_noc = get_noc_addr(noc_x, noc_y, l1_read_addr, noc_index);
     uint64_t addr_other_noc = get_noc_addr(noc_x, noc_y, l1_read_addr, 1 - noc_index);
 
-    DPRINT << "Start" <<ENDL();
+    DPRINT("Start\n");
 
     // Test stateful read API
     noc_async_read_set_state(addr_self_noc, noc_index);
@@ -51,11 +59,12 @@ void kernel_main() {
     }
 
     // Test stateful read one packet API
-    noc_async_read_one_packet_set_state(addr_self_noc, page_size, noc_index);
-    noc_async_read_one_packet_set_state(addr_other_noc, page_size, 1 - noc_index);
+    constexpr uint32_t vc = 0;
+    noc_async_read_one_packet_set_state(addr_self_noc, page_size, vc, noc_index);
+    noc_async_read_one_packet_set_state(addr_other_noc, page_size, vc, 1 - noc_index);
     for (uint32_t i = 0; i < iteration; i++) {
-        noc_async_read_one_packet_with_state(l1_read_addr, l1_read_addr, noc_index);
-        noc_async_read_one_packet_with_state(l1_read_addr, l1_read_addr, 1 - noc_index);
+        noc_async_read_one_packet_with_state(l1_read_addr, l1_read_addr, vc, noc_index);
+        noc_async_read_one_packet_with_state(l1_read_addr, l1_read_addr, vc, 1 - noc_index);
     }
 
     // Test stateful write one packet API
@@ -67,8 +76,8 @@ void kernel_main() {
     }
 
     // Test gen_fast
-    const InterleavedAddrGenFast<false> s0 = {
-        .bank_base_address = l1_read_addr, .page_size = page_size, .data_format = DataFormat::Float16_b};
+    constexpr auto s_args = TensorAccessorArgs<3>();
+    const auto s0 = TensorAccessor(s_args, l1_read_addr);
 
     for (uint32_t i = 0; i < iteration; i ++) {
         uint32_t noc = (i % 2) == 0 ? noc_index : 1-noc_index;
@@ -80,7 +89,7 @@ void kernel_main() {
         noc_async_read_one_packet(noc_addr, l1_read_addr, page_size, noc);
         noc_async_read(noc_addr, l1_read_addr, page_size, noc);
         // interleaved read
-        noc_async_read_tile(i % 1024, s0, l1_read_addr, 0, noc);
+        noc_async_read_page(i % 1024, s0, l1_read_addr, 0, noc);
 
         // Test semaphore
         noc_semaphore_inc(noc_addr, 1, noc);
@@ -90,7 +99,7 @@ void kernel_main() {
         noc_async_write(l1_read_addr, noc_addr, page_size, noc);
         noc_async_write_one_packet(l1_read_addr, noc_addr, page_size, noc);
         // interleaved write
-        noc_async_write_tile(i % 1024, s0, l1_read_addr, noc);
+        noc_async_write_page(i % 1024, s0, l1_read_addr, 0, 0, noc);
 
         // Test mcast
         if (mcast) {
@@ -129,45 +138,55 @@ void kernel_main() {
 #endif
     }
 
-    // DRAM sharded read API
-    noc_async_read_tile_dram_sharded_set_state<true>(0x32, page_size, 0, 0, noc_index);
-    noc_async_read_tile_dram_sharded_set_state<true>(0x32, page_size, 0, 0, 1 - noc_index);
-    for (uint32_t i = 0; i < iteration; i++) {
-        uint32_t trid = i % 16 + 1;
-        noc_async_read_tile_dram_sharded_with_state_with_trid(0, 0x32, l1_read_addr, trid, noc_index);
-        noc_async_read_tile_dram_sharded_with_state_with_trid(0, 0x32, l1_read_addr, trid, 1 - noc_index);
+    // barrier on all txns
+    for (int noc = 0; noc < NUM_NOCS; noc++) {
+        noc_async_full_barrier(noc);
     }
-    for (uint32_t i = 1; i < 15; i++) {
+
+    // Sync all riscs since we should only clear the trid counters when there are no outstanding requests
+    *semaphore_ptrs[risc_index] = 1;
+    for (uint32_t i = 0; i < num_riscs; i++) {
+        noc_semaphore_wait(semaphore_ptrs[i], 1);
+    }
+
+    // Previous multicasts would have put trids into a non-zero state, so reset the barrier counter
+    reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
+    reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, 1 - noc_index);
+
+    // Sync all riscs so that we don't issue new requests while clearing the trid counters
+    *semaphore_ptrs[risc_index] = 2;
+    for (uint32_t i = 0; i < num_riscs; i++) {
+        noc_semaphore_wait(semaphore_ptrs[i], 2);
+    }
+
+    // DRAM sharded read API
+    uint64_t src_addr_0 = get_noc_addr_from_bank_id<true>(0, DRAM_ALIGNMENT);
+    uint64_t src_addr_1 = get_noc_addr_from_bank_id<true>(0, DRAM_ALIGNMENT);
+    noc_async_read_one_packet_set_state<true>(src_addr_0, page_size, vc, noc_index);
+    noc_async_read_one_packet_set_state<true>(src_addr_1, page_size, vc, 1 - noc_index);
+    for (uint32_t i = 0; i < iteration; i++) {
+        uint32_t trid = i % (NOC_MAX_TRANSACTION_ID + 1);
+        noc_async_read_one_packet_with_state_with_trid(src_addr_0, DRAM_ALIGNMENT, l1_read_addr, trid, noc_index);
+        noc_async_read_one_packet_with_state_with_trid(src_addr_1, DRAM_ALIGNMENT, l1_read_addr, trid, 1 - noc_index);
+    }
+    for (uint32_t i = 0; i <= NOC_MAX_TRANSACTION_ID; i++) {
         noc_async_read_barrier_with_trid(i, noc_index);
         noc_async_read_barrier_with_trid(i, 1 - noc_index);
     }
 
-// Some mem corruption issue when using the noc_async_write_barrier_with_trid
-#ifndef ARCH_BLACKHOLE
-    // DRAM sharded write API
+    // L1 sharded write API
     for (uint32_t i = 0; i < iteration; i++) {
-        uint32_t trid = i % 16 + 1;
+        uint32_t trid = i % (NOC_MAX_TRANSACTION_ID + 1);
         noc_async_write_one_packet_with_trid(l1_read_addr, addr_self_noc, page_size, trid, write_cmd_buf, noc_index);
         noc_async_write_one_packet_with_trid(
             l1_read_addr, addr_other_noc, page_size, trid, write_cmd_buf, 1 - noc_index);
     }
-    for (uint32_t i = 1; i < 15; i++) {
+    for (uint32_t i = 0; i <= NOC_MAX_TRANSACTION_ID; i++) {
         noc_async_write_barrier_with_trid(i, noc_index);
         noc_async_write_barrier_with_trid(i, 1 - noc_index);
     }
-#endif
 
-    DPRINT << "END" <<ENDL();
-    DPRINT << "noc_mode " << (uint)noc_mode << ENDL();
-
-    // barrier on all txns
-    for (int noc = 0; noc < NUM_NOCS; noc++) {
-        while (!ncrisc_dynamic_noc_reads_flushed(noc));
-        while (!ncrisc_dynamic_noc_nonposted_writes_sent(noc));
-        while (!ncrisc_dynamic_noc_nonposted_writes_flushed(noc));
-        while (!ncrisc_dynamic_noc_nonposted_atomics_flushed(noc));
-        while (!ncrisc_dynamic_noc_posted_writes_sent(noc));
-    }
+    DPRINT("END\nnoc_mode {}\n", (uint)noc_mode);
 
     // Barrier test - test barrier itself working properly
     for (int noc = 0; noc < NUM_NOCS; noc++) {

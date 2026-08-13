@@ -1,20 +1,28 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dispatch.hpp"
 #include <cstdint>
+#include "allocator/allocator.hpp"
+#include "context/context_types.hpp"
+#include "device/device_manager.hpp"
 #include "dispatch/device_command.hpp"
 #include "dispatch/device_command_calculator.hpp"
 #include "dispatch/system_memory_manager.hpp"
+#include <tt-metalium/math.hpp>
+#include <impl/dispatch/dispatch_mem_map.hpp>
 
-namespace tt {
-namespace tt_metal {
+namespace tt::tt_metal {
 
-uint32_t calculate_max_prefetch_data_size_bytes(const CoreType& dispatch_core_type) {
-    return tt::tt_metal::MetalContext::instance().dispatch_mem_map().max_prefetch_command_size() -
-           (tt::tt_metal::MetalContext::instance().hal().get_alignment(HalMemType::HOST) *
-            2);  // * 2 to account for issue
+uint32_t calculate_max_prefetch_data_size_bytes(const CoreType& /*dispatch_core_type*/, uint32_t num_subdevices) {
+    // CQ capacity would be reduced by the commands and alignment padding.
+    // prefetch_relay_inline, dispatch_wait (x #workers), and dispatch_write_linear would add alignment padding
+    const auto host_alignment = tt::tt_metal::MetalContext::instance().hal().get_alignment(HalMemType::HOST);
+    auto padded_commands_size = tt::align(sizeof(CQPrefetchCmd), host_alignment) +
+                                (num_subdevices * tt::align(sizeof(CQDispatchCmd), host_alignment)) +
+                                tt::align(sizeof(CQDispatchCmdLarge), host_alignment);
+    return tt::tt_metal::MetalContext::instance().dispatch_mem_map().max_prefetch_command_size() - padded_commands_size;
 }
 
 namespace device_dispatch {
@@ -27,15 +35,17 @@ void validate_core_read_write_bounds(
     IDevice* device, const CoreCoord& virtual_core, DeviceAddr address, uint32_t size_bytes) {
     const HalMemType mem_type = device->get_mem_type_of_core(virtual_core);
     if (mem_type == HalMemType::L1) {
-        const DeviceAddr l1_base_address = device->get_dev_addr(virtual_core, HalL1MemAddrType::BASE);
-        const DeviceAddr l1_size = device->get_dev_size(virtual_core, HalL1MemAddrType::BASE);
+        const auto& hal = tt::tt_metal::MetalContext::instance(extract_context_id(device)).hal();
+        HalProgrammableCoreType programmable_core_type = device->get_programmable_core_type(virtual_core);
+        const DeviceAddr l1_base_address = hal.get_dev_addr(programmable_core_type, HalL1MemAddrType::BASE);
+        const DeviceAddr l1_size = hal.get_dev_size(programmable_core_type, HalL1MemAddrType::BASE);
 
         TT_FATAL(address >= l1_base_address, "Region in L1 is out of bounds");
         TT_FATAL(address + size_bytes <= l1_base_address + l1_size, "Region in L1 is out of bounds");
     } else {
         TT_ASSERT(mem_type == HalMemType::DRAM);
 
-        auto& soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device->id());
+        const auto& soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device->id());
         const uint32_t dram_channel = device->dram_channel_from_virtual_core(virtual_core);
         const DeviceAddr dram_base_address = soc_desc.get_address_offset(dram_channel);
 
@@ -49,7 +59,7 @@ void validate_core_read_write_bounds(
 DeviceAddr add_bank_offset_to_address(IDevice* device, const CoreCoord& virtual_core, DeviceAddr address) {
     const HalMemType mem_type = device->get_mem_type_of_core(virtual_core);
     if (mem_type == HalMemType::DRAM) {
-        auto& soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device->id());
+        const auto& soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device->id());
         const uint32_t dram_channel = device->dram_channel_from_virtual_core(virtual_core);
         address += soc_desc.get_address_offset(dram_channel);
     }
@@ -77,7 +87,8 @@ void issue_core_write_command_sequence(const CoreWriteDispatchParams& dispatch_p
             CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
             0,
             tt::tt_metal::MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(offset_index),
-            dispatch_params.expected_num_workers_completed[offset_index]);
+            dispatch_params.expected_num_workers_completed[offset_index],
+            dispatch_params.cq_id);
     }
 
     command_sequence.add_dispatch_write_linear<true, true>(
@@ -92,22 +103,24 @@ void issue_core_write_command_sequence(const CoreWriteDispatchParams& dispatch_p
     sysmem_manager.fetch_queue_write(cmd_sequence_sizeB, dispatch_params.cq_id);
 }
 
-void write_to_core(
+namespace {
+// Shared body of write_to_core / write_to_core_unchecked: chunk the write across the max
+// prefetch payload size and issue a command sequence per chunk. `address` is used verbatim
+// as the full device destination (no bank/channel translation).
+void write_to_core_impl(
     IDevice* device,
     const CoreCoord& virtual_core,
     const void* src,
     DeviceAddr address,
     uint32_t size_bytes,
     uint32_t cq_id,
-    tt::stl::Span<const uint32_t> expected_num_workers_completed,
-    tt::stl::Span<const SubDeviceId> sub_device_ids) {
-    validate_core_read_write_bounds(device, virtual_core, address, size_bytes);
-
+    ttsl::Span<const uint32_t> expected_num_workers_completed,
+    ttsl::Span<const SubDeviceId> sub_device_ids) {
     while (size_bytes > 0) {
         const CoreType dispatch_core_type =
             MetalContext::instance().get_dispatch_core_manager().get_dispatch_core_type();
         const uint32_t size_bytes_to_write =
-            std::min(size_bytes, calculate_max_prefetch_data_size_bytes(dispatch_core_type));
+            std::min(size_bytes, calculate_max_prefetch_data_size_bytes(dispatch_core_type, sub_device_ids.size()));
 
         CoreWriteDispatchParams dispatch_params{
             {virtual_core,
@@ -125,6 +138,36 @@ void write_to_core(
         address += size_bytes_to_write;
         src = (uint8_t*)src + size_bytes_to_write;
     }
+}
+}  // namespace
+
+void write_to_core(
+    IDevice* device,
+    const CoreCoord& virtual_core,
+    const void* src,
+    DeviceAddr address,
+    uint32_t size_bytes,
+    uint32_t cq_id,
+    ttsl::Span<const uint32_t> expected_num_workers_completed,
+    ttsl::Span<const SubDeviceId> sub_device_ids) {
+    validate_core_read_write_bounds(device, virtual_core, address, size_bytes);
+    write_to_core_impl(
+        device, virtual_core, src, address, size_bytes, cq_id, expected_num_workers_completed, sub_device_ids);
+}
+
+void write_to_core_unchecked(
+    IDevice* device,
+    const CoreCoord& virtual_core,
+    const void* src,
+    DeviceAddr address,
+    uint32_t size_bytes,
+    uint32_t cq_id,
+    ttsl::Span<const uint32_t> expected_num_workers_completed,
+    ttsl::Span<const SubDeviceId> sub_device_ids) {
+    // Same as write_to_core, minus validate_core_read_write_bounds: the DRAM-banked bounds
+    // check would reject programmable DRAM-core (DRISC) L1.
+    write_to_core_impl(
+        device, virtual_core, src, address, size_bytes, cq_id, expected_num_workers_completed, sub_device_ids);
 }
 
 void issue_core_read_command_sequence(const CoreReadDispatchParams& dispatch_params) {
@@ -150,16 +193,18 @@ void issue_core_read_command_sequence(const CoreReadDispatchParams& dispatch_par
             CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
             0,
             tt::tt_metal::MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(offset_index),
-            dispatch_params.expected_num_workers_completed[offset_index]);
+            dispatch_params.expected_num_workers_completed[offset_index],
+            dispatch_params.cq_id);
     }
     const uint8_t offset_index = *dispatch_params.sub_device_ids[last_index];
     command_sequence.add_dispatch_wait_with_prefetch_stall(
         CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER,
         0,
         tt::tt_metal::MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(offset_index),
-        dispatch_params.expected_num_workers_completed[offset_index]);
+        dispatch_params.expected_num_workers_completed[offset_index],
+        dispatch_params.cq_id);
 
-    command_sequence.add_dispatch_write_host(false, dispatch_params.size_bytes, false);
+    command_sequence.add_dispatch_write_host(false, dispatch_params.size_bytes, false, 0);
 
     command_sequence.add_prefetch_relay_linear(
         dispatch_params.device->get_noc_unicast_encoding(k_dispatch_downstream_noc, dispatch_params.virtual_core),
@@ -171,9 +216,29 @@ void issue_core_read_command_sequence(const CoreReadDispatchParams& dispatch_par
     sysmem_manager.fetch_queue_write(cmd_sequence_sizeB, dispatch_params.cq_id);
 }
 
+void read_completion_queue(
+    void* dst,
+    uint32_t size_bytes,
+    ChipId device_id,
+    uint16_t channel,
+    uint32_t addr,
+    const SystemMemoryManager& sysmem_manager) {
+    if (sysmem_manager.is_dram_backed()) {
+        const uint32_t dram_channel = tt::tt_metal::MetalContext::instance()
+                                          .device_manager()
+                                          ->get_active_device(device_id)
+                                          ->allocator_impl()
+                                          ->get_dram_channel_from_bank_id(sysmem_manager.get_dram_region_bank_id());
+        tt::tt_metal::MetalContext::instance().get_cluster().read_dram_vec(
+            dst, size_bytes, device_id, dram_channel, addr);
+    } else {
+        tt::tt_metal::MetalContext::instance().get_cluster().read_sysmem(dst, size_bytes, addr, device_id, channel);
+    }
+}
+
 void read_core_data_from_completion_queue(
     const ReadCoreDataDescriptor& read_descriptor,
-    chip_id_t mmio_device_id,
+    ChipId mmio_device_id,
     uint16_t channel,
     uint8_t cq_id,
     SystemMemoryManager& sysmem_manager,
@@ -207,21 +272,21 @@ void read_core_data_from_completion_queue(
         const uint32_t num_bytes_to_copy = std::min(
             num_bytes_to_read - num_bytes_read, num_bytes_available_in_completion_queue - completion_queue_read_offset);
 
-        tt::tt_metal::MetalContext::instance().get_cluster().read_sysmem(
+        read_completion_queue(
             (char*)(uint64_t(read_descriptor.dst) + num_bytes_read),
             num_bytes_to_copy,
-            completion_q_read_ptr + completion_queue_read_offset,
             mmio_device_id,
-            channel);
+            channel,
+            completion_q_read_ptr + completion_queue_read_offset,
+            sysmem_manager);
 
         num_bytes_read += num_bytes_to_copy;
         const uint32_t num_pages_read =
-            div_up(num_bytes_to_copy + completion_queue_read_offset, DispatchSettings::TRANSFER_PAGE_SIZE);
+            tt::div_up(num_bytes_to_copy + completion_queue_read_offset, DispatchSettings::TRANSFER_PAGE_SIZE);
         sysmem_manager.completion_queue_pop_front(num_pages_read, cq_id);
         completion_queue_read_offset = 0;
     }
 }
 
 }  // namespace device_dispatch
-}  // namespace tt_metal
-}  // namespace tt
+}  // namespace tt::tt_metal

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,14 +7,13 @@ import pytest
 
 import numpy as np
 import ttnn
-from models.utility_functions import is_wormhole_b0
+from models.common.utility_functions import is_wormhole_b0
 from ttnn.device import Arch
 
 
 def test_run_sfpu_eps(device):
     shape = [1, 1, 32, 32]
     eps_mapping = {
-        Arch.GRAYSKULL: 0.001953125,
         Arch.WORMHOLE_B0: 1.1920899822825959e-07,
         Arch.BLACKHOLE: 1.1920899822825959e-07,
     }

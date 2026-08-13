@@ -1,10 +1,10 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <fmt/base.h>
 #include <gtest/gtest.h>
-#include <stddef.h>
+#include <cstddef>
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/host_api.hpp>
 #include <cstdint>
@@ -15,29 +15,21 @@
 #include <variant>
 #include <vector>
 
-#include <tt-metalium/assert.hpp>
-#include <tt-metalium/buffer.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/device.hpp>
 #include "mesh_dispatch_fixture.hpp"
 #include <tt-metalium/distributed.hpp>
 #include "hostdevcommon/kernel_structs.h"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/program.hpp>
 #include <tt_stl/span.hpp>
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include "tt_metal/test_utils/comparison.hpp"
-
-namespace tt {
-namespace tt_metal {
-class CommandQueue;
-}  // namespace tt_metal
-}  // namespace tt
 
 namespace tt::tt_metal {
 
@@ -46,7 +38,7 @@ using namespace tt;
 using CoreSpec = std::variant<CoreCoord, CoreRange, CoreRangeSet>;
 
 std::shared_ptr<distributed::MeshBuffer> MakeMeshBuffer(
-    std::shared_ptr<distributed::MeshDevice> mesh_device, uint32_t size, uint32_t page_size, bool sram) {
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device, uint32_t size, uint32_t page_size, bool sram) {
     distributed::DeviceLocalBufferConfig local_config = {
         .page_size = page_size, .buffer_type = (sram ? BufferType::L1 : BufferType::DRAM), .bottom_up = false};
     distributed::ReplicatedBufferConfig replicated_config = {.size = size};
@@ -54,7 +46,7 @@ std::shared_ptr<distributed::MeshBuffer> MakeMeshBuffer(
 }
 
 std::shared_ptr<distributed::MeshBuffer> MakeMeshBufferBFP16(
-    std::shared_ptr<distributed::MeshDevice> mesh_device, uint32_t n_tiles, bool sram) {
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device, uint32_t n_tiles, bool sram) {
     constexpr uint32_t tile_size = sizeof(bfloat16) * tt::constants::TILE_WIDTH * tt::constants::TILE_HEIGHT;
     // For simplicity, all DRAM buffers have page size = tile size.
     const uint32_t page_tiles = sram ? n_tiles : 1;
@@ -75,7 +67,7 @@ CBHandle MakeCircularBufferBFP16(Program& program, const CoreSpec& core, tt::CBI
 namespace unit_tests_common::vecadd::test_vecadd_multi_core {
 
 bool vecadd_multi_core(
-    MeshDispatchFixture* fixture, std::shared_ptr<distributed::MeshDevice> mesh_device, uint32_t n_tiles) {
+    MeshDispatchFixture* /*fixture*/, const std::shared_ptr<distributed::MeshDevice>& mesh_device, uint32_t n_tiles) {
     const uint32_t num_core = 4;
     TT_FATAL(n_tiles >= num_core, "Parameter mismatch {} {}", n_tiles, num_core);
 
@@ -107,9 +99,9 @@ bool vecadd_multi_core(
     std::vector<bfloat16> b_data = create_random_vector_of_bfloat16_native(tile_size * n_tiles * 2, 10, rng());
 
     const uint32_t cir_buffer_title = 4;
-    CBHandle cb_a = MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_0, cir_buffer_title);
-    CBHandle cb_b = MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_1, cir_buffer_title);
-    CBHandle cb_c = MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_2, cir_buffer_title);
+    MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_0, cir_buffer_title);
+    MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_1, cir_buffer_title);
+    MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_2, cir_buffer_title);
 
     std::vector<uint32_t> reader_compile_time_args = {(std::uint32_t)tt::CBIndex::c_0, (std::uint32_t)tt::CBIndex::c_1};
     std::vector<uint32_t> writer_compile_time_args = {(std::uint32_t)tt::CBIndex::c_2};
@@ -150,7 +142,7 @@ bool vecadd_multi_core(
     distributed::WriteShard(cq, a, a_data, zero_coord);
     distributed::WriteShard(cq, b, b_data, zero_coord);
     // Enqueue the program
-    distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+    workload.add_program(device_range, std::move(program));
     distributed::EnqueueMeshWorkload(cq, workload, false);
 
     log_debug(LogTest, "Kernel execution finished");
@@ -165,8 +157,8 @@ bool vecadd_multi_core(
         const auto core_offset = core * (tile_size + tiles_per_core);
         for (int index = 0; index < data_per_core; index++) {
             const auto i = core_offset + index;
-            float golden = a_data[i].to_float() + b_data[i].to_float();
-            pass &= tt::test_utils::is_close<float>(golden, c_data[i].to_float(), 0.015f);
+            float golden = static_cast<float>(a_data[i]) + static_cast<float>(b_data[i]);
+            pass &= tt::test_utils::is_close<float>(golden, static_cast<float>(c_data[i]), 0.015f);
         }
     }
 

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,11 +6,12 @@
 
 #include <stdint.h>
 #include <optional>
-#include "fabric_edm_packet_header.hpp"
+#include "fabric/fabric_edm_packet_header.hpp"
 #include "fd_kernel.hpp"
+#include "impl/context/context_descriptor.hpp"
 #include "tt_metal/impl/dispatch/system_memory_manager.hpp"
-#include <tt-metalium/control_plane.hpp>
-#include <tt-metalium/fabric.hpp>
+#include <tt-metalium/experimental/fabric/control_plane.hpp>
+#include <tt-metalium/experimental/fabric/fabric.hpp>
 
 namespace tt::tt_metal {
 
@@ -66,13 +67,31 @@ private:
 public:
     RelayMux(
         int node_id,
-        chip_id_t device_id,
-        chip_id_t servicing_device_id,
+        ChipId device_id,
+        ChipId servicing_device_id,
         uint8_t cq_id,
         noc_selection_t noc_selection,
         bool d2h,
-        int tunnel_index) :
-        FDKernel(node_id, device_id, servicing_device_id, cq_id, noc_selection), d2h_{d2h}, tunnel_id_{tunnel_index} {
+        int tunnel_index,
+        const ContextDescriptor& descriptor,
+        dispatch_core_manager& dispatch_core_manager,
+        const GetControlPlaneFn& get_control_plane,
+        const GetDispatchQueryManagerFn& get_dispatch_query_manager,
+        const GetReadsDispatchCoresFn& get_reads_dispatch_cores) :
+        FDKernel(
+            node_id,
+            device_id,
+            servicing_device_id,
+            cq_id,
+            noc_selection,
+            descriptor,
+            dispatch_core_manager,
+            get_control_plane,
+            get_dispatch_query_manager,
+            {},
+            get_reads_dispatch_cores),
+        d2h_{d2h},
+        tunnel_id_{tunnel_index} {
         TT_FATAL(tunnel_id_ >= 0, "Relay Mux Tunnel Index must be >= 0");
         kernel_type_ = FDKernelType::ROUTING;
     }
@@ -85,7 +104,7 @@ public:
         return tt::tt_metal::TerminationInfo{
             .logical_core = logical_core_,
             .core_type = GetCoreType(),
-            .address = this->mux_kernel_config_->get_termination_signal_address(),
+            .address = static_cast<uint32_t>(this->mux_kernel_config_->get_termination_signal_address()),
             .val = tt::tt_fabric::TerminationSignal::IMMEDIATELY_TERMINATE,
         };
     }
@@ -100,6 +119,14 @@ public:
     // and workers that only need the header only channel are specified in the downstream kernels.
     // Throws if not found
     int GetWorkerChannelIndex(int worker_id, tt::tt_fabric::FabricMuxChannelType channel_type) const;
+
+    // Get the link index used by dispatch for coordination with fabric tensix
+    static uint32_t get_dispatch_link_index(
+        const tt_fabric::ControlPlane& control_plane,
+        bool is_galaxy_cluster,
+        tt::tt_fabric::FabricNodeId src_fabric_node_id,
+        tt::tt_fabric::FabricNodeId dst_fabric_node_id,
+        IDevice* device);
 };
 
 // Helper function to assemble the dispatch_fabric_mux_client_config args
@@ -111,12 +138,16 @@ void assemble_fabric_mux_client_config_args(
 
 // Helper function to calculate number of hops from a mmio device to downstream device
 // The two devices must be along the same tunnel.
-int get_num_hops(chip_id_t mmio_dev_id, chip_id_t downstream_dev_id);
+int get_num_hops(const ContextDescriptor& descriptor, ChipId mmio_dev_id, ChipId downstream_dev_id);
 
-// Helper function to assemble args specific to the 2D fabric header
+// Helper function to assemble args specific to the 2D fabric header (takes control plane directly; no
+// ContextDescriptor).
 template <typename Configuration>
-void assemble_2d_fabric_packet_header_args(Configuration& config, int my_device_id, int destination_device_id) {
-    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
+void assemble_2d_fabric_packet_header_args(
+    Configuration& config,
+    int my_device_id,
+    int destination_device_id,
+    const tt::tt_fabric::ControlPlane& control_plane) {
     const auto& src_fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(my_device_id);
     const auto& dst_fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(destination_device_id);
     const auto& forwarding_direction = control_plane.get_forwarding_direction(src_fabric_node_id, dst_fabric_node_id);

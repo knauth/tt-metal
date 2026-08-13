@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -9,8 +9,9 @@
 
 using namespace tt::tt_metal;
 
-namespace ttnn::operations::moreh::moreh_group_norm_backward {
-std::vector<std::optional<Tensor>> MorehGroupNormBackward::invoke(
+namespace ttnn {
+
+std::vector<std::optional<Tensor>> moreh_group_norm_backward(
     const Tensor& output_grad,
     const Tensor& input,
     const Tensor& mean,
@@ -26,6 +27,7 @@ std::vector<std::optional<Tensor>> MorehGroupNormBackward::invoke(
     const std::optional<MemoryConfig>& beta_grad_memory_config,
     const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
     std::vector<std::optional<Tensor>> outputs;
+    outputs.reserve(3);
 
     if (are_required_outputs[0]) {
         outputs.push_back(ttnn::prim::moreh_group_norm_backward_input_grad(
@@ -55,8 +57,8 @@ std::vector<std::optional<Tensor>> MorehGroupNormBackward::invoke(
             gamma_grad_memory_config,
             beta_grad_memory_config,
             compute_kernel_config);
-        outputs.push_back(std::move(dgamma_dbeta[0]));
-        outputs.push_back(std::move(dgamma_dbeta[1]));
+        outputs.push_back(dgamma_dbeta[0]);
+        outputs.push_back(dgamma_dbeta[1]);
 
     } else {
         outputs.push_back(std::nullopt);
@@ -65,4 +67,4 @@ std::vector<std::optional<Tensor>> MorehGroupNormBackward::invoke(
     return outputs;
 }
 
-}  // namespace ttnn::operations::moreh::moreh_group_norm_backward
+}  // namespace ttnn

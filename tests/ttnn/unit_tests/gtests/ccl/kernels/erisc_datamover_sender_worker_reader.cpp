@@ -1,25 +1,27 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-#include "dataflow_api.h"
-#include "debug/dprint.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/debug/dprint.h"
 
 void kernel_main() {
-    constexpr bool src_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr uint32_t num_pages_to_read_total = get_compile_time_arg_val(1);
-    constexpr uint32_t page_size = get_compile_time_arg_val(2);
-    constexpr uint32_t pages_per_edm_buffer = get_compile_time_arg_val(3);
+    constexpr uint32_t num_pages_to_read_total = get_compile_time_arg_val(0);
+    constexpr uint32_t page_size = get_compile_time_arg_val(1);
+    constexpr uint32_t pages_per_edm_buffer = get_compile_time_arg_val(2);
+    constexpr auto src_args = TensorAccessorArgs<3>();
     constexpr uint32_t cb_id_in0 = tt::CBIndex::c_0;
 
     const uint32_t src_addr = get_arg_val<uint32_t>(0);
+    const auto source_address_generator = TensorAccessor(src_args, src_addr);
 
-    const InterleavedAddrGen<src_is_dram> source_address_generator = {
-        .bank_base_address = src_addr, .page_size = page_size};
-
-    DPRINT << "swr: args " << "\n\tsrc_addr=" << src_addr << "\n\tsrc_is_dram=" << (src_is_dram ? "T" : "F")
-           << "\n\tnum_pages_to_read_total=" << num_pages_to_read_total << "\n\tpage_size=" << page_size << "\n";
+    DPRINT(
+        "swr: args \n\tsrc_addr={}\n\tsrc_is_dram={}\n\tnum_pages_to_read_total={}\n\tpage_size={}\n",
+        src_addr,
+        (src_args.is_dram ? "T" : "F"),
+        num_pages_to_read_total,
+        page_size);
 
     for (uint32_t num_pages_read = 0; num_pages_read < num_pages_to_read_total;
          num_pages_read += pages_per_edm_buffer) {
@@ -36,5 +38,5 @@ void kernel_main() {
         noc_async_read_barrier();
         cb_push_back(cb_id_in0, pages_to_read);
     }
-    DPRINT << "SR DONE\n";
+    DPRINT("SR DONE\n");
 }

@@ -1,23 +1,21 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ttnn/common/queue_id.hpp"
-
-#include <tt-metalium/constants.hpp>
-
 #include "all_to_all_dispatch.hpp"
 #include "device/all_to_all_dispatch_device_operation.hpp"
-#include "ttnn/run_operation.hpp"
+#include "ttnn/operation.hpp"
 #include "ttnn/operations/ccl/ccl_host_types.hpp"
 #include <tt-metalium/sub_device.hpp>
 #include <tt-metalium/hal.hpp>
-#include <tt-metalium/fabric.hpp>
+#include <tt-metalium/experimental/fabric/fabric.hpp>
+#include "ttnn/operations/ccl/common/host/moe_utils.hpp"
+#include "ttnn/operations/experimental/ccl/composite_common.hpp"
 
-namespace ttnn::operations::ccl {
+namespace ttnn {
+using namespace ttnn::operations::ccl;
 
-std::array<ttnn::Tensor, 2> ExecuteAllToAllDispatch::invoke(
-    QueueId queue_id,
+std::array<ttnn::Tensor, 2> all_to_all_dispatch(
     const ttnn::Tensor& input_tensor,
     const ttnn::Tensor& expert_indices_tensor,
     const ttnn::Tensor& expert_mapping_tensor,
@@ -27,20 +25,19 @@ std::array<ttnn::Tensor, 2> ExecuteAllToAllDispatch::invoke(
     std::optional<tt::tt_fabric::Topology> topology,
     const std::optional<ttnn::MemoryConfig>& memory_config,
     const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id,
-    const std::optional<GlobalSemaphore>& global_semaphore) {
-    auto mesh_device = input_tensor.mesh_device();
+    const std::optional<uint32_t>& output_concat_dim) {
+    auto* mesh_device = input_tensor.device();
     auto sd_id = subdevice_id.value_or(mesh_device->get_sub_device_ids().at(0));
     auto subdevice_core_range_set = mesh_device->worker_cores(tt::tt_metal::HalProgrammableCoreType::TENSIX, sd_id);
 
-    uint32_t num_links_ = num_links.value_or(1);
-    tt::tt_fabric::Topology topology_ = topology.value_or(tt::tt_fabric::get_fabric_topology());
+    uint32_t num_links_ = num_links.value_or(ttnn::operations::ccl::common::get_num_links(*mesh_device, axis));
+    log_debug(tt::LogOp, "num_links: {}", num_links_);
+    tt::tt_fabric::Topology topology_ = ::ttnn::ccl::get_usable_topology(input_tensor, topology, axis);
     auto memory_config_ = memory_config.value_or(input_tensor.memory_config());
+    uint32_t output_concat_dim_ = output_concat_dim.value_or(1);
 
-    TT_FATAL(
-        global_semaphore.has_value(),
-        "Global semaphore is required for all_to_all_dispatch due to limitations in trace");
-    const auto [cb_sizes, cb_page_sizes] =
-        detail::get_cb_sizes(input_tensor, expert_indices_tensor, expert_mapping_tensor, num_links_, axis);
+    const auto [cb_sizes, cb_page_sizes] = ttnn::operations::ccl::detail::get_cb_sizes(
+        input_tensor, expert_indices_tensor, expert_mapping_tensor, num_links_, axis);
 
     AllToAllDispatchDeviceOperation::AllToAllTransferType impl =
         AllToAllDispatchDeviceOperation::AllToAllTransferType::FullPacket;
@@ -57,16 +54,16 @@ std::array<ttnn::Tensor, 2> ExecuteAllToAllDispatch::invoke(
         if (metadata_tensor.buffer()->is_l1()) {
             total_size_bytes += metadata_tensor.buffer()->aligned_size_per_bank();
         }
-    } else {
-        std::array<ttnn::TensorSpec, 2> specs = AllToAllDispatchDeviceOperation::compute_output_specs(
+    } else if (memory_config_.buffer_type() == tt::tt_metal::BufferType::L1) {
+        std::array<tt::tt_metal::TensorSpec, 2> specs = AllToAllDispatchDeviceOperation::compute_output_specs(
             AllToAllDispatchDeviceOperation::operation_attributes_t{
                 .worker_core_range_set = subdevice_core_range_set,
                 .output_mem_config = memory_config_,
                 .axis = axis,
                 .num_links = num_links_,
                 .topology = topology_,
-                .cross_device_semaphore = global_semaphore,
-                .impl = impl},
+                .impl = impl,
+                .output_concat_dim = output_concat_dim_},
             AllToAllDispatchDeviceOperation::tensor_args_t{
                 .input_tensor = input_tensor,
                 .expert_indices_tensor = expert_indices_tensor,
@@ -102,8 +99,8 @@ std::array<ttnn::Tensor, 2> ExecuteAllToAllDispatch::invoke(
         topology_,
         memory_config_,
         subdevice_core_range_set,
-        global_semaphore,
-        impl);
+        impl,
+        output_concat_dim_);
 }
 
-}  // namespace ttnn::operations::ccl
+}  // namespace ttnn

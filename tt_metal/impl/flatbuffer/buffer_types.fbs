@@ -16,16 +16,12 @@ enum TensorMemoryLayout: ushort {
   HeightSharded = 2,
   WidthSharded = 3,
   BlockSharded = 4,
+  NdSharded = 5,
 }
 
 enum ShardOrientation : ubyte {
     RowMajor = 0,
     ColMajor = 1,
-}
-
-enum ShardMode : ubyte {
-    Physical,
-    Logical,
 }
 
 table ShardShape {
@@ -38,8 +34,6 @@ table ShardSpec {
     shape_h: uint32;
     shape_w: uint32;
     orientation: ShardOrientation;
-    shard_mode: ShardMode;
-    physical_shard_shape: ShardShape;
 }
 
 table ShardSpecBuffer {
@@ -72,6 +66,12 @@ struct CBConfigTile {
   tile: Tile;     // The tile for this index
 }
 
+struct CBConfigUnpackFaceGeometry {
+  index: uint32;       // The index in the array
+  face_r_dim: uint32;  // The unpack face row dimension for this index
+  num_faces: uint32;   // The number of logical faces for this index
+}
+
 table CircularBufferConfig {
   total_size: uint32;
   globally_allocated_address: Uint32Optional;
@@ -85,4 +85,5 @@ table CircularBufferConfig {
   dynamic_cb: bool;
   max_size: uint32;
   buffer_size: uint32;
+  unpack_face_geometry: [CBConfigUnpackFaceGeometry]; // Mimic optional array in C++ by using KV map.
 }

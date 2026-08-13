@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -13,7 +13,7 @@ import ttnn
 from tt_lib.utils import pad_activation, pad_weight
 from models.experimental.bert.fused_ops.linear import Linear as TtLinear
 from tt_lib.fused_ops.softmax import softmax
-from models.utility_functions import (
+from models.common.utility_functions import (
     comp_pcc,
     comp_allclose,
 )
@@ -205,6 +205,7 @@ class PytorchMultiHeadAttentionModel(torch.nn.Module):
 def run_mha_inference(device, model_version, batch, seq_len, pcc, model_location_generator):
     model_name = str(model_location_generator(model_version, model_subdir="Bert"))
 
+    # NOTE(transformers-5.x): `torchscript=` was removed from transformers configs in 5.x; drop it (a default no-op) when running this experimental model under 5.x.
     hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
     tt_mha_model = TtMultiHeadAttentionModel(
         hugging_face_reference_model.config,
@@ -254,6 +255,4 @@ def run_mha_inference(device, model_version, batch, seq_len, pcc, model_location
     ),
 )
 def test_mha_inference(device, model_version, batch, seq_len, pcc, model_location_generator):
-    # enable_persistent_kernel_cache()
-
     run_mha_inference(device, model_version, batch, seq_len, pcc, model_location_generator)

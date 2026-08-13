@@ -1,11 +1,10 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "linear_module.hpp"
 
 #include <cmath>
-#include <core/ttnn_all_includes.hpp>
 
 #include "autograd/auto_context.hpp"
 #include "autograd/tensor.hpp"
@@ -18,7 +17,6 @@ namespace ttml::modules {
 
 namespace {
 ttml::autograd::TensorPtr create_weight(uint32_t in_features, uint32_t out_features) {
-    auto* device = &autograd::ctx().get_device();
     auto weight_shape = ttnn::Shape({1, 1, out_features, in_features});
     auto weight = ttml::autograd::create_tensor();
     const float init_k = std::sqrt(1.F / static_cast<float>(in_features));
@@ -27,7 +25,6 @@ ttml::autograd::TensorPtr create_weight(uint32_t in_features, uint32_t out_featu
 }
 ttml::autograd::TensorPtr create_bias(uint32_t in_features, uint32_t out_features) {
     const float init_k = std::sqrt(1.F / static_cast<float>(in_features));
-    auto* device = &ttml::autograd::ctx().get_device();
     auto bias_shape = ttnn::Shape({1, 1, 1, out_features});
     auto bias = ttml::autograd::create_tensor();
     ttml::init::uniform_init(bias, bias_shape, ttml::init::UniformRange{-init_k, init_k});

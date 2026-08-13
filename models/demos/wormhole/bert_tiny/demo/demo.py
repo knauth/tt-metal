@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,13 +8,14 @@ import evaluate
 import pytest
 import torch
 from loguru import logger
-from transformers import BertForQuestionAnswering, BertTokenizer, pipeline
+from transformers import BertForQuestionAnswering, BertTokenizer
 from ttnn.model_preprocessing import preprocess_model_parameters
 
 import ttnn
+from models.common.utility_functions import is_wormhole_b0, profiler
 from models.datasets.dataset_squadv2 import squadv2_1K_samples_input, squadv2_answer_decode_batch
+from models.demos.utils.qa_pipeline_compat import QuestionAnsweringPipeline
 from models.demos.wormhole.bert_tiny.tt.bert_tiny import bert_for_question_answering, preprocess_inputs
-from models.utility_functions import disable_persistent_kernel_cache, is_wormhole_b0, profiler, skip_for_grayskull
 
 
 def load_inputs(input_path, batch):
@@ -47,15 +48,14 @@ def run_bert_question_and_answering_inference(
     model_location_generator,
     input_path,
 ):
-    disable_persistent_kernel_cache()
     model = str(model_location_generator(model_name, model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model)
     pytorch_model = hugging_face_reference_model.eval()
 
     tokenizer_name = str(model_location_generator(model_name, model_subdir="Bert"))
     tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
     config = hugging_face_reference_model.config
-    nlp = pipeline("question-answering", model=hugging_face_reference_model, tokenizer=tokenizer)
+    nlp = QuestionAnsweringPipeline(model=hugging_face_reference_model, tokenizer=tokenizer)
 
     profiler.start(f"preprocessing_parameter")
     mesh_device_flag = is_wormhole_b0() and ttnn.GetNumAvailableDevices() == 2
@@ -86,8 +86,11 @@ def run_bert_question_and_answering_inference(
         }
         preprocessed_inputs.append(single_input)
 
-    bert_input = tokenizer.batch_encode_plus(
-        zip(question, context),
+    # transformers 5.x removed tokenizer.batch_encode_plus; __call__ with text/text_pair lists is the
+    # supported replacement and pairs question[i] with context[i] (as zip(question, context) did).
+    bert_input = tokenizer(
+        text=question,
+        text_pair=context,
         max_length=sequence_size,
         padding="max_length",
         truncation=True,
@@ -164,10 +167,8 @@ def run_bert_question_and_answering_inference_squad_v2(
     model_location_generator,
     n_iterations,
 ):
-    disable_persistent_kernel_cache()
-
     model = str(model_location_generator(model_name, model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model)
     pytorch_model = hugging_face_reference_model.eval()
 
     # set up tokenizer
@@ -187,7 +188,7 @@ def run_bert_question_and_answering_inference_squad_v2(
             convert_to_ttnn=lambda *_: True,
         )
 
-    nlp = pipeline("question-answering", model=hugging_face_reference_model, tokenizer=tokenizer)
+    nlp = QuestionAnsweringPipeline(model=hugging_face_reference_model, tokenizer=tokenizer)
 
     attention_mask = True
     token_type_ids = True
@@ -251,7 +252,6 @@ def run_bert_question_and_answering_inference_squad_v2(
         logger.info(f"CPU_Eval: exact: {cpu_eval_score['exact']} -- F1:  {cpu_eval_score['f1']}")
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
 @pytest.mark.parametrize("sequence_size", [128])
 @pytest.mark.parametrize("model_name", ["mrm8488/bert-tiny-finetuned-squadv2"])
@@ -263,8 +263,6 @@ def test_demo(
     model_location_generator,
     mesh_device,
 ):
-    disable_persistent_kernel_cache()
-
     return run_bert_question_and_answering_inference(
         mesh_device=mesh_device,
         model_name=model_name,
@@ -274,7 +272,6 @@ def test_demo(
     )
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
 @pytest.mark.parametrize("sequence_size", [384])
 @pytest.mark.parametrize("model_name", ["mrm8488/bert-tiny-finetuned-squadv2"])
@@ -289,8 +286,6 @@ def test_demo_squadv2(
     model_location_generator,
     mesh_device,
 ):
-    disable_persistent_kernel_cache()
-
     return run_bert_question_and_answering_inference_squad_v2(
         mesh_device=mesh_device,
         model_name=model_name,

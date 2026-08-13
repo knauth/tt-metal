@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -8,6 +8,8 @@
 #include <random>
 #include <span>
 #include <string>
+
+#include <yaml-cpp/yaml.h>
 
 #include "autograd/auto_context.hpp"
 #include "dataset_subset.hpp"
@@ -43,6 +45,7 @@ std::vector<DatasetSubset<DatasetType>> random_split(
 
     // Create the subsets
     std::vector<DatasetSubset<DatasetType>> subsets;
+    subsets.reserve(split_sizes.size());
     auto current_iter = indices.begin();
     for (size_t size : split_sizes) {
         std::vector<size_t> subset_indices(current_iter, current_iter + (long)size);
@@ -53,6 +56,6 @@ std::vector<DatasetSubset<DatasetType>> random_split(
     return subsets;
 }
 
-std::vector<uint32_t> load_tokens_from_space_separated_file(const std::string& file_path);
+InMemoryTokenDataset create_token_dataset_from_yaml(const YAML::Node& yaml_data);
 
 }  // namespace ttml::datasets

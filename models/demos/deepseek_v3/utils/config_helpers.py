@@ -1,20 +1,190 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC.
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import itertools
 import math
+import os
+from contextlib import contextmanager
 from itertools import takewhile
-from typing import Any, Sequence
+from pathlib import Path
+from types import NoneType
+from typing import Any, Mapping, Sequence
 
 import torch
 from loguru import logger
 
 import ttnn
+from models.demos.deepseek_v3.utils.config_dataclass import (
+    ConfigWeight,
+    DeepseekSamplingArgs,
+    PrefillChunkSizes,
+    SavedWeight,
+)
 
 # Constants
 NORM_CATEGORIES = {"attention_norm", "mlp_norm", "q_norm", "k_norm"}
-MAX_BATCH_SIZE = 32
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value.strip().lower() not in ("", "0", "false")
+
+
+def get_fabric_config() -> ttnn.FabricConfig:
+    """Get the fabric config for the model."""
+    return ttnn.FabricConfig.FABRIC_1D_RING if _env_flag_enabled("USE_TORUS_MODE") else ttnn.FabricConfig.FABRIC_1D
+
+
+def is_ring_fabric(fabric_config: ttnn.FabricConfig) -> bool:
+    """Check whether the given fabric config has a RING configuration"""
+    return fabric_config == ttnn.FabricConfig.FABRIC_1D_RING
+
+
+def is_quad_mesh_env() -> bool:
+    """True when ``MESH_DEVICE`` requests a QUAD run (before a mesh device exists)."""
+    return os.getenv("MESH_DEVICE") == "QUAD"
+
+
+# We can't warmup prefill for all possible prompt lengths, only warmup for the selective prompt lengths.
+# LINEAR_ADDITIVE: tile, 2*tile, 3*tile, ... hf_config.max_seq_len
+# LINEAR_MULTIPLES: tile, 2*tile, 4*tile, 8*tile, ... hf_config.max_seq_len
+PREFILL_WARMUP_MODE_LINEAR_ADDITIVE = "LINEAR_ADDITIVE"
+PREFILL_WARMUP_MODE_LINEAR_MULTIPLES = "LINEAR_MULTIPLES"
+DEFAULT_PREFILL_WARMUP_MODE_VLLM = PREFILL_WARMUP_MODE_LINEAR_MULTIPLES
+DEFAULT_PREFILL_WARMUP_MODE_DEMO = PREFILL_WARMUP_MODE_LINEAR_ADDITIVE
+
+
+def is_quad_mesh(mesh_device: ttnn.MeshDevice) -> bool:
+    """Check whether the mesh device has a QUAD configuration (16x8)."""
+    return mesh_device.shape[0] == 16 and mesh_device.shape[1] == 8
+
+
+OPTIMIZED_MOE_BLOCK_USERS_PER_ROW = 32
+USERS_PER_ROW = 32
+DEFAULT_MAX_SEQ_LEN = 2048
 SEQ_LEN_CHUNK_SIZE = 1024  # NOTE: should be 512 for blackhole (in case of future bring-up)
+Q_CHUNK_SIZE = 128
+K_CHUNK_SIZE = int(os.getenv("DEEPSEEK_K_CHUNK_SIZE", "64"))
 TOPK_MIN_WIDTH = 64  # Minimum width of the topk input tensor
+MAX_TOP_K = 32
+# Default sampling parameters, huggingface recommended values
+DEFAULT_SAMPLING_TEMPERATURE = 0.6
+DEFAULT_SAMPLING_TOP_P = 0.95
+# huggingface recommended value for top-k sampling is zero for DeepSeek-V3 model, but TTNN Op
+# does not support top-k=0. see https://github.com/tenstorrent/tt-metal/issues/40236
+# So, using 32 as default value for top-k when sampling on device. If top-k = 0 is needed, then
+# do sampling on host.
+DEFAULT_SAMPLING_TOP_K = 32
+
+
+# Each value is a tuple of (seq_len_threshold, PrefillChunkSizes) pairs, sorted ascending by threshold.
+PREFILL_CHUNK_SIZES = {
+    # QUAD
+    16: (
+        (0, PrefillChunkSizes(model_chunk=DEFAULT_MAX_SEQ_LEN, mla_chunk=DEFAULT_MAX_SEQ_LEN, wkv_b2_chunk=2 * 1024)),
+        (32 * 1024, PrefillChunkSizes(model_chunk=32 * 1024, mla_chunk=32 * 1024, wkv_b2_chunk=8 * 1024)),
+        (48 * 1024, PrefillChunkSizes(model_chunk=48 * 1024, mla_chunk=48 * 1024, wkv_b2_chunk=4 * 1024)),
+        (64 * 1024, PrefillChunkSizes(model_chunk=64 * 1024, mla_chunk=4 * 1024, wkv_b2_chunk=4 * 1024)),
+        (128 * 1024, PrefillChunkSizes(model_chunk=1024, mla_chunk=256, wkv_b2_chunk=256)),
+    ),
+    # DUAL
+    8: (
+        (0, PrefillChunkSizes(model_chunk=DEFAULT_MAX_SEQ_LEN, mla_chunk=DEFAULT_MAX_SEQ_LEN, wkv_b2_chunk=2 * 1024)),
+        (8 * 1024, PrefillChunkSizes(model_chunk=8 * 1024, mla_chunk=8 * 1024, wkv_b2_chunk=2 * 1024)),
+        (16 * 1024, PrefillChunkSizes(model_chunk=16 * 1024, mla_chunk=1 * 1024, wkv_b2_chunk=1 * 1024)),
+        (32 * 1024, PrefillChunkSizes(model_chunk=1024, mla_chunk=512, wkv_b2_chunk=512)),
+    ),
+    # TG
+    4: (
+        (0, PrefillChunkSizes(model_chunk=DEFAULT_MAX_SEQ_LEN, mla_chunk=DEFAULT_MAX_SEQ_LEN, wkv_b2_chunk=2 * 1024)),
+        (32 * 1024, PrefillChunkSizes(model_chunk=32 * 1024, mla_chunk=32 * 1024, wkv_b2_chunk=2 * 1024)),
+    ),
+}
+
+
+def get_prefill_chunk_sizes(max_seq_len: int, num_rows: int) -> PrefillChunkSizes:
+    """Return PrefillChunkSizes for the given (num_rows, max_seq_len).
+
+    Return the configuration for the largest threshold not exceeding max_seq_len.
+    """
+    if num_rows not in PREFILL_CHUNK_SIZES:
+        raise ValueError(f"num_rows should be in (4, 8, 16), got {num_rows}")
+    chunk_sizes = PREFILL_CHUNK_SIZES[num_rows]
+
+    chunks_to_return = chunk_sizes[0][1]
+    for config_seq_len, chunks in chunk_sizes:
+        if config_seq_len > max_seq_len:
+            break
+        chunks_to_return = chunks
+    logger.info(f"Prefill chunks: {chunks_to_return}")
+    return chunks_to_return
+
+
+_LEGACY_SAVED_WEIGHT_EMISSION_DEPTH = 0
+
+
+@contextmanager
+def emit_legacy_saved_weights():
+    """Temporarily make ``shard_and_save()`` dump tensors to disk and return ``SavedWeight`` records."""
+
+    global _LEGACY_SAVED_WEIGHT_EMISSION_DEPTH
+    _LEGACY_SAVED_WEIGHT_EMISSION_DEPTH += 1
+    try:
+        yield
+    finally:
+        _LEGACY_SAVED_WEIGHT_EMISSION_DEPTH -= 1
+
+
+def align_up(value: int, align_value: int) -> int:
+    """Round value up to the next multiple of align_value, with a minimum of align_value."""
+    return int(max(align_value, (value + align_value - 1) // align_value * align_value))
+
+
+def get_min_alignment_value_for_prefill(rows: int) -> int:
+    """for quad mesh, we need to align each seq_len chunk per row to the tile size
+    for other meshes, we align the entire seq_len to the tile size"""
+    return int(ttnn.TILE_SIZE) * rows if rows == 16 else int(ttnn.TILE_SIZE)
+
+
+def align_prefill_padded_seq_len(seq_len: int, num_mesh_rows: int) -> int:
+    """Round ``seq_len`` up to a multiple of ``TILE_SIZE * num_mesh_rows`` (mesh axis 0).
+
+    Used when padding prefill token batches so the workspace sequence length satisfies
+    dispatch / mesh-row alignment constraints.
+    """
+    seq_len_i = int(seq_len)
+    rows = int(num_mesh_rows)
+    if rows <= 0:
+        raise ValueError(f"num_mesh_rows must be > 0, got {num_mesh_rows!r}")
+    alignment = get_min_alignment_value_for_prefill(rows)
+    return align_up(seq_len_i, alignment)
+
+
+def make_deepseek_sampling_args(
+    mesh_device,
+    vocab_size: int,
+    *,
+    max_top_k: int = MAX_TOP_K,
+    max_batch_size: int = USERS_PER_ROW,
+    sampling_all_gather_axis: int = 1,
+    pad_logits_to_power_of_2: bool = True,
+) -> DeepseekSamplingArgs:
+    cluster_shape = tuple(mesh_device.shape)
+    sampling_dp = int(cluster_shape[0])  # one sampling group per row
+    num_tp = int(cluster_shape[1])
+    per_device_vocab = int(math.ceil(vocab_size / num_tp))
+    padded_per_device_vocab = int(math.ceil(per_device_vocab / ttnn.TILE_SIZE) * ttnn.TILE_SIZE)
+    padded_vocab_size = padded_per_device_vocab * num_tp
+    return DeepseekSamplingArgs(
+        vocab_size=vocab_size,
+        padded_vocab_size=padded_vocab_size,
+        max_top_k=max_top_k,
+        max_batch_size=max_batch_size,
+        sampling_dp=sampling_dp,
+        cluster_shape=cluster_shape,
+        sampling_all_gather_axis=sampling_all_gather_axis,
+        pad_logits_to_power_of_2=pad_logits_to_power_of_2,
+    )
 
 
 # Compute kernel configurations
@@ -44,6 +214,13 @@ COMPUTE_KERNEL_CONFIG_HIFI4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4,
     math_approx_mode=False,
     fp32_dest_acc_en=True,
+    packer_l1_acc=True,
+)
+
+COMPUTE_KERNEL_CONFIG_HIFI4_NOFP32_ACC = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4,
+    math_approx_mode=False,
+    fp32_dest_acc_en=False,
     packer_l1_acc=True,
 )
 
@@ -481,16 +658,27 @@ def base_model_name(hf_config):
     return model_name.split("B-")[0] + "B" if "B-" in model_name else model_name
 
 
-def dequantize(tensor: torch.Tensor, inv_scale: torch.Tensor, block_shape: Sequence[int]) -> torch.Tensor:
-    """Dequantize a pytorch tensor using the provided scale."""
-    assert tensor.ndim == inv_scale.ndim and tensor.dtype == torch.float8_e4m3fn and inv_scale.dtype == torch.float32
-    assert len(block_shape) == tensor.ndim and all(
-        inv_scale.shape[i] * block_shape[i] >= tensor.shape[i] for i in range(tensor.ndim)
-    )
-    for i, block_dim in enumerate(block_shape):
-        inv_scale = inv_scale.repeat_interleave(block_dim, dim=i)
-    tensor = tensor.bfloat16() * inv_scale[tuple(slice(0, s) for s in tensor.shape)].bfloat16()
-    del inv_scale
+def get_dequantized_tensor(
+    state_dict: dict[str, torch.Tensor],
+    key: str,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Load a tensor and reject quantized checkpoint formats in dequantized-only paths."""
+    tensor = state_dict[key]
+    scale_key = f"{key}_scale_inv"
+    if scale_key in state_dict:
+        raise TypeError(
+            f"Expected dequantized tensor '{key}', but found matching quantization scale '{scale_key}'. "
+            "Use a dequantized checkpoint or dequantize before conversion."
+        )
+    if tensor.dtype == torch.float8_e4m3fn:
+        raise TypeError(
+            f"Expected dequantized tensor '{key}', but found float8 data. "
+            "Use a dequantized checkpoint or dequantize before conversion."
+        )
+    if tensor.is_floating_point() and tensor.dtype != dtype:
+        return tensor.to(dtype)
     return tensor
 
 
@@ -540,9 +728,21 @@ def get_state_dicts(
     return torch.stack(tensors, dim=concat_dim)
 
 
-def sub_state_dict(state_dict: dict[str, torch.Tensor], prefix: str):
+def sub_state_dict(state_dict: Mapping[str, torch.Tensor], prefix: str, num_layers: int | None = None):
     """Get a subset of the state dict with a given prefix."""
-    return {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
+    view_with_prefix = getattr(state_dict, "view_with_prefix", None)
+    if callable(view_with_prefix):
+        return view_with_prefix(prefix, num_layers)
+    if num_layers is None:
+        return {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
+    else:
+        return {
+            k[len(prefix) :]: v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+            for layer_idx_str in ["".join(itertools.takewhile(str.isdigit, k.removeprefix("model.layers.")))]
+            if not layer_idx_str or int(layer_idx_str) < num_layers
+        }
 
 
 def sub_state_dicts(
@@ -552,11 +752,480 @@ def sub_state_dicts(
     return tuple(None if d is None else sub_state_dict(d, prefix) for d in state_dicts)
 
 
-def save_and_get_path(path, tensor):
-    """Save a tensor to a file and return the path."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        logger.warning(f"Overwriting existing cache file: {path}")
-    ttnn.dump_tensor(path, tensor)
-    ttnn.deallocate(tensor)
-    return str(path)
+TENSOR_CACHE_EXTENSION = ".tensorbin"
+
+
+def _get_relative_cache_path(path: Path) -> str | None:
+    """Extract the cache-relative path after the ``mesh_<rows>x<cols>`` directory."""
+
+    path_str = str(path)
+    mesh_idx = path_str.find("mesh_")
+    if mesh_idx == -1:
+        return None if path.is_absolute() else path_str
+    parts = path_str[mesh_idx:].split("/", 1)
+    if len(parts) < 2:
+        return None if path.is_absolute() else path_str
+    return parts[1]
+
+
+def shard_and_save(
+    path: Path,
+    tensor: torch.Tensor,
+    shard_dims: tuple[int | None, int | None],
+    mesh_device: ttnn.MeshDevice,
+    remove_dims: tuple[bool, bool] | bool = False,
+    *,
+    dtype: ttnn.DataType | None = None,
+    layout: ttnn.Layout | None = None,
+    memory_config: ttnn.MemoryConfig | None = None,
+    _torch_impl: bool = False,
+    padding_needed: tuple[int, int, int] = (0, 0, 0),
+) -> ConfigWeight:
+    """Shard a tensor and materialize it directly as a TTNN tensor."""
+    assert all(isinstance(shard_dim, (int, NoneType)) for shard_dim in shard_dims)
+    assert isinstance(remove_dims, bool) or all(isinstance(remove_dim, bool) for remove_dim in remove_dims)
+    assert len(shard_dims) == 2, "shard_dims must be exactly 2 dimensions (can repeat)"
+
+    if isinstance(remove_dims, bool):
+        remove_dims = (remove_dims, remove_dims)
+
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+
+    assert (
+        shard_dims[0] != shard_dims[1] or remove_dims[0] == remove_dims[1]
+    ), "If sharding a single dim, both remove_dim values must be the same"
+
+    for remove_dim, shard_dim, mesh_dim in zip(remove_dims, shard_dims, mesh_device.shape, strict=True):
+        assert (
+            shard_dim is None or tensor.shape[shard_dim] % mesh_dim == 0
+        ), f"Cannot shard dimension {shard_dim} of size {tensor.shape[shard_dim]} into {mesh_dim} shards"
+        assert not (remove_dim and shard_dim is None), f"Cannot remove unsharded dimension {shard_dim}"
+
+    if shard_dims[0] == shard_dims[1] and shard_dims[0] is not None:
+        assert remove_dims[0] == remove_dims[1], "If sharding a single dim, both remove_dim values must be the same"
+        assert (
+            tensor.shape[shard_dims[0]] % mesh_device.get_num_devices() == 0
+        ), f"Cannot shard dimension {shard_dims[0]} of size {tensor.shape[shard_dims[0]]} into {mesh_device.get_num_devices()} shards"
+        assert (
+            not remove_dims[0] or tensor.shape[shard_dims[0]] == mesh_device.get_num_devices()
+        ), f"The removed dim {shard_dims[0]} must be fully sharded"
+    else:
+        for remove_dim, shard_dim, mesh_dim in zip(remove_dims, shard_dims, mesh_device.shape, strict=True):
+            assert (
+                shard_dim is None or tensor.shape[shard_dim] % mesh_dim == 0
+            ), f"Cannot shard dimension {shard_dim} of size {tensor.shape[shard_dim]} into {mesh_dim} shards"
+            assert not (remove_dim and shard_dim is None), f"Cannot remove unsharded dimension {shard_dim}"
+            assert (
+                not remove_dim or tensor.shape[shard_dim] == mesh_dim
+            ), f"The removed dim {shard_dim} must be fully sharded"
+
+    if _torch_impl:
+        ttnn_tensor = _shard_torch_impl(
+            path=path,
+            tensor=tensor,
+            shard_dims=shard_dims,
+            mesh_device=mesh_device,
+            remove_dims=remove_dims,
+            dtype=dtype,
+            layout=layout,
+            memory_config=memory_config,
+        )
+    else:
+        ttnn_tensor = _shard_device_impl(
+            path=path,
+            tensor=tensor,
+            shard_dims=shard_dims,
+            mesh_device=mesh_device,
+            remove_dims=remove_dims,
+            dtype=dtype,
+            layout=layout,
+            memory_config=memory_config,
+            padding_needed=padding_needed,
+        )
+
+    if _LEGACY_SAVED_WEIGHT_EMISSION_DEPTH > 0:
+        cache_path = (
+            path
+            if path.name.endswith(TENSOR_CACHE_EXTENSION)
+            else path.with_name(f"{path.name}{TENSOR_CACHE_EXTENSION}")
+        )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        relative_cache_path = _get_relative_cache_path(cache_path)
+        if relative_cache_path is None:
+            raise ValueError(f"Expected path under a 'mesh_<rows>x<cols>' cache directory: {cache_path}")
+        try:
+            ttnn.dump_tensor(cache_path, ttnn_tensor)
+            return SavedWeight(Path(relative_cache_path), ttnn_tensor.memory_config())
+        finally:
+            try:
+                ttnn.deallocate(ttnn_tensor)
+            except Exception:
+                pass
+
+    return ttnn_tensor
+
+
+def _shard_device_impl(
+    *,
+    path: Path,
+    tensor: torch.Tensor,
+    shard_dims: tuple[int | None, int | None],
+    mesh_device: ttnn.MeshDevice,
+    remove_dims: tuple[bool, bool] | bool,
+    dtype: ttnn.DataType | None,
+    layout: ttnn.Layout | None,
+    memory_config: ttnn.MemoryConfig | None,
+    padding_needed: tuple[int, int, int] = (0, 0, 0),
+) -> ttnn.Tensor:
+    assert layout in {
+        None,
+        ttnn.ROW_MAJOR_LAYOUT,
+        ttnn.TILE_LAYOUT,
+    }, "Device implementation only supports row-major and tiled layouts"
+
+    dtype_is_tilized = dtype in {ttnn.bfloat4_b, ttnn.bfloat8_b}
+    assert not (
+        layout == ttnn.ROW_MAJOR_LAYOUT and dtype_is_tilized
+    ), "Row-major layout is not supported for tilized dtypes"
+    if dtype_is_tilized:
+        layout = ttnn.TILE_LAYOUT
+
+    if isinstance(remove_dims, bool):
+        remove_dims = (remove_dims, remove_dims)
+
+    # If we have padding and sharded memory config, apply padding per-shard
+    if padding_needed != (0, 0, 0):
+        # Tuple format: (pad_third_to_last_dim, pad_second_to_last_dim, pad_last_dim)
+        pad_third_to_last, pad_second_to_last, pad_last = padding_needed
+        # Determine which dimension(s) to shard and split the tensor accordingly
+        if shard_dims[0] is not None and shard_dims[1] is not None:
+            # 2D sharding - but check which dimensions actually need sharding
+            # A dimension with size 1 or not divisible by mesh size is replicated, not sharded
+            dim_0_shardable = (
+                tensor.shape[shard_dims[0]] >= mesh_device.shape[0]
+                and tensor.shape[shard_dims[0]] % mesh_device.shape[0] == 0
+            )
+            dim_1_shardable = (
+                tensor.shape[shard_dims[1]] >= mesh_device.shape[1]
+                and tensor.shape[shard_dims[1]] % mesh_device.shape[1] == 0
+            )
+
+            if dim_0_shardable and dim_1_shardable:
+                # True 2D sharding
+                shard_dim_0_size = mesh_device.shape[0]
+                shard_dim_1_size = mesh_device.shape[1]
+
+                tensor_shards = []
+                for i in range(shard_dim_0_size):
+                    start_0 = i * (tensor.shape[shard_dims[0]] // shard_dim_0_size)
+                    end_0 = (i + 1) * (tensor.shape[shard_dims[0]] // shard_dim_0_size)
+                    shard_row = []
+                    for j in range(shard_dim_1_size):
+                        start_1 = j * (tensor.shape[shard_dims[1]] // shard_dim_1_size)
+                        end_1 = (j + 1) * (tensor.shape[shard_dims[1]] // shard_dim_1_size)
+
+                        # Extract shard
+                        shard_slice = [slice(None)] * len(tensor.shape)
+                        shard_slice[shard_dims[0]] = slice(start_0, end_0)
+                        shard_slice[shard_dims[1]] = slice(start_1, end_1)
+                        shard = tensor[tuple(shard_slice)]
+
+                        # Apply padding to this shard
+                        if pad_third_to_last > 0:
+                            shard = torch.nn.functional.pad(
+                                shard,
+                                (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last),
+                                mode="constant",
+                                value=0,
+                            )
+                        elif pad_second_to_last > 0 or pad_last > 0:
+                            shard = torch.nn.functional.pad(
+                                shard, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0
+                            )
+
+                        shard_row.append(shard)
+                    tensor_shards.append(torch.cat(shard_row, dim=shard_dims[1]))
+
+                tensor = torch.cat(tensor_shards, dim=shard_dims[0])
+            elif dim_1_shardable:
+                # Only shard along dimension 1 (dimension 0 is replicated)
+                shard_dim_size = mesh_device.shape[1]
+                dim = shard_dims[1]
+
+                shards = []
+                for j in range(shard_dim_size):
+                    start = j * (tensor.shape[dim] // shard_dim_size)
+                    end = (j + 1) * (tensor.shape[dim] // shard_dim_size)
+
+                    # Extract shard
+                    shard_slice = [slice(None)] * len(tensor.shape)
+                    shard_slice[dim] = slice(start, end)
+                    shard = tensor[tuple(shard_slice)]
+
+                    # Apply padding to this shard
+                    if pad_third_to_last > 0:
+                        shard = torch.nn.functional.pad(
+                            shard, (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last), mode="constant", value=0
+                        )
+                    elif pad_second_to_last > 0 or pad_last > 0:
+                        shard = torch.nn.functional.pad(
+                            shard, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0
+                        )
+
+                    shards.append(shard)
+
+                tensor = torch.cat(shards, dim=dim)
+            elif dim_0_shardable:
+                # Only shard along dimension 0 (dimension 1 is replicated)
+                shard_dim_size = mesh_device.shape[0]
+                dim = shard_dims[0]
+
+                shards = []
+                for i in range(shard_dim_size):
+                    start = i * (tensor.shape[dim] // shard_dim_size)
+                    end = (i + 1) * (tensor.shape[dim] // shard_dim_size)
+
+                    # Extract shard
+                    shard_slice = [slice(None)] * len(tensor.shape)
+                    shard_slice[dim] = slice(start, end)
+                    shard = tensor[tuple(shard_slice)]
+
+                    # Apply padding to this shard
+                    if pad_third_to_last > 0:
+                        shard = torch.nn.functional.pad(
+                            shard, (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last), mode="constant", value=0
+                        )
+                    elif pad_second_to_last > 0 or pad_last > 0:
+                        shard = torch.nn.functional.pad(
+                            shard, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0
+                        )
+
+                    shards.append(shard)
+
+                tensor = torch.cat(shards, dim=dim)
+            # else: both dimensions replicated, no sharding needed, but still need to apply padding
+            else:
+                # No actual sharding, just apply padding to the whole tensor
+                if pad_third_to_last > 0:
+                    tensor = torch.nn.functional.pad(
+                        tensor, (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last), mode="constant", value=0
+                    )
+                elif pad_second_to_last > 0 or pad_last > 0:
+                    tensor = torch.nn.functional.pad(
+                        tensor, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0
+                    )
+        elif shard_dims[0] == shard_dims[1] and shard_dims[0] is not None:
+            # 1D sharding along one dimension
+            shard_dim_size = mesh_device.get_num_devices()
+            dim = shard_dims[0]
+            shard_size = even_int_div(tensor.shape[dim], shard_dim_size)
+
+            # Split along the shard dimension
+            shards = []
+            for i in range(shard_dim_size):
+                start = i * shard_size
+                end = (i + 1) * shard_size
+
+                # Extract shard
+                shard_slice = [slice(None)] * len(tensor.shape)
+                shard_slice[dim] = slice(start, end)
+                shard = tensor[tuple(shard_slice)]
+
+                # Apply padding to this shard
+                # torch.nn.functional.pad order: (left, right, top, bottom, front, back) from last to first dim
+                if pad_third_to_last > 0:
+                    # 3D padding
+                    shard = torch.nn.functional.pad(
+                        shard, (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last), mode="constant", value=0
+                    )
+                elif pad_second_to_last > 0 or pad_last > 0:
+                    # 2D padding
+                    shard = torch.nn.functional.pad(
+                        shard, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0
+                    )
+
+                shards.append(shard)
+
+            # Concatenate all shards back together
+            tensor = torch.cat(shards, dim=dim)
+        elif shard_dims[0] is None and shard_dims[1] is not None:
+            # Sharding only along dimension 1 (dimension 0 is None)
+            shard_dim_size = mesh_device.shape[1]
+            dim = shard_dims[1]
+            shard_size = even_int_div(tensor.shape[dim], shard_dim_size)
+
+            shards = []
+            for j in range(shard_dim_size):
+                start = j * shard_size
+                end = (j + 1) * shard_size
+
+                shard_slice = [slice(None)] * len(tensor.shape)
+                shard_slice[dim] = slice(start, end)
+                shard = tensor[tuple(shard_slice)]
+
+                if pad_third_to_last > 0:
+                    shard = torch.nn.functional.pad(
+                        shard, (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last), mode="constant", value=0
+                    )
+                elif pad_second_to_last > 0 or pad_last > 0:
+                    shard = torch.nn.functional.pad(
+                        shard, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0
+                    )
+
+                shards.append(shard)
+
+            tensor = torch.cat(shards, dim=dim)
+        elif shard_dims[0] is not None and shard_dims[1] is None:
+            # Sharding only along dimension 0 (dimension 1 is None)
+            shard_dim_size = mesh_device.shape[0]
+            dim = shard_dims[0]
+            shard_size = even_int_div(tensor.shape[dim], shard_dim_size)
+
+            shards = []
+            for i in range(shard_dim_size):
+                start = i * shard_size
+                end = (i + 1) * shard_size
+
+                shard_slice = [slice(None)] * len(tensor.shape)
+                shard_slice[dim] = slice(start, end)
+                shard = tensor[tuple(shard_slice)]
+
+                if pad_third_to_last > 0:
+                    shard = torch.nn.functional.pad(
+                        shard, (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last), mode="constant", value=0
+                    )
+                elif pad_second_to_last > 0 or pad_last > 0:
+                    shard = torch.nn.functional.pad(
+                        shard, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0
+                    )
+
+                shards.append(shard)
+
+            tensor = torch.cat(shards, dim=dim)
+        elif shard_dims[0] is None and shard_dims[1] is None:
+            if pad_third_to_last > 0:
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, pad_last, 0, pad_second_to_last, 0, pad_third_to_last), mode="constant", value=0
+                )
+            elif pad_second_to_last > 0 or pad_last > 0:
+                tensor = torch.nn.functional.pad(tensor, (0, pad_last, 0, pad_second_to_last), mode="constant", value=0)
+    if shard_dims[0] is None and shard_dims[1] is None:
+        mesh_mapper = ttnn.ReplicateTensorToMesh(mesh_device)
+    elif shard_dims[0] == shard_dims[1] and shard_dims[0] is not None:
+        mesh_mapper = ttnn.ShardTensorToMesh(mesh_device, dim=shard_dims[0])
+    else:
+        mesh_mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=mesh_device.shape, dims=shard_dims)
+
+    ttnn_tensor = ttnn.from_torch(
+        tensor,
+        layout=layout,
+        memory_config=memory_config,
+        mesh_mapper=mesh_mapper,
+        device=mesh_device,
+        dtype=dtype,
+        enable_bfloat_opt=True,
+    )
+
+    assert memory_config == ttnn_tensor.memory_config()
+    assert dtype == ttnn_tensor.dtype
+    assert layout == ttnn_tensor.layout
+
+    new_tensor_shape = list(ttnn_tensor.shape)
+    if shard_dims[0] == shard_dims[1]:
+        if remove_dims[0]:
+            new_tensor_shape.pop(shard_dims[0])
+    else:
+        if None not in shard_dims and shard_dims[0] > shard_dims[1]:
+            shard_dims = (shard_dims[1], shard_dims[0])
+            remove_dims = (remove_dims[1], remove_dims[0])
+        if remove_dims[1]:
+            new_tensor_shape.pop(shard_dims[1])
+        if remove_dims[0]:
+            new_tensor_shape.pop(shard_dims[0])
+
+    new_tensor_shape = [1] * sum(remove_dims) + new_tensor_shape
+    ttnn_tensor = ttnn_tensor.reshape(new_tensor_shape)
+
+    return ttnn_tensor
+
+
+def _shard_torch_impl(
+    *,
+    path: Path,
+    tensor: torch.Tensor,
+    shard_dims: tuple[int | None, ...],
+    mesh_device: ttnn.MeshDevice,
+    remove_dims: tuple[bool, ...],
+    dtype: ttnn.DataType | None = None,
+    layout: ttnn.Layout | None = None,
+    memory_config: ttnn.MemoryConfig | None = None,
+) -> ttnn.Tensor:
+    if shard_dims[0] == shard_dims[1]:
+        assert remove_dims[0] == remove_dims[1], "If sharding a single dim, both remove_dim values must be the same"
+        remove_dims = (remove_dims[0],)
+        shard_dims = (shard_dims[0],)
+        sharding_shape = (mesh_device.shape[0] * mesh_device.shape[1],)
+    else:
+        sharding_shape = (mesh_device.shape[0], mesh_device.shape[1])
+
+    return ttnn.from_host_shards(
+        [
+            ttnn.from_torch(
+                tensor[_get_shard_slices(tensor.shape, shard_dims, sharding_shape, shard_coords)][
+                    _get_remove_dim_slices(tensor.shape, shard_dims, remove_dims)
+                ],
+                dtype=dtype,
+                layout=layout,
+                memory_config=memory_config,
+            )
+            for shard_coords in itertools.product(*map(range, sharding_shape))
+        ],
+        mesh_shape=mesh_device.shape,
+    )
+
+
+def _get_shard_slices(
+    tensor_shape: Sequence[int],
+    shard_dims: tuple[int | None, ...],
+    mesh_shape: tuple[int, ...],
+    device_coords: tuple[int, ...],
+) -> tuple[slice, ...]:
+    """Get the slices for a shard of a tensor given the sharding dimensions, mesh shape, and device coordinates."""
+    slices = [slice(None) for _ in tensor_shape]
+    for dim_idx, (device_coord, mesh_dim, shard_dim) in enumerate(
+        zip(device_coords, mesh_shape, shard_dims, strict=True)
+    ):
+        assert 0 <= device_coord < mesh_dim, f"device_coords[{dim_idx}] out of range"
+        if shard_dim is None:
+            continue
+        shard_size = even_int_div(tensor_shape[shard_dim], mesh_dim)
+        slices[shard_dim] = slice(shard_size * device_coord, shard_size * (device_coord + 1))
+    return tuple(slices)
+
+
+def _get_remove_dim_slices(
+    tensor_shape: Sequence[int],
+    shard_dims: tuple[int | None, ...],
+    remove_dims: tuple[bool, ...],
+) -> tuple[slice | int, ...]:
+    """Get the slices to remove the sharded dimensions if specified."""
+    slices: list[slice | int] = [slice(None) for _ in tensor_shape]
+    for shard_dim, remove_dim in zip(shard_dims, remove_dims, strict=True):
+        if not remove_dim:
+            continue
+        assert shard_dim is not None
+        slices[shard_dim] = 0
+    return tuple(slices)
+
+
+def get_mesh_coords(mesh_shape: list[int], row: int = None, col: int = None) -> list[ttnn.MeshCoordinate]:
+    """Get mesh coordinates for a given mesh shape and optional row and column indices."""
+    if row:
+        assert 0 <= row < mesh_shape[0], "Row index out of bounds"
+    if col:
+        assert 0 <= col < mesh_shape[1], "Column index out of bounds"
+
+    row_select = range(mesh_shape[0]) if row is None else [row]
+    col_select = range(mesh_shape[1]) if col is None else [col]
+    return [ttnn.MeshCoordinate(r, c) for r in row_select for c in col_select]

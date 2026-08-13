@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,11 +11,10 @@ from models.experimental.bert.tt.embeddings import PytorchEmbeddings
 from models.experimental.bert.tt.bert_encoder import TtBertEncoder
 from models.experimental.bert.fused_ops.linear import Linear
 from tt_lib.utils import pad_activation, pad_weight
-from models.utility_functions import (
+from models.common.utility_functions import (
     comp_pcc,
     comp_allclose,
     profiler,
-    disable_persistent_kernel_cache,
 )
 
 
@@ -134,6 +133,7 @@ def run_bert_question_and_answering_inference(
     model_name = str(model_location_generator(model_version, model_subdir="Bert"))
     tokenizer_name = str(model_location_generator(model_version, model_subdir="Bert"))
 
+    # NOTE(transformers-5.x): `torchscript=` was removed from transformers configs in 5.x; drop it (a default no-op) when running this experimental model under 5.x.
     hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
     hugging_face_reference_model.eval()
     tt_bert_model = TtBertForQuestionAnswering(
@@ -148,6 +148,8 @@ def run_bert_question_and_answering_inference(
             "Johann Joachim Winckelmann was a German art historian and archaeologist. He was a pioneering Hellenist who first articulated the difference between Greek, Greco-Roman and Roman art. The prophet and founding hero of modern archaeology, Winckelmann was one of the founders of scientific archaeology and first applied the categories of style on a large, systematic basis to the history of art."
         ]
         question = batch * ["What discipline did Winkelmann create?"]
+        # NOTE(transformers-5.x): tokenizer.batch_encode_plus was removed in transformers 5.x; call the
+        # tokenizer directly (text=..., text_pair=...). Experimental, not run on CI, so left as-is.
         bert_input = tokenizer.batch_encode_plus(
             zip(question, context),
             max_length=seq_len,
@@ -274,8 +276,6 @@ def test_bert_large_baseline_perf(device, model_location_generator):
     token_type_ids = True
     pcc = 0.98
     PERF_CNT = 1
-
-    disable_persistent_kernel_cache()
 
     run_bert_question_and_answering_inference(
         device,

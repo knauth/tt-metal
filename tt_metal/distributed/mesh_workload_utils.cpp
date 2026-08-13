@@ -1,21 +1,26 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dev_msgs.h"
+#include <tt_stl/fmt.hpp>
 #include "device.hpp"
+#include "mesh_device.hpp"
+#include "distributed/mesh_device_impl.hpp"
 #include "impl/context/metal_context.hpp"
 #include "dispatch/kernels/cq_commands.hpp"
-#include "dispatch_core_common.hpp"
-#include "hal.hpp"
 #include "hal_types.hpp"
+#include "llrt/hal.hpp"
+#include <cstdint>
 #include <tt_stl/strong_type.hpp>
 #include "dispatch/system_memory_manager.hpp"
 #include "tt_align.hpp"
 #include "tt_metal/distributed/mesh_workload_utils.hpp"
 #include "tt_metal/impl/dispatch/device_command.hpp"
+#include "tt_metal/impl/dispatch/device_command_calculator.hpp"
 
-enum class CoreType;
+#include <umd/device/types/core_coordinates.hpp>
+#include <impl/dispatch/dispatch_query_manager.hpp>
+#include <impl/dispatch/dispatch_mem_map.hpp>
 
 namespace tt::tt_metal::distributed {
 
@@ -24,7 +29,7 @@ namespace tt::tt_metal::distributed {
 // a workload is dispatched, in order to maintain consistent global state.
 void write_go_signal(
     uint8_t cq_id,
-    IDevice* device,
+    MeshDevice* mesh_device,
     SubDeviceId sub_device_id,
     SystemMemoryManager& sysmem_manager,
     uint32_t expected_num_workers_completed,
@@ -32,9 +37,14 @@ void write_go_signal(
     bool send_mcast,
     bool send_unicasts,
     const program_dispatch::ProgramDispatchMetadata& dispatch_md) {
-    uint32_t pcie_alignment = MetalContext::instance().hal().get_alignment(HalMemType::HOST);
-    uint32_t cmd_sequence_sizeB = align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd), pcie_alignment) +
-                                  MetalContext::instance().hal().get_alignment(HalMemType::HOST);
+    const auto& hal = MetalContext::instance().hal();
+    uint32_t pcie_alignment = hal.get_alignment(HalMemType::HOST);
+    DeviceCommandCalculator calculator;
+    if (tt_metal::MetalContext::instance().get_dispatch_query_manager().dispatch_s_enabled()) {
+        calculator.add_notify_dispatch_s_go_signal_cmd();
+    }
+    calculator.add_dispatch_go_signal_mcast();
+    uint32_t cmd_sequence_sizeB = calculator.write_offset_bytes();
     cmd_sequence_sizeB +=
         dispatch_md.prefetcher_cache_info.is_cached ? 0 : align(sizeof(CQPrefetchCmd), pcie_alignment);
 
@@ -50,12 +60,12 @@ void write_go_signal(
             true);
     }
 
-    go_msg_t run_program_go_signal;
-    run_program_go_signal.signal = RUN_MSG_GO;
-    run_program_go_signal.master_x = dispatch_core.x;
-    run_program_go_signal.master_y = dispatch_core.y;
-    run_program_go_signal.dispatch_message_offset =
-        MetalContext::instance().dispatch_mem_map().get_dispatch_message_update_offset(sub_device_index);
+    uint32_t go_msg_u32_val = hal.make_go_msg_u32(
+        dev_msgs::RUN_MSG_GO,
+        dispatch_core.x,
+        dispatch_core.y,
+        MetalContext::instance().dispatch_mem_map().get_dispatch_message_update_offset(sub_device_index) +
+            MetalContext::instance().dispatch_mem_map().get_completion_counter_offset(cq_id));
 
     // When running with dispatch_s enabled:
     //   - dispatch_d must notify dispatch_s that a go signal can be sent
@@ -63,7 +73,7 @@ void write_go_signal(
     // When running without dispatch_s:
     //   - dispatch_d handles sending the go signal to all workers
     // There is no need for dispatch_d to barrier before sending the dispatch_s notification or go signal,
-    // since this go signal is not preceeded by NOC txns for program config data
+    // since this go signal is not preceded by NOC txns for program config data
     DispatcherSelect dispatcher_for_go_signal = DispatcherSelect::DISPATCH_MASTER;
     if (MetalContext::instance().get_dispatch_query_manager().dispatch_s_enabled()) {
         uint16_t index_bitmask = 1 << sub_device_index;
@@ -74,18 +84,37 @@ void write_go_signal(
     }
     go_signal_cmd_sequence.add_dispatch_go_signal_mcast(
         expected_num_workers_completed,
-        *reinterpret_cast<uint32_t*>(&run_program_go_signal),
+        go_msg_u32_val,
         MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(sub_device_index),
-        (send_mcast && device->has_noc_mcast_txns(sub_device_id)) ? *sub_device_id
-                                                                  : CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
-        send_unicasts ? device->num_virtual_eth_cores(sub_device_id) : 0,
-        device->noc_data_start_index(sub_device_id, send_unicasts), /* noc_data_start_idx */
+        (send_mcast && mesh_device->impl().has_noc_mcast_txns(sub_device_id)) ? *sub_device_id
+                                                                              : CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
+        send_unicasts ? mesh_device->impl().num_virtual_eth_cores(sub_device_id) : 0,
+        mesh_device->impl().noc_data_start_index(sub_device_id, send_unicasts), /* noc_data_start_idx */
         dispatcher_for_go_signal);
 
     TT_ASSERT(go_signal_cmd_sequence.size_bytes() == go_signal_cmd_sequence.write_offset_bytes());
 
     sysmem_manager.issue_queue_push_back(cmd_sequence_sizeB, cq_id);
 
+    sysmem_manager.fetch_queue_reserve_back(cq_id);
+    sysmem_manager.fetch_queue_write(cmd_sequence_sizeB, cq_id);
+}
+
+void write_rt_profiler_flush(
+    uint8_t cq_id, SubDeviceId sub_device_id, SystemMemoryManager& sysmem_manager, uint32_t wait_count) {
+    DeviceCommandCalculator calculator;
+    calculator.add_dispatch_rt_profiler_flush();
+    uint32_t cmd_sequence_sizeB = calculator.write_offset_bytes();
+
+    void* cmd_region = sysmem_manager.issue_queue_reserve(cmd_sequence_sizeB, cq_id);
+
+    HugepageDeviceCommand flush_cmd_sequence(cmd_region, cmd_sequence_sizeB);
+    const uint32_t wait_stream = MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(*sub_device_id);
+    flush_cmd_sequence.add_dispatch_rt_profiler_flush(wait_count, wait_stream);
+
+    TT_ASSERT(flush_cmd_sequence.size_bytes() == flush_cmd_sequence.write_offset_bytes());
+
+    sysmem_manager.issue_queue_push_back(cmd_sequence_sizeB, cq_id);
     sysmem_manager.fetch_queue_reserve_back(cq_id);
     sysmem_manager.fetch_queue_write(cmd_sequence_sizeB, cq_id);
 }

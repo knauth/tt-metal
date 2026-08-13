@@ -1,11 +1,11 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ring_fusion.hpp"
 
 using namespace tt::tt_metal;
-namespace ttnn::operations::transformer::detail {
+namespace ttnn::prim {
 
 void RingSDPAFusedOpSignaler::init_all_gather(
     uint32_t ring_size, uint32_t ring_index, uint32_t forward_writes_expected, uint32_t backward_writes_expected) {
@@ -69,5 +69,13 @@ void RingSDPAFusedOpSignaler::push_ring_sdpa_fused_op_rt_args(std::vector<uint32
     out_rt_args.push_back(static_cast<uint32_t>(this->backward_writes_expected));
     out_rt_args.push_back(static_cast<uint32_t>(this->fused_op_receiver_signal_semaphores[0]));
     out_rt_args.push_back(static_cast<uint32_t>(this->fused_op_receiver_signal_semaphores[1]));
+
+    // Even-ring split-forwarding: the diametric shard S arrives split across both links
+    const uint32_t split_shard_id =
+        this->ring_size ? ((this->ring_index + this->backward_writes_expected + 1) % this->ring_size) : 0;
+    const uint32_t split_second_half_wait = this->backward_writes_expected + 1;
+    out_rt_args.push_back(static_cast<uint32_t>(this->split_forwarding_enabled ? 1 : 0));
+    out_rt_args.push_back(static_cast<uint32_t>(split_shard_id));
+    out_rt_args.push_back(static_cast<uint32_t>(split_second_half_wait));
 }
-}  // namespace ttnn::operations::transformer::detail
+}  // namespace ttnn::prim

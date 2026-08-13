@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,7 +14,7 @@ def Linear(in_features: int, out_features: int, weight: List[Union[int, float]],
 
     ``weight`` must be the weight as a tilized list of values.
     """
-    logger.warning("Linear will be deprecated soon, please use linear in models/helper_funcs")
+    logger.warning("Linear will be deprecated soon, please use linear in models/common/helper_funcs")
     assert weight.get_layout() == ttnn.TILE_LAYOUT
     weight = weight.to(device)
 

@@ -1,71 +1,97 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "core/distributed/distributed.hpp"
 
 #include <core/ttnn_all_includes.hpp>
-#include <ttnn/operations/creation.hpp>
+#include <ttnn/operations/creation/creation.hpp>
 #include <ttnn/operations/eltwise/binary/binary.hpp>
 
 #include "autograd/auto_context.hpp"
 #include "core/tt_tensor_utils.hpp"
+#include "ttnn/operations/ccl/all_reduce/all_reduce.hpp"
+#include "ttnn/tensor/tensor.hpp"
 #include "ttnn_fixed/distributed/ttnn_ops.hpp"
 
 namespace ttml::core::distributed {
 
-ttnn::Tensor synchronize_tensor(const ttnn::Tensor& tensor) {
+ttnn::Tensor synchronize_tensor(const ttnn::Tensor& tensor, const ttsl::SmallVector<uint32_t>& cluster_axes) {
     auto* device = &autograd::ctx().get_device();
-    auto devices_count = device->get_devices().size();
-    assert(devices_count >= 1U);
-    // no need to synchronize if there is only one device
-    if (devices_count == 1U) {
+    if (cluster_axes.size() == 0) {
         return tensor;
     }
+    uint32_t scaler = 1U;
+    for (const auto& cluster_axis : cluster_axes) {
+        TT_FATAL(cluster_axis < device->shape().dims(), "Cluster axis must be within mesh shape");
+        scaler *= device->shape()[cluster_axis];
+    }
+    if (scaler == 1U) {
+        return tensor;
+    }
+    auto result = tensor;
+    for (const auto& cluster_axis : cluster_axes) {
+        result = ttml::ttnn_fixed::distributed::all_reduce(result, cluster_axis);
+    }
 
-    // all_reduce Mean is not supported, use sum and divide by #devices
-    auto result = ttnn_fixed::distributed::all_reduce(tensor);
-    result = ttnn::multiply(result, 1.0F / static_cast<float>(devices_count));
+    result = ttnn::multiply(result, 1.0F / static_cast<float>(scaler));
     return result;
 }
 
-void synchronize_parameters(const serialization::NamedParameters& parameters) {
+namespace {
+
+// Returns true if the parameter's current placement on the given mesh axis is a
+// Shard{...} rather than Replicate.
+bool is_sharded_on_axis(const ttnn::Tensor& value, uint32_t axis) {
+    const auto& topology = value.tensor_topology();
+    const auto& placements = topology.placements();
+    if (axis >= placements.size()) {
+        return false;
+    }
+    return std::holds_alternative<tt::tt_metal::distributed::MeshMapperConfig::Shard>(placements[axis]);
+}
+
+}  // namespace
+
+void synchronize_gradients(const serialization::NamedParameters& parameters) {
+    if (!autograd::ctx().is_parallelism_context_initialized()) {
+        return;
+    }
+    const auto& pctx = autograd::ctx().get_parallelism_context();
+    ttsl::SmallVector<uint32_t> cluster_axes;
+    if (pctx.is_cp_enabled()) {
+        cluster_axes.push_back(pctx.get_cp_axis().value());
+    }
+    if (pctx.is_ddp_enabled()) {
+        cluster_axes.push_back(pctx.get_ddp_axis().value());
+    }
+    for (auto& [name, tensor] : parameters) {
+        if (!tensor->is_grad_initialized()) {
+            continue;
+        }
+        // Build per-param axes, dropping any axis on which this parameter is
+        // sharded: FSDP already reduce-scattered the grad over the DDP axis in
+        // its backward-post hook.
+        ttsl::SmallVector<uint32_t> axes_for_param;
+        for (uint32_t axis : cluster_axes) {
+            if (!is_sharded_on_axis(tensor->get_value(), axis)) {
+                axes_for_param.push_back(axis);
+            }
+        }
+        if (axes_for_param.empty()) {
+            continue;
+        }
+        tensor->set_grad(synchronize_tensor(tensor->get_grad(), axes_for_param));
+    }
+}
+
+void synchronize_gradients(
+    const serialization::NamedParameters& parameters, const std::vector<uint32_t>& cluster_axes) {
+    ttsl::SmallVector<uint32_t> axes(cluster_axes.begin(), cluster_axes.end());
     for (auto& [name, tensor] : parameters) {
         if (tensor->is_grad_initialized()) {
-            tensor->set_grad(synchronize_tensor(tensor->get_grad()));
+            tensor->set_grad(synchronize_tensor(tensor->get_grad(), axes));
         }
-    }
-}
-
-void send_tensor(const autograd::DistributedContext& ctx, const ttnn::Tensor& tensor, Rank dest, Tag tag) {
-    auto cpu_tensor = tensor.cpu();
-    auto buffers = ttml::core::get_bytes_from_cpu_tensor(cpu_tensor);
-    for (auto buffer : buffers) {
-        ctx.send(buffer, dest, tag);
-    }
-}
-
-void recv_tensor(const autograd::DistributedContext& ctx, ttnn::Tensor& tensor, Rank source, Tag tag) {
-    auto cpu_tensor = tensor.cpu();
-
-    auto buffers = ttml::core::get_bytes_from_cpu_tensor(cpu_tensor);
-    for (auto buffer : buffers) {
-        ctx.recv(buffer, source, tag);
-    }
-
-    ttnn::assign(cpu_tensor.to_device(tensor.device()), tensor);
-}
-
-void broadcast_tensor(const autograd::DistributedContext& ctx, ttnn::Tensor& tensor, Rank root) {
-    auto cpu_tensor = tensor.cpu();
-
-    auto buffers = ttml::core::get_bytes_from_cpu_tensor(cpu_tensor);
-
-    for (auto buffer : buffers) {
-        ctx.broadcast(buffer, root);
-    }
-    if (ctx.rank() != root) {
-        ttnn::assign(cpu_tensor.to_device(tensor.device()), tensor);
     }
 }
 

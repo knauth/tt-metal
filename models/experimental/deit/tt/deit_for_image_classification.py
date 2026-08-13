@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -10,8 +10,8 @@ import ttnn
 
 from models.experimental.deit.tt.deit_config import DeiTConfig
 from models.experimental.deit.tt.deit_model import TtDeiTModel
-from models.helper_funcs import Linear as TtLinear
-from models.utility_functions import (
+from models.common.helper_funcs import Linear as TtLinear
+from models.common.utility_functions import (
     torch_to_tt_tensor_rm,
 )
 

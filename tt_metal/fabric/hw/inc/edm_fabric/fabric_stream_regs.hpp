@@ -1,16 +1,41 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "tt_metal/hw/inc/risc_attribs.h"
+#include "internal/risc_attribs.h"
 #include "noc_overlay_parameters.h"
-#include "tt_metal/hw/inc/ethernet/tunneling.h"
+#include "internal/ethernet/tunneling.h"
 #include "tt_metal/fabric/hw/inc/edm_fabric/named_types.hpp"
 
 using StreamId = tt::tt_fabric::NamedType<uint32_t, struct StreamIdType>;
 
+//------------------------- Stream Scratch Register --------------------------
+//--------------------------------  24 bits ----------------------------------
+template <uint32_t stream_id>
+FORCE_INLINE uint32_t get_stream_scratch_register_address() {
+    return STREAM_REG_ADDR(stream_id, STREAM_REMOTE_SRC_REG_INDEX);
+}
+FORCE_INLINE uint32_t get_stream_scratch_register_address(uint8_t stream_id) {
+    return STREAM_REG_ADDR(stream_id, STREAM_REMOTE_SRC_REG_INDEX);
+}
+template <uint32_t stream_id>
+FORCE_INLINE uint32_t read_stream_scratch_register() {
+    return NOC_STREAM_READ_REG(stream_id, STREAM_REMOTE_SRC_REG_INDEX);
+}
+FORCE_INLINE uint32_t read_stream_scratch_register(uint8_t stream_id) {
+    return NOC_STREAM_READ_REG(stream_id, STREAM_REMOTE_SRC_REG_INDEX);
+}
+template <uint32_t stream_id>
+FORCE_INLINE uint32_t write_stream_scratch_register(uint32_t val) {
+    return NOC_STREAM_WRITE_REG(stream_id, STREAM_REMOTE_SRC_REG_INDEX, val);
+}
+FORCE_INLINE uint32_t write_stream_scratch_register(uint8_t stream_id, uint32_t val) {
+    return NOC_STREAM_WRITE_REG(stream_id, STREAM_REMOTE_SRC_REG_INDEX, val);
+}
+
+//------------------------- AutoInc on  Write Register --------------------------
 // This will be an atomic register read to the register
 template <uint32_t stream_id>
 FORCE_INLINE int32_t get_ptr_val() {
@@ -62,6 +87,10 @@ constexpr FORCE_INLINE uint32_t get_stream_reg_write_addr() {
 
 FORCE_INLINE uint32_t get_stream_reg_write_addr(uint8_t stream_id) {
     return STREAM_REG_ADDR(stream_id, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE_REG_INDEX);
+}
+
+FORCE_INLINE int32_t pack_value_for_inc_on_write_stream_reg_write(int32_t val) {
+    return val << REMOTE_DEST_BUF_WORDS_FREE_INC;
 }
 
 template <uint32_t stream_id, uint32_t txq_id>

@@ -21,52 +21,143 @@ The operation returns both the sorted tensor and the indices representing the or
 - memory_config (MemoryConfig, optional): Specifies memory configuration for the output tensor. Defaults to None.
 - out (tuple of Tensors, optional): Preallocated tensors for the sorted values and indices. Defaults to None.
 
-### Usage
+### Universal Input/Output Support
 
-#### TTNN
+`ttnn.sort` is a thin **composite layer** wrapped around the bitonic-sort
+**device kernel**. The composite layer accepts the broadest set of tensor
+configurations users can express and converts to whatever the kernel
+requires; users do not need to pre-format inputs.
 
-```python
-import ttnn
+#### Supported value and index dtypes
 
-# Create a TTNN tensor
-input_tensor = ttnn.Tensor([3, 1, 2])
+| Tensor   | Supported dtypes              |
+| -------- | ----------------------------- |
+| Values   | `bfloat16`, `float32`, `uint16` |
+| Indices  | `uint16`, `uint32` (auto-promoted to `uint32` when the sort dim ≥ 65 535) |
 
-# Sort in ascending order
-sorted_tensor, indices = ttnn.sort(input_tensor)
+#### Supported layouts
 
-# Sort in descending order
-sorted_tensor_desc, indices_desc = ttnn.sort(input_tensor, descending=True)
+| Layout       | Supported | Notes                                                                                |
+| ------------ | --------- | ------------------------------------------------------------------------------------ |
+| `TILE`       | ✓         | Native kernel layout.                                                                |
+| `ROW_MAJOR`  | ✓         | Handled natively by the sort kernels (tilize/untilize happens inside the kernels, not as a composite-layer layout conversion). |
 
-# Sort along a specific dimension
-input_tensor_2d = ttnn.Tensor([[3, 1, 2], [6, 5, 4]])
-sorted_tensor_dim, indices_dim = ttnn.sort(input_tensor_2d, dim=1)
-```
+#### Supported memory configurations
 
-#### Metalium
+| Memory layout      | L1 | DRAM | Notes                                                                  |
+| ------------------ | -- | ---- | ---------------------------------------------------------------------- |
+| `INTERLEAVED`      | ✓  | ✓    | Native kernel layout.                                                  |
+| `HEIGHT_SHARDED`   | ✓  | ✓    | Composite layer de-shards on input and re-shards on output.            |
+| `WIDTH_SHARDED`    | ✓  | ✓    | Same composite-layer round trip.                                       |
+| `BLOCK_SHARDED`    | ✓  | ✓    | Same composite-layer round trip.                                       |
 
-```cpp
-// Create input tensor
-const ttnn::Tensor input_tensor = ...
+Both `ROW_MAJOR` and `COL_MAJOR` shard orientations are accepted.
 
-// Set sorting dim
-const int8_t dim = -1;
+#### Supported tensor shapes / sort dims
 
-// Set sorting params
-const bool descending = false;
-const bool stable = false;
+- Tensor ranks: 1D through arbitrary N-D. Tensors with rank > 4 are reshaped
+  to 4D internally and restored to their original rank on output via
+  `ttnn::reshape`'s metadata-only fast path (no device reshape kernel — this
+  is what allows `UINT16` indices to round-trip through high-rank tensors).
+- Sort `dim`: any valid axis, including negative indices. The composite
+  layer transposes the chosen dim to the innermost position before invoking
+  the kernel and reverses the transpose on output.
+- Logical shapes need not be tile-aligned; the composite layer pads with
+  ±∞ sentinels and slices back to the original size after sorting.
+- The minimum effective sort dim is 2 tiles (64 elements). Smaller dims are
+  padded up internally.
 
-// Optional params
-std::optional<std::tuple<ttnn::Tensor&, ttnn::Tensor&>> optional_output_tensors;
-const std::optional<ttnn::MemoryConfig> memory_config;
+#### Preallocated outputs (`out=(values, indices)`)
 
-std::vector<Tensor> sorted_tensors = ttnn::sort(queue_id, input_tensor, dim, descending, stable, memory_config, optional_output_tensors);
-```
+- `values` and `indices` may have any supported layout, memory config, and
+  the `values` dtype must match the input dtype (kernel-level constraint);
+  the `indices` dtype must be `UINT16` or `UINT32`.
+- The two preallocated tensors may have **different** layouts and memory
+  configs from each other and from the input.
+- If the buffer changes during the composite-layer conversions, the user's
+  tensor handle is silently rebound to the new buffer so the call site sees
+  the result regardless.
 
-### Usage Limitations
+#### Other arguments
 
-- Supported index tensor types: `uint32`, `uint16`,
-- Supported value tensor types: `uint16`, `bfloat16`,
-- `stable=True` is not supported in this implementation.
+- `descending` (bool): ascending (default) or descending order.
+- `memory_config` (optional): output memory config when `out=` is omitted.
+  Defaults to the input's memory config.
+- `stable` (bool): **not supported** in this implementation. Passing
+  `stable=True` raises a `TT_FATAL` error.
+
+## Tensor Transformations
+
+Before and after the core sorting operation, the input tensor undergoes several transformations to ensure compatibility with the Bitonic Sort algorithm and hardware requirements. These transformations are transparent to the user and are automatically reversed after sorting.
+
+### Pre-Sort Transformations
+
+The composite layer first normalizes the input layout and memory configuration to the canonical format expected by the device kernel, then `pre_sort_transform_tensor` prepares the resulting tensor through the remaining steps:
+
+1. **Layout and Memory Config Normalization** (composite layer):
+   - If the input is sharded (`HEIGHT_SHARDED`, `WIDTH_SHARDED`, or `BLOCK_SHARDED`), it is converted to interleaved DRAM so that `ttnn::pad` (called in the next step) can run on it. The result is converted back to the original sharded config after the post-sort slice restores the original width.
+   - `ROW_MAJOR` inputs are processed natively by all three sort program factories (single-core, hybrid cross-core, DRAM multi-core). No layout conversion is applied at the composite layer.
+   - Preallocated outputs supplied via `out=` undergo the same normalization; the user-visible handles are rebound at the end of the operation.
+
+2. **Dimension Transposition**:
+   - If the sort dimension is not the last dimension, the tensor is transposed to move the sort dimension to the last position.
+   - This ensures that sorting always operates on the innermost dimension, which is required by the hardware implementation.
+
+3. **Rank Normalization to 4D**:
+   - Tensors with rank less than 4 are expanded to 4D by adding dimensions of size 1.
+   - Tensors with rank greater than 4 are reshaped to 4D by combining higher dimensions.
+   - This standardization simplifies the sorting implementation, as all strategies operate on 4D tensors.
+
+4. **Row-Group Alignment** (layout-dependent):
+   - **TILE layout**: tiles may have implicit row-padding to align with the hardware tile height (32 rows). This padding is filled with `+∞` (ascending) or `-∞` (descending) so that padded rows sort to the end.
+   - **ROW_MAJOR layout**: the sort kernel groups input rows in batches of 32. If the combined height (`shape[0] × shape[1] × shape[2]`) is not a multiple of 32, the H dimension is explicitly padded to the next compliant value. The padding rows are filled with sentinel values and sliced away after sorting.
+
+5. **Power-of-Two Padding**:
+   - Bitonic Sort requires the dataset size to be a power of two.
+   - If the last dimension (after implicit tile padding) is not a power of two, additional manual padding is applied.
+   - The minimum size is 2 tiles (64 elements), even if the original dimension is smaller.
+   - Padding values are `+∞` or `-∞` depending on sort order.
+
+### Post-Sort Transformations
+
+The `post_sort_transform_tensor` function reverses the pre-sort transformations to restore the original tensor structure, and the composite layer then restores the user-visible layout and memory configuration:
+
+1. **Slice to Original Size**:
+   - If manual power-of-two padding was applied, the sorted output is sliced back to the original dimension size.
+   - Both the sorted values and indices tensors are sliced identically.
+
+2. **Rank Restoration**:
+   - Tensors are reshaped back to their original rank:
+     - Tensors originally with rank < 4 are squeezed back.
+     - Tensors originally with rank > 4 are reshaped to their original shape. The reshape targets the *transposed* high-rank shape (the final dimension transpose then swaps it back), keeping the last dim unchanged so that ttnn::reshape's metadata-only fast path is used. This avoids the device reshape kernel, which is required for `UINT16` indices.
+
+3. **Dimension Transpose Back**:
+   - If the sort dimension was transposed to the last position, the tensor is transposed back to restore the original dimension order.
+   - Both sorted values and indices are transposed consistently.
+
+4. **Layout and Memory Config Restoration** (composite layer):
+   - The sorted values and indices are converted back to the user-requested layout (e.g., `TILE` → `ROW_MAJOR`) if it differs from the canonical format.
+   - If the user requested a sharded output memory configuration, the interleaved output is re-sharded to that configuration. Values and indices may have different requested memory configurations and are handled independently.
+   - The order is layout first, then memory config — interleaved-to-sharded conversion is the well-tested path and avoids unsupported sharded-TILE → ROW_MAJOR conversions.
+
+### Example Transformation Flow
+
+For a tensor of shape `[3, 5, 7]` sorted along dimension 0:
+
+**Pre-sort:**
+1. Transpose: `[3, 5, 7]` → `[5, 7, 3]` (move dim 0 to last)
+2. Expand to 4D: `[5, 7, 3]` → `[1, 5, 7, 3]`
+3. Tile padding: `[1, 5, 7, 3]` → `[1, 5, 7, 32]` (implicit padding to tile boundary)
+4. Power-of-two padding: `[1, 5, 7, 32]` → `[1, 5, 7, 64]` (pad to 2 tiles minimum)
+
+**Sort operation** (on transformed tensor)
+
+**Post-sort:**
+1. Slice: `[1, 5, 7, 64]` → `[1, 5, 7, 3]` (remove manual padding)
+2. Squeeze to 3D: `[1, 5, 7, 3]` → `[5, 7, 3]`
+3. Transpose back: `[5, 7, 3]` → `[3, 5, 7]` (restore original dimension order)
+
+These transformations ensure that any tensor shape and sort dimension combination can be efficiently processed by the underlying Bitonic Sort hardware implementation.
 
 ## Strategy Comparison Overview
 

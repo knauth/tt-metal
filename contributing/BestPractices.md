@@ -18,13 +18,13 @@ void write_buffer(queue_id cq_id, Tensor& dst, std::vector<std::shared_ptr<void>
 void write_buffer(queue_id cq_id, Tensor& dst, const std::vector<std::shared_ptr<void>>& src, const std::optional<std::size_t>& transfer_size = std::nullopt); // Right!
 ```
 
-## 2. Use `tt::stl::Span` for Input Parameters
+## 2. Use `ttsl::Span` for Input Parameters
 
 ### Practice
-Consider using `tt::stl::Span` as input instead of `std::vector`. This allows `std::array` to be used as an argument as well.
+Consider using `ttsl::Span` as input instead of `std::vector`. This allows `std::array` to be used as an argument as well.
 
 ### Explanation
-`tt::stl::Span` is a lightweight view over a contiguous sequence of objects, such as arrays and vectors. It provides a safe and flexible way to handle array-like data structures without copying them.
+`ttsl::Span` is a lightweight view over a contiguous sequence of objects, such as arrays and vectors. It provides a safe and flexible way to handle array-like data structures without copying them.
 
 ### Motivation
 - **Flexibility**: Enables functions to accept both `std::vector` and `std::array`.
@@ -33,7 +33,7 @@ Consider using `tt::stl::Span` as input instead of `std::vector`. This allows `s
 ### Example
 ```
 template <typename T>
-void print_elements(tt::stl::Span<const T> data) {
+void print_elements(ttsl::Span<const T> data) {
     for (const auto& element : data) {
         std::cout << element << " ";
     }
@@ -357,7 +357,7 @@ void doSomething(...) {
 
 ## 17. Avoid `static` variables with non-trivial destructors
 ### Practice
-Avoid using `static` variables with non-trivial destructors. When applicable, use `tt::stl::Indestructible<T>` to create static objects with disabled destructor.
+Avoid using `static` variables with non-trivial destructors. When applicable, use `ttsl::Indestructible<T>` to create static objects with disabled destructor.
 
 ### Explanation
 Objects with static storage duration (globals, static class members, or function-local statics) live from initialization until program termination.
@@ -366,7 +366,7 @@ A non-trivial destructor (i.e., one that is user-defined or virtual) may depend 
 
 An object is considered trivially destructible if it has no custom or virtual destructor and all its bases and non-static members are also trivially destructible. Examples include: fundamental types (pointers, int, float, etc.), arrays of trivially destructible types, variables marked with `constexpr`.
 
-To ensure safe and predictable program termination, static objects should meet these criteria. If dynamic initialization is required, consider using function-local statics with `tt::stl::Indestructible<T>` that disables destruction.
+To ensure safe and predictable program termination, static objects should meet these criteria. If dynamic initialization is required, consider using function-local statics with `ttsl::Indestructible<T>` that disables destruction.
 
 ### Motivation
 - **Safety:** Prevents accessing objects after they have been destroyed.
@@ -395,7 +395,7 @@ constexpr std::array<int, 3> kDeviceIds = {1, 2, 8};
 
 // Option 2: If dynamic initialization is required, use function-local statics with `Indestructible`.
 const auto& get_device_configs() {
-    static tt::stl::Indestructible<std::map<int, std::string_view>> configs{
+    static ttsl::Indestructible<std::map<int, std::string_view>> configs{
         std::map<int, std::string_view>{
             {1, "n150.yaml"},
             {2, "n300.yaml"},
@@ -405,3 +405,52 @@ const auto& get_device_configs() {
     return configs.get();
 }
 ```
+
+## 18. Use Exhaustive Switch Statements for Enums
+
+### Practice
+Always use exhaustive switch statements when handling enum classes, explicitly listing all cases without a `default` clause. Follow the switch statement with `TT_THROW("Unreachable")` to handle potential compiler warnings.
+
+### Explanation
+When switching on enum values, avoid using a `default` case. Instead, explicitly handle every enum value. This approach ensures that when new enum values are added, the compiler will generate an error at every switch statement that needs updating, forcing developers to handle the new case appropriately.
+
+The `TT_THROW("Unreachable")` statement after the switch handles cases where some compilers may warn about "non-void function must return a value" in CI environments.
+
+### Motivation
+- **Compile-Time Safety**: Forces compilation to fail when new enums are added, ensuring all relevant code locations are updated.
+- **Maintainability**: Prevents silent bugs from unhandled enum values that would be caught by a default case.
+- **Code Completeness**: Guarantees that every enum value is explicitly considered and handled.
+
+### Example
+```cpp
+enum class TensorLayout {
+    INVALID = 0, ROW_MAJOR = 1, TILE = 2,
+};
+
+// Good: Exhaustive switch with all cases handled
+std::string_view tensor_layout_to_string(TensorLayout layout) {
+    switch (layout) {
+        case TensorLayout::INVALID:
+            return "INVALID";
+        case TensorLayout::ROW_MAJOR:
+            return "ROW_MAJOR";
+        case TensorLayout::TILE:
+            return "TILE";
+    }
+    TT_THROW("Unreachable");
+}
+
+// Bad: Using default case hides missing enum handling
+std::string_view tensor_layout_to_string_bad(TensorLayout layout) {
+    switch (layout) {
+        case TensorLayout::ROW_MAJOR:
+            return "ROW_MAJOR";
+        case TensorLayout::TILE:
+            return "TILE";
+        default:
+            return "UNKNOWN";  // New enums will silently fall here
+    }
+}
+```
+
+When a new layout type is added (e.g., `BLOCK`), the exhaustive switch will fail to compile, immediately alerting developers to update all switch statements handling `TensorLayout`.

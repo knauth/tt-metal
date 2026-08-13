@@ -1,17 +1,21 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/run_operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
 
-namespace ttnn::operations::data_movement::detail {
+#include "ttnn/operations/data_movement/sharded/sharded_to_interleaved/device/sharded_to_interleaved_device_operation_types.hpp"
+#include "ttnn/device_operation.hpp"
 
-tt::tt_metal::operation::ProgramWithCallbacks sharded_to_interleaved_multi_core(
-    const Tensor& a,
-    const Tensor& output,
-    bool is_l1_aligned = false,
-    uint32_t num_slices = 1,
-    uint32_t slice_index = 0);
-}
+namespace ttnn::prim {
+
+struct ShardedToInterleavedProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const ShardedToInterleavedParams& operation_attributes,
+        const ShardedToInterleavedInputs& tensor_args,
+        Tensor& output_tensor);
+};
+
+}  // namespace ttnn::prim

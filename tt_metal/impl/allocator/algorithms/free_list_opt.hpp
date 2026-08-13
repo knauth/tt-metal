@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
@@ -13,12 +13,9 @@
 #include <vector>
 
 #include "allocator_algorithm.hpp"
-#include "allocator_types.hpp"
 #include "hal_types.hpp"
 
-namespace tt {
-namespace tt_metal {
-namespace allocator {
+namespace tt::tt_metal::allocator {
 // Essentially the same free list algorithm as FreeList with BestFit policy, but with (IMO absurdly) optimized code.
 // Including
 // - SoA instead of linked list for the free list
@@ -40,8 +37,22 @@ public:
         SearchPolicy policy = SearchPolicy::BEST);
     void init() override;
 
+    // Returns start and end addresses of available blocks; addresses are absolute addresses with offset added
     std::vector<std::pair<DeviceAddr, DeviceAddr>> available_addresses(DeviceAddr size_bytes) const override;
 
+    // Returns start and end addresses of allocated blocks; addresses are absolute addresses with offset added
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> allocated_addresses() const override;
+
+    // Returns the size of the allocation at the given absolute address, or nullopt if not found
+    std::optional<DeviceAddr> get_allocation_size(DeviceAddr absolute_address) const override;
+
+    // Address limit is used as a final check to see if selected address is > address limit.
+    // The selected address is first converted to absolute address by adding offset_bytes_.
+    // Based on usage, it seems like offset_bytes_ is used to offset by address limit so that
+    // absolute address > address limit. Otherwise, bottom-up allocation will always fail without offset.
+    // Eg. In L1 allocator setup:
+    // - address limit (interleaved address limit): 100432
+    // - offset_bytes (l1 unreserved base): 100416
     std::optional<DeviceAddr> allocate(
         DeviceAddr size_bytes, bool bottom_up = true, DeviceAddr address_limit = 0) override;
 
@@ -75,18 +86,18 @@ private:
 
     // Caches so most operations don't need to scan the entire free list. The allocated block table
     // will not rehash as I find the cost to not be worth it
-    inline static constexpr size_t n_alloc_table_buckets = 512;          // Number of buckets in the hash table
-    inline static constexpr size_t n_alloc_table_init_bucket_size = 10;  // Initial size of each bucket
+    static constexpr size_t n_alloc_table_buckets = 512;          // Number of buckets in the hash table
+    static constexpr size_t n_alloc_table_init_bucket_size = 10;  // Initial size of each bucket
     std::vector<std::vector<std::pair<DeviceAddr, size_t>>> allocated_block_table_;
 
     // Size segregated list of free blocks. Idea comes from the TLSF paper, but instead of aiming for realtime
     // the goal there is to not look at small blocks when allocating large blocks. Which the naive free list
-    // algorithm does not do. Confiugring these 2 parameters is needs real world data, but for now it's just
+    // algorithm does not do. Configuring these 2 parameters needs real world data, but for now it's just
     // number pulled out of thin air. Too low and it devolves into an array search, too high you pay cache misses
 
     // Size class index is calculated by taking the log2 of the block size divided by the base size
     // ex: size = 2048, base = 1024, log2(2048/1024) = 1, so size class index = 1
-    inline static constexpr size_t size_segregated_base = 1024;  // in bytes
+    static constexpr size_t size_segregated_base = 1024;         // in bytes
     const size_t size_segregated_count;                          // Number of size classes
     std::vector<std::vector<size_t>> free_blocks_segregated_by_size_;
 
@@ -96,7 +107,7 @@ private:
     // NOTE: This function DOES NOT remove block_index from the segregated list. Caller should do that
     size_t allocate_in_block(size_t block_index, DeviceAddr alloc_size, size_t offset);
 
-    inline size_t get_size_segregated_index(DeviceAddr size_bytes) const {
+    size_t get_size_segregated_index(DeviceAddr size_bytes) const {
         // std::log2 is SLOW, so we use a simple log2 implementation for integers. I assume GCC compiles this to a
         // count leading zeros instruction then a subtraction.
         size_t lg = 0;
@@ -120,6 +131,7 @@ private:
     static size_t hash_device_address(DeviceAddr address);
     void insert_block_to_alloc_table(DeviceAddr address, size_t block_index);
     bool is_address_in_alloc_table(DeviceAddr address) const;
+    std::optional<size_t> get_block_index_from_alloc_table(DeviceAddr address) const;
     std::optional<size_t> get_and_remove_from_alloc_table(DeviceAddr address);
 
     void update_lowest_occupied_address(DeviceAddr address);
@@ -129,6 +141,4 @@ private:
     SearchPolicy policy_;
 };
 
-}  // namespace allocator
-}  // namespace tt_metal
-}  // namespace tt
+}  // namespace tt::tt_metal::allocator

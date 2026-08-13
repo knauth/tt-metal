@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -15,7 +15,7 @@ import numpy as np
 from collections import defaultdict
 
 
-from tt_metal.tools.profiler.common import PROFILER_LOGS_DIR, PROFILER_DEVICE_SIDE_LOG
+from tracy.common import PROFILER_LOGS_DIR, PROFILER_DEVICE_SIDE_LOG, clear_profiler_runtime_artifacts
 
 from tests.tt_metal.tt_metal.data_movement.python.config import DataMovementConfig
 from tests.tt_metal.tt_metal.data_movement.python.test_metadata import TestMetadataLoader
@@ -45,12 +45,16 @@ def run_dm_tests(profile, verbose, gtest_filter, plot, report, arch_name):
         profile_dm_tests(verbose=verbose, gtest_filter=gtest_filter)
 
     # Gather analysis stats
-    stats_collector = StatsCollector(log_file_path, test_id_to_name, test_type_attributes, verbose=verbose)
-    dm_stats, aggregate_stats = stats_collector.gather_analysis_stats()
+    stats_collector = StatsCollector(log_file_path, test_id_to_name, test_type_attributes, verbose=verbose, arch=arch)
+    stats = stats_collector.gather_stats_from_csv()
+    if not stats.get("devices"):
+        logger.info("No profiling data available.")
+        return
+    dm_stats, aggregate_stats = stats_collector.gather_analysis_stats(stats)
 
     # Print stats if explicitly requested
     stats_reporter = StatsReporter(
-        dm_stats, aggregate_stats, test_id_to_name, test_type_attributes, DEFAULT_OUTPUT_DIR, arch
+        dm_stats, aggregate_stats, test_id_to_name, test_type_attributes, DEFAULT_OUTPUT_DIR, arch, metadata_loader
     )
 
     if verbose:
@@ -62,7 +66,9 @@ def run_dm_tests(profile, verbose, gtest_filter, plot, report, arch_name):
 
     # Plot results
     if plot:
-        plotter = Plotter(dm_stats, aggregate_stats, DEFAULT_OUTPUT_DIR, arch, test_id_to_name, test_id_to_comment)
+        plotter = Plotter(
+            dm_stats, aggregate_stats, DEFAULT_OUTPUT_DIR, arch, test_id_to_name, test_id_to_comment, metadata_loader
+        )
         plotter.plot_dm_stats()
 
     # Check performance
@@ -77,7 +83,10 @@ def run_dm_tests(profile, verbose, gtest_filter, plot, report, arch_name):
 def profile_dm_tests(verbose=False, gtest_filter=None):
     if verbose:
         logger.info(f"Profiling Kernels...")
-    cmd = f"TT_METAL_SLOW_DISPATCH_MODE=1 TT_METAL_DEVICE_PROFILER=1 {os.environ['TT_METAL_HOME']}/build/test/tt_metal/unit_tests_data_movement"
+
+    clear_profiler_runtime_artifacts()
+
+    cmd = f"TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=1333 {os.environ['TT_METAL_HOME']}/build/test/tt_metal/unit_tests_data_movement"
 
     if gtest_filter:
         cmd += f' --gtest_filter="*{gtest_filter}*"'

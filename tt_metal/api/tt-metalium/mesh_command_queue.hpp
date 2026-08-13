@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -19,8 +19,6 @@
 
 #include <tt_stl/span.hpp>
 #include <tt-metalium/buffer.hpp>
-#include <tt-metalium/command_queue.hpp>
-#include <tt-metalium/command_queue_interface.hpp>
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
 #include <tt-metalium/mesh_coord.hpp>
@@ -30,11 +28,12 @@
 #include <tt-metalium/mesh_workload.hpp>
 #include <tt-metalium/sub_device_types.hpp>
 #include <tt-metalium/vector_aligned.hpp>
-#include <umd/device/tt_core_coordinates.h>
 
-namespace tt {
-namespace tt_metal {
+namespace tt::tt_metal {
+class HostTensor;
 class IDevice;
+class MemoryConfig;
+class MeshTensor;
 class SystemMemoryManager;
 class WorkerConfigBufferMgr;
 namespace distributed {
@@ -42,8 +41,11 @@ class MeshDevice;
 class MeshWorkload;
 }  // namespace distributed
 struct ProgramCommandSequence;
-}  // namespace tt_metal
-}  // namespace tt
+namespace experimental {
+
+class ShardDataTransferHelper;
+}  // namespace experimental
+}  // namespace tt::tt_metal
 
 namespace tt::tt_metal::distributed {
 
@@ -56,12 +58,11 @@ struct MeshCoreDataReadDescriptor;
 using MeshCompletionReaderVariant =
     std::variant<MeshBufferReadDescriptor, MeshReadEventDescriptor, MeshCoreDataReadDescriptor>;
 
+class ShardDataTransfer;
+
 // THREAD SAFETY: All methods are thread safe.
 class MeshCommandQueue {
     // Main interface to dispatch data and workloads to a MeshDevice
-    // Currently only supports dispatching workloads and relies on the
-    // tt::tt_metal::CommandQueue.
-    // Additional support for Reads and Writes to be added
 protected:
     MeshDevice* mesh_device_ = nullptr;
     uint32_t id_ = 0;
@@ -81,7 +82,7 @@ public:
     virtual void enqueue_mesh_workload(MeshWorkload& mesh_workload, bool blocking) = 0;
 
     // Specifies host data to be written to or read from a MeshBuffer shard.
-    struct ShardDataTransfer {
+    struct [[deprecated("Use distributed::ShardDataTransfer instead.")]] ShardDataTransfer {
         MeshCoordinate shard_coord;
         void* host_data = nullptr;
         std::optional<BufferRegion> region;
@@ -96,18 +97,47 @@ public:
         std::optional<BufferRegion> region = std::nullopt) = 0;
     virtual void enqueue_write_mesh_buffer(
         const std::shared_ptr<MeshBuffer>& buffer, const void* host_data, bool blocking) = 0;
-    virtual void enqueue_write_shards(
-        const std::shared_ptr<MeshBuffer>& mesh_buffer,
-        const std::vector<ShardDataTransfer>& shard_data_transfers,
-        bool blocking) = 0;
+    // If PinnedMemory is attached to a HostBuffer used within the enqueue_write, the contents of the memory must not be
+    // modified until the enqueue_write has completed on the device. This may be checked by any of
+    // * calling lock() on the PinnedMemory
+    // * setting the blocking parameter to true
+    // * calling finish() on the MeshCommandQueue
+    // * calling enqueue_record_event_to_host() and then waiting for the event to complete on the host.
     virtual void enqueue_write(
         const std::shared_ptr<MeshBuffer>& mesh_buffer, const DistributedHostBuffer& host_buffer, bool blocking) = 0;
+    // If PinnedMemory is set on a ShardDataTransfer, the contents of the memory must not be modified until the
+    // enqueue_write has completed on the device. This may be checked by any of
+    // * calling lock() on the PinnedMemory
+    // * setting the blocking parameter to true
+    // * calling finish() on the MeshCommandQueue
+    // * calling enqueue_record_event_to_host() and then waiting for the event to complete on the host.
+    virtual void enqueue_write_shards(
+        const std::shared_ptr<MeshBuffer>& mesh_buffer,
+        const std::vector<distributed::ShardDataTransfer>& shard_data_transfers,
+        bool blocking) = 0;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    [[deprecated("Use enqueue_write_shards with distributed::ShardDataTransfer instead.")]]
+    void enqueue_write_shards(
+        const std::shared_ptr<MeshBuffer>& mesh_buffer,
+        const std::vector<ShardDataTransfer>& shard_data_transfers,
+        bool blocking);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
     // MeshBuffer Read APIs
     virtual void enqueue_read_mesh_buffer(
         void* host_data, const std::shared_ptr<MeshBuffer>& buffer, bool blocking) = 0;
     virtual void enqueue_read_shards(
-        const std::vector<ShardDataTransfer>& shard_data_transfers,
+        const std::vector<distributed::ShardDataTransfer>& shard_data_transfers,
         const std::shared_ptr<MeshBuffer>& mesh_buffer,
         bool blocking) = 0;
     // TODO: does "enqueue" make sense anymore? Return the object by value instead.
@@ -116,23 +146,90 @@ public:
         DistributedHostBuffer& host_buffer,
         const std::optional<std::unordered_set<MeshCoordinate>>& shards,
         bool blocking) = 0;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    [[deprecated("Use enqueue_read_shards with distributed::ShardDataTransfer instead.")]]
+    void enqueue_read_shards(
+        const std::vector<ShardDataTransfer>& shard_data_transfers,
+        const std::shared_ptr<MeshBuffer>& mesh_buffer,
+        bool blocking);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+    // MeshTensor Read/Write APIs
+    tt::tt_metal::HostTensor enqueue_read_tensor(const tt::tt_metal::MeshTensor& device_tensor, bool blocking = true);
+    void enqueue_read_tensor(
+        const tt::tt_metal::MeshTensor& device_tensor, tt::tt_metal::HostTensor& host_tensor, bool blocking = true);
+    tt::tt_metal::MeshTensor enqueue_write_tensor(const tt::tt_metal::HostTensor& host_tensor);
+    tt::tt_metal::MeshTensor enqueue_write_tensor(
+        const tt::tt_metal::HostTensor& host_tensor, const tt::tt_metal::MemoryConfig& memory_config);
+    void enqueue_write_tensor(const tt::tt_metal::HostTensor& host_tensor, tt::tt_metal::MeshTensor& device_tensor);
 
     virtual MeshEvent enqueue_record_event(
-        tt::stl::Span<const SubDeviceId> sub_device_ids = {},
+        ttsl::Span<const SubDeviceId> sub_device_ids = {},
         const std::optional<MeshCoordinateRange>& device_range = std::nullopt) = 0;
     virtual MeshEvent enqueue_record_event_to_host(
-        tt::stl::Span<const SubDeviceId> sub_device_ids = {},
+        ttsl::Span<const SubDeviceId> sub_device_ids = {},
         const std::optional<MeshCoordinateRange>& device_range = std::nullopt) = 0;
     virtual void enqueue_wait_for_event(const MeshEvent& sync_event) = 0;
-    virtual void finish(tt::stl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
-    virtual void reset_worker_state(
-        bool reset_launch_msg_state,
-        uint32_t num_sub_devices,
-        const vector_aligned<uint32_t>& go_signal_noc_data,
-        const std::vector<std::pair<CoreRangeSet, uint32_t>>& core_go_message_mapping) = 0;
+    virtual void finish(ttsl::Span<const SubDeviceId> sub_device_ids = {}) = 0;
     virtual void record_begin(const MeshTraceId& trace_id, const std::shared_ptr<MeshTraceDescriptor>& ctx) = 0;
     virtual void record_end() = 0;
     virtual void enqueue_trace(const MeshTraceId& trace_id, bool blocking) = 0;
+};
+
+// Specifies host data to be written to or read from a MeshBuffer shard.
+class ShardDataTransfer {
+private:
+    MeshCoordinate shard_coord_;
+    void* host_data_ = nullptr;
+    std::optional<BufferRegion> region_;
+    std::shared_ptr<experimental::PinnedMemory> pinned_memory_ = nullptr;
+    friend class experimental::ShardDataTransferHelper;
+
+public:
+    explicit ShardDataTransfer(const MeshCoordinate& shard_coord) : shard_coord_(shard_coord) {}
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    explicit ShardDataTransfer(const MeshCommandQueue::ShardDataTransfer& shard_data_transfer) :
+        shard_coord_(shard_data_transfer.shard_coord),
+        host_data_(shard_data_transfer.host_data),
+        region_(shard_data_transfer.region) {}
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
+    MeshCoordinate shard_coord() const { return shard_coord_; }
+    void* host_data() const { return host_data_; }
+    std::optional<BufferRegion> region() const { return region_; }
+
+    ShardDataTransfer& shard_coord(const MeshCoordinate& shard_coord) {
+        shard_coord_ = shard_coord;
+        return *this;
+    }
+    ShardDataTransfer& host_data(void* host_data) {
+        host_data_ = host_data;
+        return *this;
+    }
+    ShardDataTransfer& region(std::optional<BufferRegion> region) {
+        region_ = region;
+        return *this;
+    }
 };
 
 }  // namespace tt::tt_metal::distributed

@@ -1,9 +1,11 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "flatbuffer/buffer_types_from_flatbuffer.hpp"
 #include "flatbuffer/program_types_from_flatbuffer.hpp"
+
+#include <utility>
 
 namespace tt::tt_metal {
 
@@ -24,6 +26,7 @@ TensorMemoryLayout from_flatbuffer(flatbuffer::TensorMemoryLayout layout) {
         case flatbuffer::TensorMemoryLayout::HeightSharded: return TensorMemoryLayout::HEIGHT_SHARDED;
         case flatbuffer::TensorMemoryLayout::WidthSharded: return TensorMemoryLayout::WIDTH_SHARDED;
         case flatbuffer::TensorMemoryLayout::BlockSharded: return TensorMemoryLayout::BLOCK_SHARDED;
+        case flatbuffer::TensorMemoryLayout::NdSharded: return TensorMemoryLayout::ND_SHARDED;
     }
     TT_THROW("Unsupported TensorMemoryLayout from flatbuffer.");
 }
@@ -39,22 +42,35 @@ CircularBufferConfig from_flatbuffer(
 
     std::array<std::optional<tt::DataFormat>, NUM_CIRCULAR_BUFFERS> data_formats = {};
     if (config_fb->data_formats()) {
-        for (auto entry : *config_fb->data_formats()) {
+        for (const auto* entry : *config_fb->data_formats()) {
             data_formats[entry->index()] = from_flatbuffer(entry->format());
         }
     }
 
     std::array<std::optional<uint32_t>, NUM_CIRCULAR_BUFFERS> page_sizes = {};
     if (config_fb->page_sizes()) {
-        for (auto entry : *config_fb->page_sizes()) {
+        for (const auto* entry : *config_fb->page_sizes()) {
             page_sizes[entry->index()] = entry->size();
         }
     }
 
     std::array<std::optional<Tile>, NUM_CIRCULAR_BUFFERS> tiles = {};
     if (config_fb->tiles()) {
-        for (auto entry : *config_fb->tiles()) {
+        for (const auto* entry : *config_fb->tiles()) {
             tiles[entry->index()] = from_flatbuffer(entry->tile());
+        }
+    }
+
+    std::array<std::optional<FaceGeometry>, NUM_CIRCULAR_BUFFERS> unpack_face_geometry = {};
+    if (config_fb->unpack_face_geometry()) {
+        for (const auto* entry : *config_fb->unpack_face_geometry()) {
+            const auto index = entry->index();
+            TT_FATAL(
+                index < NUM_CIRCULAR_BUFFERS,
+                "Invalid unpack face geometry index {} from flatbuffer. Expected index < {}",
+                index,
+                NUM_CIRCULAR_BUFFERS);
+            unpack_face_geometry[index] = FaceGeometry{entry->face_r_dim(), entry->num_faces()};
         }
     }
 
@@ -74,6 +90,7 @@ CircularBufferConfig from_flatbuffer(
         data_formats,
         page_sizes,
         tiles,
+        unpack_face_geometry,
         create_uint8_set(config_fb->buffer_indices()),
         create_uint8_set(config_fb->local_buffer_indices()),
         create_uint8_set(config_fb->remote_buffer_indices()),
@@ -96,24 +113,11 @@ ShardOrientation from_flatbuffer(flatbuffer::ShardOrientation orientation) {
     TT_THROW("Unsupported ShardOrientation from flatbuffer.");
 }
 
-ShardMode from_flatbuffer(flatbuffer::ShardMode mode) {
-    switch (mode) {
-        case flatbuffer::ShardMode::Physical: return ShardMode::PHYSICAL;
-        case flatbuffer::ShardMode::Logical: return ShardMode::LOGICAL;
-    }
-    TT_THROW("Unsupported ShardMode from flatbuffer.");
-}
-
 ShardSpec from_flatbuffer(const flatbuffer::ShardSpec* spec) {
     CoreRangeSet grid = from_flatbuffer(spec->grid());
     std::array<uint32_t, 2> shape = {spec->shape_h(), spec->shape_w()};
     ShardOrientation orientation = from_flatbuffer(spec->orientation());
-    ShardMode mode = from_flatbuffer(spec->shard_mode());
-    if (const auto* fb_shard_shape = spec->physical_shard_shape()) {
-        std::array<uint32_t, 2> physical_shard_shape = {fb_shard_shape->height(), fb_shard_shape->width()};
-        return ShardSpec(grid, shape, physical_shard_shape, orientation);
-    }
-    return ShardSpec(grid, shape, orientation, mode);
+    return ShardSpec(grid, shape, orientation);
 }
 
 std::optional<ShardSpecBuffer> from_flatbuffer(const flatbuffer::ShardSpecBuffer* fb_shard_spec) {
@@ -134,14 +138,14 @@ std::optional<BufferDistributionSpec> from_flatbuffer(const flatbuffer::BufferDi
 
     std::vector<CoreCoord> cores;
     cores.reserve(fb_dist_spec->cores()->size());
-    for (auto entry : *fb_dist_spec->cores()) {
+    for (const auto* entry : *fb_dist_spec->cores()) {
         cores.push_back(CoreCoord(entry->x(), entry->y()));
     }
 
     return BufferDistributionSpec(
-        Shape(tt::stl::SmallVector<uint32_t>(
+        Shape(ttsl::SmallVector<uint32_t>(
             fb_dist_spec->tensor_shape_in_pages()->cbegin(), fb_dist_spec->tensor_shape_in_pages()->cend())),
-        Shape(tt::stl::SmallVector<uint32_t>(
+        Shape(ttsl::SmallVector<uint32_t>(
             fb_dist_spec->shard_shape_in_pages()->cbegin(), fb_dist_spec->shard_shape_in_pages()->cend())),
         std::move(cores));
 }

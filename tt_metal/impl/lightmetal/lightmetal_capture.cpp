@@ -1,21 +1,24 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <tt_stl/fmt.hpp>
 #include <tt-logger/tt-logger.hpp>
-#include <tt-metalium/assert.hpp>
+#include <tt_stl/assert.hpp>
 #include "lightmetal/lightmetal_capture.hpp"
+#include <tt-metalium/experimental/lightmetal/lightmetal_binary.hpp>
 #include "flatbuffers/flatbuffers.h"
 #include "command_generated.h"
 #include "light_metal_binary_generated.h"
 #include "trace/trace_buffer.hpp"
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/program.hpp>
-#include <tt-metalium/kernel.hpp>
+
+#include "impl/program/program_impl.hpp"
 
 namespace tt::tt_metal {
 
-LightMetalCaptureContext::LightMetalCaptureContext() : is_tracing_(false), builder_() {}
+LightMetalCaptureContext::LightMetalCaptureContext() = default;
 
 // Singleton instance accessor
 LightMetalCaptureContext& LightMetalCaptureContext::get() {
@@ -71,7 +74,7 @@ void LightMetalCaptureContext::reset() {
 ////////////////////////////////////////////
 
 bool LightMetalCaptureContext::is_in_map(const Buffer* obj) {
-    return buffer_id_to_global_id_map_.find(obj->unique_id()) != buffer_id_to_global_id_map_.end();
+    return buffer_id_to_global_id_map_.contains(obj->unique_id());
 }
 
 uint32_t LightMetalCaptureContext::add_to_map(const Buffer* obj) {
@@ -94,43 +97,39 @@ uint32_t LightMetalCaptureContext::get_global_id(const Buffer* obj) {
     auto it = buffer_id_to_global_id_map_.find(obj->unique_id());
     if (it != buffer_id_to_global_id_map_.end()) {
         return it->second;
-    } else {
-        TT_THROW("Buffer id: {} not found in global_id map", obj->unique_id());
     }
+    TT_THROW("Buffer id: {} not found in global_id map", obj->unique_id());
 }
 
 bool LightMetalCaptureContext::is_in_map(const Program* obj) {
-    return program_id_to_global_id_map_.find(obj->get_id()) != program_id_to_global_id_map_.end();
+    return program_id_to_global_id_map_.contains(obj->impl().get_id());
 }
 
 uint32_t LightMetalCaptureContext::add_to_map(const Program* obj) {
     if (is_in_map(obj)) {
-        log_warning(tt::LogMetalTrace, "Program id: {} already exists in global_id map.", obj->get_id());
+        log_warning(tt::LogMetalTrace, "Program id: {} already exists in global_id map.", obj->impl().get_id());
     }
     uint32_t global_id = next_global_id_++;
-    program_id_to_global_id_map_[obj->get_id()] = global_id;
+    program_id_to_global_id_map_[obj->impl().get_id()] = global_id;
     return global_id;
 }
 
 void LightMetalCaptureContext::remove_from_map(const Program* obj) {
     if (!is_in_map(obj)) {
-        log_warning(tt::LogMetalTrace, "Program id: {} not found in global_id map.", obj->get_id());
+        log_warning(tt::LogMetalTrace, "Program id: {} not found in global_id map.", obj->impl().get_id());
     }
-    program_id_to_global_id_map_.erase(obj->get_id());
+    program_id_to_global_id_map_.erase(obj->impl().get_id());
 }
 
 uint32_t LightMetalCaptureContext::get_global_id(const Program* obj) {
-    auto it = program_id_to_global_id_map_.find(obj->get_id());
+    auto it = program_id_to_global_id_map_.find(obj->impl().get_id());
     if (it != program_id_to_global_id_map_.end()) {
         return it->second;
-    } else {
-        TT_THROW("Program id: {} not found in global_id map.", obj->get_id());
     }
+    TT_THROW("Program id: {} not found in global_id map.", obj->impl().get_id());
 }
 
-bool LightMetalCaptureContext::is_in_map(const Kernel* obj) {
-    return kernel_to_global_id_map_.find(obj) != kernel_to_global_id_map_.end();
-}
+bool LightMetalCaptureContext::is_in_map(const Kernel* obj) { return kernel_to_global_id_map_.contains(obj); }
 
 uint32_t LightMetalCaptureContext::add_to_map(const Kernel* obj) {
     if (is_in_map(obj)) {
@@ -152,14 +151,11 @@ uint32_t LightMetalCaptureContext::get_global_id(const Kernel* obj) {
     auto it = kernel_to_global_id_map_.find(obj);
     if (it != kernel_to_global_id_map_.end()) {
         return it->second;
-    } else {
-        TT_THROW("Kernel not found in global_id map.");
     }
+    TT_THROW("Kernel not found in global_id map.");
 }
 
-bool LightMetalCaptureContext::is_in_map(const CBHandle handle) {
-    return cb_handle_to_global_id_map_.find(handle) != cb_handle_to_global_id_map_.end();
-}
+bool LightMetalCaptureContext::is_in_map(const CBHandle handle) { return cb_handle_to_global_id_map_.contains(handle); }
 
 uint32_t LightMetalCaptureContext::add_to_map(const CBHandle handle) {
     if (is_in_map(handle)) {
@@ -181,9 +177,8 @@ uint32_t LightMetalCaptureContext::get_global_id(const CBHandle handle) {
     auto it = cb_handle_to_global_id_map_.find(handle);
     if (it != cb_handle_to_global_id_map_.end()) {
         return it->second;
-    } else {
-        TT_THROW("CBHandle not found in global_id map.");
     }
+    TT_THROW("CBHandle not found in global_id map.");
 }
 
 ////////////////////////////////////////////

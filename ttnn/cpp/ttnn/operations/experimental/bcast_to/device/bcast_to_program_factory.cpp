@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -18,6 +18,7 @@
 
 #include "bcast_to_device_operation.hpp"
 #include "bcast_to_utils.hpp"
+#include <tt-metalium/tensor_accessor_args.hpp>
 
 using namespace ttnn::operations::experimental::broadcast_to;
 
@@ -36,7 +37,7 @@ void set_or_update_runtime_arguments(
     KernelHandle writer_kernel_id,
     KernelHandle compute_kernel_id,
     CoreCoord compute_with_storage_grid_size,
-    const BcastToOperation::operation_attributes_t& operation_attributes,
+    const BcastToOperation::operation_attributes_t& /*operation_attributes*/,
     const BcastToOperation::tensor_args_t& tensor_args,
     BcastToOperation::tensor_return_value_t& output,
     F handle_args) {
@@ -53,7 +54,6 @@ void set_or_update_runtime_arguments(
     uint32_t num_cores_x = compute_with_storage_grid_size.x;
     uint32_t num_cores_y = compute_with_storage_grid_size.y;
     uint32_t num_cores_total = num_cores_x * num_cores_y;
-    auto all_device_cores = CoreRange({0, 0}, {num_cores_x - 1, num_cores_y - 1});
     auto [num_cores, all_cores, core_group_1, core_group_2, num_tiles_per_core_group_1, num_tiles_per_core_group_2] =
         tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, num_output_tiles, row_major);
 
@@ -143,7 +143,7 @@ BcastToOperation::BcastToTileFactory::cached_program_t BcastToOperation::BcastTo
 
     auto output_shape = output.logical_shape();
 
-    uint32_t input_single_tile_size = tt::tt_metal::detail::TileSize(input_data_format);
+    uint32_t input_single_tile_size = tt::tile_size(input_data_format);
 
     // Device Setup
     auto* device = input.device();
@@ -161,32 +161,45 @@ BcastToOperation::BcastToTileFactory::cached_program_t BcastToOperation::BcastTo
 
     create_cb(tt::CBIndex::c_1, program, all_device_cores, input_single_tile_size, num_tiles_per_cb, input_data_format);
 
-    const auto src_is_dram = static_cast<const uint32_t>(input.buffer()->is_dram());
-    const auto dst_is_dram = static_cast<const uint32_t>(output.buffer()->is_dram());
-
     auto kernel_config = BcastToKernelConfig(operation_attributes.subtile_broadcast_type);
 
     // READER KERNEL
+    std::vector<uint32_t> reader_compile_time_args{(uint32_t)tt::CBIndex::c_0};
+    tt::tt_metal::TensorAccessorArgs(input.buffer()).append_to(reader_compile_time_args);
     auto reader_id = tt::tt_metal::CreateKernel(
         program,
         get_kernel_file_path(kernel_config.reader_kernel),
         all_device_cores,
-        tt::tt_metal::ReaderDataMovementConfig({src_is_dram, (uint32_t)tt::CBIndex::c_0}));
+        tt::tt_metal::ReaderDataMovementConfig(reader_compile_time_args));
 
     // WRITER KERNEL
+    uint32_t writer_cb_id = (kernel_config.writer_kernel == KernelName::WriterNoBcast) ? (uint32_t)tt::CBIndex::c_0
+                                                                                       : (uint32_t)tt::CBIndex::c_1;
+    std::vector<uint32_t> writer_compile_time_args{writer_cb_id};
+    tt::tt_metal::TensorAccessorArgs(output.buffer()).append_to(writer_compile_time_args);
     auto writer_id = tt::tt_metal::CreateKernel(
         program,
         get_kernel_file_path(kernel_config.writer_kernel),
         all_device_cores,
-        tt::tt_metal::WriterDataMovementConfig({dst_is_dram, (uint32_t)tt::CBIndex::c_1, (uint32_t)tt::CBIndex::c_0}));
+        tt::tt_metal::WriterDataMovementConfig(writer_compile_time_args));
 
     // COMPUTE KERNEL
+    // Enable fp32_dest_acc_en and unpack_to_dest_mode for 32-bit formats (Float32, Int32, UInt32)
+    bool is_32bit_format = input_data_format == tt::DataFormat::Float32 || input_data_format == tt::DataFormat::Int32 ||
+                           input_data_format == tt::DataFormat::UInt32;
+    std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode(NUM_CIRCULAR_BUFFERS, tt::tt_metal::UnpackToDestMode::Default);
+    if (is_32bit_format) {
+        unpack_to_dest_mode[(uint32_t)tt::CBIndex::c_0] = tt::tt_metal::UnpackToDestMode::UnpackToDestFp32;
+    }
     auto compute_id = tt::tt_metal::CreateKernel(
         program,
         get_kernel_file_path(kernel_config.compute_kernel),
         all_device_cores,
         tt::tt_metal::ComputeConfig{
-            .math_approx_mode = false, .compile_args = {(uint32_t)tt::CBIndex::c_0, (uint32_t)tt::CBIndex::c_1}});
+            .fp32_dest_acc_en = is_32bit_format,
+            .unpack_to_dest_mode = unpack_to_dest_mode,
+            .math_approx_mode = false,
+            .compile_args = {(uint32_t)tt::CBIndex::c_0, (uint32_t)tt::CBIndex::c_1}});
 
     auto set_runtime_args = [](Program& program, KernelHandle kernel_id, CoreCoord core, auto&& args) {
         tt::tt_metal::SetRuntimeArgs(program, kernel_id, core, args);

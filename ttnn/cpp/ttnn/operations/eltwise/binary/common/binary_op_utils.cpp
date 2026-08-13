@@ -1,10 +1,11 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "binary_op_utils.hpp"
 
-#include <tt-metalium/assert.hpp>
+#include "binary_op_dtype_policy.hpp"
+#include <tt_stl/assert.hpp>
 #include "ttnn/operations/eltwise/unary/common/unary_op_utils.hpp"
 #include "ttnn/tensor/types.hpp"
 
@@ -12,8 +13,8 @@ using namespace tt::tt_metal;
 
 namespace ttnn::operations::binary::utils {
 
+using ttnn::operations::unary::EltwiseUnaryWithParam;
 using ttnn::operations::unary::UnaryOpType;
-using ttnn::operations::unary::UnaryWithParam;
 
 bool is_typecast(tt::tt_metal::DataType input, tt::tt_metal::DataType output) {
     using enum tt::tt_metal::DataType;
@@ -35,12 +36,46 @@ bool is_typecast(tt::tt_metal::DataType input, tt::tt_metal::DataType output) {
            (input == UINT32 && output == UINT16);
 }
 
+bool is_quant_op(BinaryOpType op) {
+    return op == BinaryOpType::QUANT || op == BinaryOpType::DEQUANT || op == BinaryOpType::REQUANT;
+}
+
+namespace {
+
+bool is_isclose_mixed_dtype_pair(DataType dtype_a, DataType dtype_b) {
+    return (dtype_a == DataType::FLOAT32 && dtype_b == DataType::BFLOAT16) ||
+           (dtype_a == DataType::BFLOAT16 && dtype_b == DataType::FLOAT32);
+}
+
+}  // namespace
+
+bool is_dtype_combination_supported(BinaryOpType op, DataType dtype_a, DataType dtype_b) {
+    if (is_quant_op(op)) {
+        return dtype_policy::is_quant_operand_pair_supported(op, dtype_a, dtype_b);
+    }
+
+    if (op == BinaryOpType::ISCLOSE) {
+        return dtype_a == dtype_b ? dtype_policy::is_supported(op, dtype_a)
+                                  : is_isclose_mixed_dtype_pair(dtype_a, dtype_b);
+    }
+
+    if (dtype_a == dtype_b) {
+        return dtype_policy::is_supported(op, dtype_a);
+    }
+
+    if (dtype_policy::is_mixed_float_pair(dtype_a, dtype_b) && dtype_policy::supports_mixed_float_inputs(op)) {
+        return dtype_policy::is_supported(op, dtype_a) && dtype_policy::is_supported(op, dtype_b);
+    }
+
+    return false;
+}
+
 std::map<std::string, std::string> get_defines(
     BinaryOpType op_type,
     const std::optional<tt::tt_metal::DataType> input_dtype,
     const std::optional<tt::tt_metal::DataType> output_dtype,
-    const std::optional<std::vector<UnaryWithParam>>& fused_activations,
-    const std::optional<unary::UnaryWithParam>& input_tensor_a_activation) {
+    const std::optional<std::vector<EltwiseUnaryWithParam>>& fused_activations,
+    const std::optional<EltwiseUnaryWithParam>& input_tensor_a_activation) {
     std::map<std::string, std::string> defines;
     std::string op_name = "sub_tiles";
     std::string op_binary_type = "EltwiseBinaryType::ELWSUB";
@@ -139,25 +174,34 @@ std::map<std::string, std::string> get_defines(
             op_binary_type = "EltwiseBinaryType::ELWADD";
             defines.merge(get_defines(UnaryOpType::LOG2, std::nullopt, "0", idst));
             break;
+        case BinaryOpType::HYPOT:
+            // Hypot: sqrt(a^2 + b^2)
+            defines.merge(get_defines(UnaryOpType::SQUARE, std::nullopt, "PRE_IN0_0", "0", input_dtype));
+            defines.merge(get_defines(UnaryOpType::SQUARE, std::nullopt, "PRE_IN1_0", "0", input_dtype));
+            op_name = "add_tiles";
+            op_binary_type = "EltwiseBinaryType::ELWADD";
+            defines.merge(get_defines(UnaryOpType::SQRT, std::nullopt, "0", idst, input_dtype));
+            break;
         default: TT_THROW("Undefined op type {}", op_type);
     }
 
     if (input_dtype.has_value() && output_dtype.has_value() && is_typecast(*input_dtype, *output_dtype)) {
-        TT_ASSERT(defines.count("SFPU_OP_CHAIN_0") == 0, "SFPU_OP_CHAIN_0 already defined");
+        TT_ASSERT(!defines.contains("SFPU_OP_CHAIN_0"), "SFPU_OP_CHAIN_0 already defined");
 
-        auto in_dataformat = (uint32_t)datatype_to_dataformat_converter(input_dtype.value());
-        auto out_dataformat = (uint32_t)datatype_to_dataformat_converter(output_dtype.value());
+        auto in_dataformat = static_cast<uint32_t>(datatype_to_dataformat_converter(input_dtype.value()));
+        auto out_dataformat = static_cast<uint32_t>(datatype_to_dataformat_converter(output_dtype.value()));
         defines.insert(
             {"SFPU_OP_CHAIN_0",
-             fmt::format("typecast_tile_init(); typecast_tile<{0}u, {1}u>(i);", in_dataformat, out_dataformat)});
+             fmt::format(
+                 "typecast_tile_init<{0}u, {1}u>(); typecast_tile<{0}u, {1}u>(i);", in_dataformat, out_dataformat)});
         defines.insert({"SFPU_OP_TYPECAST_INCLUDE", "1"});
     }
 
-    defines["ELTWISE_OP"] = op_name.c_str();
-    defines["ELTWISE_OP_TYPE"] = op_binary_type.c_str();
+    defines["ELTWISE_OP"] = op_name;
+    defines["ELTWISE_OP_TYPE"] = op_binary_type;
     if (fused_activations.has_value()) {
         if (op_type == BinaryOpType::ADD and fused_activations->size() == 1 and
-            fused_activations->at(0).op_type == UnaryOpType::RELU and not input_tensor_a_activation.has_value()) {
+            fused_activations->at(0).type() == UnaryOpType::RELU and not input_tensor_a_activation.has_value()) {
             defines["PACK_RELU"] = "1";
         } else {
             defines.merge(ttnn::operations::unary::utils::get_block_defines(*fused_activations, "0", idst));
@@ -166,7 +210,7 @@ std::map<std::string, std::string> get_defines(
 
     if (input_tensor_a_activation.has_value()) {
         defines.merge(ttnn::operations::unary::utils::get_defines(
-            input_tensor_a_activation.value().op_type, std::nullopt, "PRE_IN0_0", idst, input_dtype));
+            input_tensor_a_activation.value().type(), std::nullopt, "PRE_IN0_0", idst, input_dtype));
     }
 
     return defines;
@@ -176,8 +220,8 @@ std::map<std::string, std::string> get_defines_fp32(
     BinaryOpType op_type,
     const std::optional<tt::tt_metal::DataType> input_a_dtype,
     const std::optional<tt::tt_metal::DataType> input_b_dtype,
-    const std::optional<std::vector<UnaryWithParam>>& fused_activations,
-    const std::optional<unary::UnaryWithParam>& input_tensor_a_activation) {
+    const std::optional<std::vector<EltwiseUnaryWithParam>>& fused_activations,
+    const std::optional<EltwiseUnaryWithParam>& input_tensor_a_activation) {
     std::map<std::string, std::string> new_defines;
     std::string op_name = "sub_binary_tile";
     std::string idst1 = "i*2";    // tile index for input A in dst and final output
@@ -189,13 +233,13 @@ std::map<std::string, std::string> get_defines_fp32(
         case BinaryOpType::ADD:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
                 new_defines.insert({"ADD_INT_INIT", fmt::format("add_int_tile_init();")});
-                op_name = "add_int32_tile";
+                op_name = "add_int_tile<DataFormat::Int32>";
             } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
                 new_defines.insert({"ADD_INT_INIT", fmt::format("add_int_tile_init();")});
-                op_name = "add_uint32_tile";
+                op_name = "add_int_tile<DataFormat::UInt32>";
             } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
                 new_defines.insert({"ADD_INT_INIT", fmt::format("add_int_tile_init();")});
-                op_name = "add_uint16_tile";
+                op_name = "add_int_tile<DataFormat::UInt16>";
             } else {
                 new_defines.insert({"BINOP_INIT", fmt::format("add_binary_tile_init();")});
                 op_name = "add_binary_tile";
@@ -204,10 +248,13 @@ std::map<std::string, std::string> get_defines_fp32(
         case BinaryOpType::SUB:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
                 new_defines.insert({"SUB_INT_INIT", fmt::format("sub_int_tile_init();")});
-                op_name = "sub_int32_tile";
+                op_name = "sub_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"SUB_INT_INIT", fmt::format("sub_int_tile_init();")});
+                op_name = "sub_int_tile<DataFormat::UInt32>";
             } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
                 new_defines.insert({"SUB_INT_INIT", fmt::format("sub_int_tile_init();")});
-                op_name = "sub_uint16_tile";
+                op_name = "sub_int_tile<DataFormat::UInt16>";
             } else {
                 new_defines.insert({"BINOP_INIT", "sub_binary_tile_init();"});
                 op_name = "sub_binary_tile";
@@ -215,80 +262,131 @@ std::map<std::string, std::string> get_defines_fp32(
             break;
         case BinaryOpType::MUL:
             if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
-                new_defines.insert({"MUL_INT_INIT", fmt::format("mul_int_tile_init();")});
-                op_name = "mul_uint16_tile";
+                new_defines.insert({"MUL_INT_INIT", fmt::format("mul_int_tile_init<DataFormat::UInt16>();")});
+                op_name = "mul_int_tile<DataFormat::UInt16>";
             } else if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                new_defines.insert({"MUL_INT32_INIT", fmt::format("mul_int32_tile_init();")});
-                op_name = "mul_int32_tile";
+                new_defines.insert({"MUL_INT_INIT", fmt::format("mul_int_tile_init<DataFormat::Int32>();")});
+                op_name = "mul_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"MUL_INT_INIT", fmt::format("mul_int_tile_init<DataFormat::UInt32>();")});
+                op_name = "mul_int_tile<DataFormat::UInt32>";
             } else {
                 new_defines.insert({"BINOP_INIT", fmt::format("mul_binary_tile_init();")});
                 op_name = "mul_binary_tile";
             }
             break;
         case BinaryOpType::RSUB:
-            new_defines.insert({"BINOP_INIT", fmt::format("rsub_binary_tile_init();")});
-            op_name = "rsub_binary_tile";
+            if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
+                new_defines.insert({"BINOP_INIT", fmt::format("rsub_int_tile_init();")});
+                op_name = "rsub_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"BINOP_INIT", fmt::format("rsub_int_tile_init();")});
+                op_name = "rsub_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                new_defines.insert({"BINOP_INIT", fmt::format("rsub_int_tile_init();")});
+                op_name = "rsub_int_tile<DataFormat::UInt16>";
+            } else {
+                new_defines.insert({"BINOP_INIT", fmt::format("rsub_binary_tile_init();")});
+                op_name = "rsub_binary_tile";
+            }
             break;
         case BinaryOpType::POWER:
             new_defines.insert({"BINOP_INIT", fmt::format("power_binary_tile_init();")});
             op_name = "power_binary_tile";
             break;
         case BinaryOpType::DIV:
-            new_defines.insert({"BINOP_INIT", fmt::format("div_binary_tile_init();")});
-            op_name = "div_binary_tile";
+            if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
+                new_defines.insert({"BINOP_INIT", fmt::format("div_int32_tile_init();")});
+                op_name = "div_int32_tile";
+            } else {
+                new_defines.insert({"BINOP_INIT", fmt::format("div_binary_tile_init();")});
+                op_name = "div_binary_tile";
+            }
             break;
         case BinaryOpType::BITWISE_AND:
             if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
                 new_defines.insert({"BITWISE_UINT16_INIT", fmt::format("binary_bitwise_tile_init();")});
-                op_name = "bitwise_and_uint16_binary_tile";
+                op_name = "bitwise_and_binary_tile<DataFormat::UInt16>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"BITWISE_UINT32_INIT", fmt::format("binary_bitwise_tile_init();")});
+                op_name = "bitwise_and_binary_tile<DataFormat::UInt32>";
             } else {
                 new_defines.insert({"BITWISE_INIT", fmt::format("binary_bitwise_tile_init();")});
-                op_name = "bitwise_and_binary_tile";
+                op_name = "bitwise_and_binary_tile<DataFormat::Int32>";
             }
             break;
         case BinaryOpType::BITWISE_OR:
             if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
                 new_defines.insert({"BITWISE_UINT16_INIT", fmt::format("binary_bitwise_tile_init();")});
-                op_name = "bitwise_or_uint16_binary_tile";
+                op_name = "bitwise_or_binary_tile<DataFormat::UInt16>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"BITWISE_UINT32_INIT", fmt::format("binary_bitwise_tile_init();")});
+                op_name = "bitwise_or_binary_tile<DataFormat::UInt32>";
             } else {
                 new_defines.insert({"BITWISE_INIT", fmt::format("binary_bitwise_tile_init();")});
-                op_name = "bitwise_or_binary_tile";
+                op_name = "bitwise_or_binary_tile<DataFormat::Int32>";
             }
             break;
         case BinaryOpType::BITWISE_XOR:
             if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
                 new_defines.insert({"BITWISE_UINT16_INIT", fmt::format("binary_bitwise_tile_init();")});
-                op_name = "bitwise_xor_uint16_binary_tile";
+                op_name = "bitwise_xor_binary_tile<DataFormat::UInt16>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"BITWISE_UINT32_INIT", fmt::format("binary_bitwise_tile_init();")});
+                op_name = "bitwise_xor_binary_tile<DataFormat::UInt32>";
             } else {
                 new_defines.insert({"BITWISE_INIT", fmt::format("binary_bitwise_tile_init();")});
-                op_name = "bitwise_xor_binary_tile";
+                op_name = "bitwise_xor_binary_tile<DataFormat::Int32>";
             }
             break;
-        case BinaryOpType::LEFT_SHIFT:
+        case BinaryOpType::LEFT_SHIFT: {
+            const char* data_format =
+                (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32)   ? "UInt32"
+                : (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) ? "UInt16"
+                                                                                           : "Int32";
             new_defines.insert({"SHIFT_INIT", fmt::format("binary_shift_tile_init();")});
-            op_name = "binary_left_shift_tile";
+            op_name = fmt::format("binary_left_shift_tile<DataFormat::{}>", data_format);
             break;
-        case BinaryOpType::RIGHT_SHIFT:
+        }
+        case BinaryOpType::RIGHT_SHIFT: {
+            const char* data_format =
+                (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32)   ? "UInt32"
+                : (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) ? "UInt16"
+                                                                                           : "Int32";
             new_defines.insert({"SHIFT_INIT", fmt::format("binary_shift_tile_init();")});
-            op_name = "binary_right_shift_tile";
+            op_name = fmt::format("binary_right_shift_tile<DataFormat::{}>", data_format);
             break;
-        case BinaryOpType::LOGICAL_RIGHT_SHIFT:
+        }
+        case BinaryOpType::LOGICAL_RIGHT_SHIFT: {
+            const char* data_format =
+                (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32)   ? "UInt32"
+                : (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) ? "UInt16"
+                                                                                           : "Int32";
             new_defines.insert({"SHIFT_INIT", fmt::format("binary_shift_tile_init();")});
-            op_name = "binary_logical_right_shift_tile";
+            op_name = fmt::format("binary_logical_right_shift_tile<DataFormat::{}>", data_format);
             break;
+        }
         case BinaryOpType::MAXIMUM:
-            new_defines.insert({"BINOP_INIT", fmt::format("binary_max_tile_init();")});
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
+                new_defines.insert({"BINOP_INIT", fmt::format("binary_max_int32_tile_init();")});
                 op_name = "binary_max_int32_tile";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"BINOP_INIT", fmt::format("binary_max_uint32_tile_init();")});
+                op_name = "binary_max_uint32_tile";
             } else {
+                new_defines.insert({"BINOP_INIT", fmt::format("binary_max_tile_init();")});
                 op_name = "binary_max_tile";
             }
             break;
         case BinaryOpType::MINIMUM:
-            new_defines.insert({"BINOP_INIT", fmt::format("binary_min_tile_init();")});
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
+                new_defines.insert({"BINOP_INIT", fmt::format("binary_min_int32_tile_init();")});
                 op_name = "binary_min_int32_tile";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"BINOP_INIT", fmt::format("binary_min_uint32_tile_init();")});
+                op_name = "binary_min_uint32_tile";
             } else {
+                new_defines.insert({"BINOP_INIT", fmt::format("binary_min_tile_init();")});
                 op_name = "binary_min_tile";
             }
             break;
@@ -322,11 +420,15 @@ std::map<std::string, std::string> get_defines_fp32(
             break;
         case BinaryOpType::SQUARED_DIFFERENCE:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                op_name = "sub_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                op_name = "sub_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                op_name = "sub_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
             }
-            new_defines.merge(get_defines(UnaryOpType::SQUARE, std::nullopt, "0", idst1));
+            new_defines.merge(get_defines(UnaryOpType::SQUARE, std::nullopt, "0", idst1, input_a_dtype));
             break;
         case BinaryOpType::BIAS_GELU:
             new_defines.insert({"BINOP_INIT", fmt::format("add_binary_tile_init();")});
@@ -337,19 +439,29 @@ std::map<std::string, std::string> get_defines_fp32(
             new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "PRE_IN0_0", "0", input_a_dtype));
             new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "PRE_IN1_0", "0", input_b_dtype));
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                new_defines.insert({"ADD_INT32_INIT", fmt::format("add_int32_tile_init();")});
-                op_name = "add_int32_tile";
+                new_defines.insert({"ADD_INT_INIT", fmt::format("add_int_tile_init();")});
+                op_name = "add_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"ADD_INT_INIT", fmt::format("add_int_tile_init();")});
+                op_name = "add_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                new_defines.insert({"ADD_INT_INIT", fmt::format("add_int_tile_init();")});
+                op_name = "add_int_tile<DataFormat::UInt16>";
             } else {
                 new_defines.insert({"BINOP_INIT", fmt::format("add_binary_tile_init();")});
                 op_name = "add_binary_tile";
             }
-            new_defines.merge(get_defines(UnaryOpType::GTZ, std::nullopt, "0", idst1, input_a_dtype));
+            new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "0", idst1, input_a_dtype));
             break;
         case BinaryOpType::LOGICAL_XOR:
             new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "PRE_IN0_0", "0", input_a_dtype));
             new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "PRE_IN1_0", "0", input_b_dtype));
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                op_name = "sub_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                op_name = "sub_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                op_name = "sub_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
             }
@@ -359,8 +471,16 @@ std::map<std::string, std::string> get_defines_fp32(
             new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "PRE_IN0_0", "0", input_a_dtype));
             new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "PRE_IN1_0", "0", input_b_dtype));
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "mul_int32_tile";
+                new_defines.insert({"MUL_INT_INIT", fmt::format("mul_int_tile_init<DataFormat::Int32>();")});
+                op_name = "mul_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"MUL_INT_INIT", fmt::format("mul_int_tile_init<DataFormat::UInt32>();")});
+                op_name = "mul_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                new_defines.insert({"MUL_INT_INIT", fmt::format("mul_int_tile_init<DataFormat::UInt16>();")});
+                op_name = "mul_int_tile<DataFormat::UInt16>";
             } else {
+                new_defines.insert({"BINOP_INIT", fmt::format("mul_binary_tile_init();")});
                 op_name = "mul_binary_tile";
             }
             new_defines.merge(get_defines(UnaryOpType::NEZ, std::nullopt, "0", idst1, input_a_dtype));
@@ -368,39 +488,71 @@ std::map<std::string, std::string> get_defines_fp32(
         // applied on A-B
         case BinaryOpType::GT:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                new_defines.insert({"GT_INT32_INIT", fmt::format("gt_int_tile_init<DataFormat::Int32>();")});
+                op_name = "gt_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"GT_UINT32_INIT", fmt::format("gt_int_tile_init<DataFormat::UInt32>();")});
+                op_name = "gt_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                new_defines.insert({"GT_UINT16_INIT", fmt::format("gt_int_tile_init<DataFormat::UInt16>();")});
+                op_name = "gt_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
+                new_defines.merge(get_defines(UnaryOpType::GTZ, std::nullopt, "0", idst1, input_a_dtype));
             }
-            new_defines.merge(get_defines(UnaryOpType::GTZ, std::nullopt, "0", idst1, input_a_dtype));
             break;
         case BinaryOpType::LT:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                new_defines.insert({"LT_INT32_INIT", fmt::format("lt_int_tile_init<DataFormat::Int32>();")});
+                op_name = "lt_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"LT_UINT32_INIT", fmt::format("lt_int_tile_init<DataFormat::UInt32>();")});
+                op_name = "lt_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                new_defines.insert({"LT_UINT16_INIT", fmt::format("lt_int_tile_init<DataFormat::UInt16>();")});
+                op_name = "lt_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
+                new_defines.merge(get_defines(UnaryOpType::LTZ, std::nullopt, "0", idst1, input_a_dtype));
             }
-            new_defines.merge(get_defines(UnaryOpType::LTZ, std::nullopt, "0", idst1, input_a_dtype));
             break;
         case BinaryOpType::GE:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                new_defines.insert({"GE_INT32_INIT", fmt::format("ge_int_tile_init<DataFormat::Int32>();")});
+                op_name = "ge_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"GE_UINT32_INIT", fmt::format("ge_int_tile_init<DataFormat::UInt32>();")});
+                op_name = "ge_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                new_defines.insert({"GE_UINT16_INIT", fmt::format("ge_int_tile_init<DataFormat::UInt16>();")});
+                op_name = "ge_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
+                new_defines.merge(get_defines(UnaryOpType::GEZ, std::nullopt, "0", idst1, input_a_dtype));
             }
-            new_defines.merge(get_defines(UnaryOpType::GEZ, std::nullopt, "0", idst1, input_a_dtype));
             break;
         case BinaryOpType::LE:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                new_defines.insert({"LE_INT32_INIT", fmt::format("le_int_tile_init<DataFormat::Int32>();")});
+                op_name = "le_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                new_defines.insert({"LE_UINT32_INIT", fmt::format("le_int_tile_init<DataFormat::UInt32>();")});
+                op_name = "le_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                new_defines.insert({"LE_UINT16_INIT", fmt::format("le_int_tile_init<DataFormat::UInt16>();")});
+                op_name = "le_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
+                new_defines.merge(get_defines(UnaryOpType::LEZ, std::nullopt, "0", idst1, input_a_dtype));
             }
-            new_defines.merge(get_defines(UnaryOpType::LEZ, std::nullopt, "0", idst1, input_a_dtype));
             break;
         case BinaryOpType::EQ:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                op_name = "sub_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                op_name = "sub_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                op_name = "sub_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
             }
@@ -408,7 +560,11 @@ std::map<std::string, std::string> get_defines_fp32(
             break;
         case BinaryOpType::NE:
             if (input_a_dtype == DataType::INT32 && input_b_dtype == DataType::INT32) {
-                op_name = "sub_int32_tile";
+                op_name = "sub_int_tile<DataFormat::Int32>";
+            } else if (input_a_dtype == DataType::UINT32 && input_b_dtype == DataType::UINT32) {
+                op_name = "sub_int_tile<DataFormat::UInt32>";
+            } else if (input_a_dtype == DataType::UINT16 && input_b_dtype == DataType::UINT16) {
+                op_name = "sub_int_tile<DataFormat::UInt16>";
             } else {
                 op_name = "sub_binary_tile";
             }
@@ -418,16 +574,36 @@ std::map<std::string, std::string> get_defines_fp32(
             new_defines.insert({"BINOP_INIT", fmt::format("xlogy_binary_tile_init();")});
             op_name = "xlogy_binary_tile";
             break;
+        case BinaryOpType::FMOD:
+            new_defines.insert({"BINOP_INIT", fmt::format("fmod_binary_tile_init();")});
+            op_name = "fmod_binary_tile";
+            break;
+        case BinaryOpType::REMAINDER:
+            new_defines.insert({"BINOP_INIT", fmt::format("remainder_binary_tile_init();")});
+            op_name = "remainder_binary_tile";
+            break;
+        case BinaryOpType::HYPOT:
+            // Hypot: sqrt(a^2 + b^2)
+            new_defines.merge(get_defines(UnaryOpType::SQUARE, std::nullopt, "PRE_IN0_0", idst, input_a_dtype));
+            new_defines.merge(get_defines(UnaryOpType::SQUARE, std::nullopt, "PRE_IN1_0", idst, input_b_dtype));
+            new_defines.insert({"BINOP_INIT", fmt::format("add_binary_tile_init();")});
+            op_name = "add_binary_tile";
+            new_defines.merge(get_defines(UnaryOpType::SQRT, std::nullopt, "0", idst1, input_a_dtype));
+            break;
+        case BinaryOpType::ATAN2:
+            new_defines.insert({"BINOP_INIT", fmt::format("atan2_binary_tile_init();")});
+            op_name = "atan2_binary_tile";
+            break;
         default:
             log_debug(tt::LogOp, "Undefined op type {}", op_type);
             TT_FATAL(false, "Undefined op type for binary sfpu operation {}", op_type);
     }
 
-    new_defines.insert({"BINARY_SFPU_OP", fmt::format("{}({}, {});", op_name, idst1, idst2)});
+    new_defines.insert({"BINARY_SFPU_OP", fmt::format("{}({}, {}, {});", op_name, idst1, idst2, idst1)});
 
     if (fused_activations.has_value()) {
         if (op_type == BinaryOpType::ADD and fused_activations.value().size() == 1 and
-            fused_activations.value().at(0).op_type == UnaryOpType::RELU) {
+            fused_activations.value().at(0).type() == UnaryOpType::RELU) {
             new_defines["PACK_RELU"] = "1";
         } else {
             new_defines.merge(ttnn::operations::unary::utils::get_block_defines(fused_activations.value(), "0", idst1));
@@ -436,7 +612,7 @@ std::map<std::string, std::string> get_defines_fp32(
 
     if (input_tensor_a_activation.has_value()) {
         new_defines.merge(ttnn::operations::unary::utils::get_defines(
-            input_tensor_a_activation.value().op_type, std::nullopt, "PRE_IN0_0", idst));
+            input_tensor_a_activation.value().type(), std::nullopt, "PRE_IN0_0", idst));
     }
 
     return new_defines;

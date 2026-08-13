@@ -1,8 +1,11 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ttnn/deprecated/tt_dnn/kernels/dataflow/moreh_common.hpp"
+#include "ttnn/kernel/dataflow/moreh_common.hpp"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
 
 static constexpr int32_t MAX_NUM_DIMENSIONS = 8;
 
@@ -30,19 +33,18 @@ inline void unravel_output_tidx(uint32_t output_tidx, uint32_t* output_idxes, ui
 
 void kernel_main() {
     // compile-time args
-    constexpr bool input_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr bool other_is_dram = get_compile_time_arg_val(1) == 1;
-    constexpr uint32_t Kt = get_compile_time_arg_val(2);
-    bool transpose_input = (get_compile_time_arg_val(3) == 1);
-    bool transpose_other = (get_compile_time_arg_val(4) == 1);
-    uint32_t input_mask_h = get_compile_time_arg_val(5);
-    uint32_t input_mask_w = get_compile_time_arg_val(6);
-    uint32_t other_mask_h = get_compile_time_arg_val(7);
-    uint32_t other_mask_w = get_compile_time_arg_val(8);
+    constexpr uint32_t Kt = get_compile_time_arg_val(0);
+    bool transpose_input = (get_compile_time_arg_val(1) == 1);
+    bool transpose_other = (get_compile_time_arg_val(2) == 1);
+    uint32_t input_mask_h = get_compile_time_arg_val(3);
+    uint32_t input_mask_w = get_compile_time_arg_val(4);
+    uint32_t other_mask_h = get_compile_time_arg_val(5);
+    uint32_t other_mask_w = get_compile_time_arg_val(6);
+    constexpr auto input_args = TensorAccessorArgs<7>();
+    constexpr auto other_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
 #ifdef FUSE_BIAS
-    constexpr bool bias_is_dram = (get_compile_time_arg_val(9) == 1);
-    bool is_scalar_bias = (get_compile_time_arg_val(10) == 1);
-    bool scalar_bias_loaded = false;
+    constexpr bool is_scalar_bias = (get_compile_time_arg_val(other_args.next_compile_time_args_offset()) == 1);
+    constexpr auto bias_args = TensorAccessorArgs<other_args.next_compile_time_args_offset() + 1>();
 #endif
 
     // runtime args
@@ -85,22 +87,11 @@ void kernel_main() {
     constexpr uint32_t cb_id_in4 = 4;
     constexpr uint32_t onetile = 1;
 
-    const uint32_t in0_tile_bytes = get_tile_size(cb_id_in0);
-    const DataFormat in0_data_format = get_dataformat(cb_id_in0);
-    const uint32_t in1_tile_bytes = get_tile_size(cb_id_in1);
-    const DataFormat in1_data_format = get_dataformat(cb_id_in1);
-
-    const InterleavedAddrGenFast<input_is_dram> s0 = {
-        .bank_base_address = input_addr, .page_size = in0_tile_bytes, .data_format = in0_data_format};
-
-    const InterleavedAddrGenFast<other_is_dram> s1 = {
-        .bank_base_address = other_addr, .page_size = in1_tile_bytes, .data_format = in1_data_format};
+    const auto s0 = TensorAccessor(input_args, input_addr);
+    const auto s1 = TensorAccessor(other_args, other_addr);
 
 #ifdef FUSE_BIAS
-    const uint32_t in4_tile_bytes = get_tile_size(cb_id_in4);
-    const DataFormat in4_data_format = get_dataformat(cb_id_in4);
-    const InterleavedAddrGenFast<bias_is_dram> s_bias = {
-        .bank_base_address = bias_addr, .page_size = in4_tile_bytes, .data_format = in4_data_format};
+    const auto s_bias = TensorAccessor(bias_args, bias_addr);
 #endif
 
     // mask
@@ -108,18 +99,39 @@ void kernel_main() {
     bool need_input_mask_w = (input_mask_w != 32);
 
     if (need_input_mask_h || need_input_mask_w) {
-        generate_mask_tiles(cb_id_in2, input_mask_h, input_mask_w);
+        DataflowBuffer dfb_in2(cb_id_in2);
+        generate_mask_tiles(dfb_in2, input_mask_h, input_mask_w);
     }
 
     bool need_other_mask_h = (other_mask_h != 32);
     bool need_other_mask_w = (other_mask_w != 32);
     if (need_other_mask_h || need_other_mask_w) {
-        generate_mask_tiles(cb_id_in3, other_mask_h, other_mask_w);
+        DataflowBuffer dfb_in3(cb_id_in3);
+        generate_mask_tiles(dfb_in3, other_mask_h, other_mask_w);
     }
 
     uint32_t output_tidx = output_tile_start_idx;
     uint32_t input_step_count = (transpose_input) ? (input_stride[1]) : (input_stride[0]);
     uint32_t other_step_count = (transpose_other) ? (other_stride[0]) : (other_stride[1]);
+
+    Noc noc;
+    DataflowBuffer dfb_in0(cb_id_in0);
+    DataflowBuffer dfb_in1(cb_id_in1);
+    const auto in0_tile_bytes = get_tile_size(cb_id_in0);
+    const auto in1_tile_bytes = get_tile_size(cb_id_in1);
+#ifdef FUSE_BIAS
+    DataflowBuffer dfb_in4(cb_id_in4);
+    const auto in4_tile_bytes = get_tile_size(cb_id_in4);
+#endif
+
+#ifdef FUSE_BIAS
+    if (is_scalar_bias && num_output_tiles > 0) {
+        dfb_in4.reserve_back(onetile);
+        noc.async_read(s_bias, dfb_in4, in4_tile_bytes, {.page_id = 0}, {.offset_bytes = 0});
+        noc.async_read_barrier();
+        dfb_in4.push_back(onetile);
+    }
+#endif
 
     for (uint32_t n = 0; n < num_output_tiles; n++) {
         uint32_t output_idxes[MAX_NUM_DIMENSIONS];
@@ -128,40 +140,26 @@ void kernel_main() {
         uint32_t other_tidx = get_tidx(output_idxes, other_stride, other_not_bcast, transpose_other, false);
 
         for (uint32_t kt = 0; kt < Kt; kt++) {
-            // read input, other tile
-            cb_reserve_back(cb_id_in0, onetile);
-            cb_reserve_back(cb_id_in1, onetile);
+            dfb_in0.reserve_back(onetile);
+            dfb_in1.reserve_back(onetile);
 
-            uint32_t l1_write_addr_in0 = get_write_ptr(cb_id_in0);
-            noc_async_read_tile(input_tidx, s0, l1_write_addr_in0);
+            noc.async_read(s0, dfb_in0, in0_tile_bytes, {.page_id = input_tidx}, {.offset_bytes = 0});
+            noc.async_read(s1, dfb_in1, in1_tile_bytes, {.page_id = other_tidx}, {.offset_bytes = 0});
+            noc.async_read_barrier();
 
-            uint32_t l1_write_addr_in1 = get_write_ptr(cb_id_in1);
-            noc_async_read_tile(other_tidx, s1, l1_write_addr_in1);
-            noc_async_read_barrier();
-
-            cb_push_back(cb_id_in0, onetile);
-            cb_push_back(cb_id_in1, onetile);
+            dfb_in0.push_back(onetile);
+            dfb_in1.push_back(onetile);
 
             input_tidx += input_step_count;
             other_tidx += other_step_count;
         }
 #ifdef FUSE_BIAS
-        if (!is_scalar_bias) {
+        if constexpr (!is_scalar_bias) {
             uint32_t bias_tidx = output_idxes[0];
-            cb_reserve_back(cb_id_in4, onetile);
-            uint32_t l1_write_addr_in4 = get_write_ptr(cb_id_in4);
-            noc_async_read_tile(bias_tidx, s_bias, l1_write_addr_in4);
-            noc_async_read_barrier();
-            cb_push_back(cb_id_in4, onetile);
-        } else {
-            if (!scalar_bias_loaded) {
-                cb_reserve_back(cb_id_in4, onetile);
-                uint32_t l1_write_addr_in4 = get_write_ptr(cb_id_in4);
-                noc_async_read_tile(0, s_bias, l1_write_addr_in4);
-                noc_async_read_barrier();
-                cb_push_back(cb_id_in4, onetile);
-                scalar_bias_loaded = true;
-            }
+            dfb_in4.reserve_back(onetile);
+            noc.async_read(s_bias, dfb_in4, in4_tile_bytes, {.page_id = bias_tidx}, {.offset_bytes = 0});
+            noc.async_read_barrier();
+            dfb_in4.push_back(onetile);
         }
 #endif
 

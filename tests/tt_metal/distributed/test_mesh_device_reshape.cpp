@@ -1,10 +1,9 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
-#include <stdlib.h>
-#include <tt_stl/indestructible.hpp>
+#include <cstdlib>
 #include <algorithm>
 #include <cstddef>
 #include <memory>
@@ -16,17 +15,17 @@
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/dispatch_core_common.hpp>
 #include "gmock/gmock.h"
-#include <tt-metalium/host_api.hpp>
 #include "hostdevcommon/common_values.hpp"
 #include <tt-metalium/mesh_config.hpp>
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/system_mesh.hpp>
 #include <tt-metalium/maybe_remote.hpp>
+#include "impl/context/metal_context.hpp"
 #include "tests/tt_metal/tt_metal/common/multi_device_fixture.hpp"
 #include "tests/tt_metal/test_utils/env_vars.hpp"
 #include <tt-metalium/tt_backend_api_types.hpp>
-#include "umd/device/types/arch.h"
+#include <umd/device/types/arch.hpp>
 
 namespace tt::tt_metal::distributed {
 namespace {
@@ -34,16 +33,8 @@ namespace {
 using ::testing::ElementsAre;
 using ::testing::SizeIs;
 
-std::vector<chip_id_t> get_physical_device_ids(const MeshDevice& mesh) {
-    std::vector<chip_id_t> device_ids;
-    for (auto* device : mesh.get_devices()) {
-        device_ids.push_back(device->id());
-    }
-    return device_ids;
-}
-
 std::vector<MeshShape> get_mesh_shapes() {
-    static tt::stl::Indestructible<std::vector<MeshShape>> kMeshShapes(std::vector<MeshShape>{
+    static ttsl::Indestructible<std::vector<MeshShape>> kMeshShapes(std::vector<MeshShape>{
         MeshShape{1, 1}, MeshShape{1, 2}, MeshShape{1, 3}, MeshShape{1, 4}, MeshShape{1, 5}, MeshShape{1, 6},
         MeshShape{1, 7}, MeshShape{1, 8}, MeshShape{2, 1}, MeshShape{2, 2}, MeshShape{2, 3}, MeshShape{2, 4},
         MeshShape{3, 1}, MeshShape{3, 2}, MeshShape{4, 1}, MeshShape{4, 2}, MeshShape{8, 1}, MeshShape{7, 1},
@@ -64,7 +55,7 @@ TEST_P(MeshConfigurationTest, MeshConfigurations) { EXPECT_EQ(mesh_device_->shap
 TEST_P(MeshConfigurationTest, GetMappedDevices) {
     const auto& shape = GetParam();
 
-    auto& system_mesh = SystemMesh::instance();
+    auto& system_mesh = MetalContext::instance().get_system_mesh();
     EXPECT_THAT(system_mesh.get_mapped_devices(shape).device_ids, SizeIs(shape.mesh_size()));
     EXPECT_THAT(system_mesh.get_mapped_devices(shape).fabric_node_ids, SizeIs(shape.mesh_size()));
 }
@@ -126,14 +117,13 @@ public:
 };
 
 TEST_F(MeshDevice1x8ReshapeTest, InvalidRequestedShape) {
-    auto& system_mesh = tt::tt_metal::distributed::SystemMesh::instance();
+    auto& system_mesh = tt::tt_metal::MetalContext::instance().get_system_mesh();
 
     // Shape too big.
     EXPECT_ANY_THROW(system_mesh.get_mapped_devices(MeshShape(9)));
     EXPECT_ANY_THROW(system_mesh.get_mapped_devices(MeshShape(2, 5)));
 
     // Invalid offset.
-    EXPECT_ANY_THROW(system_mesh.get_mapped_devices(MeshShape(1, 8), /*offset=*/MeshCoordinate(0, 1)));
     EXPECT_ANY_THROW(system_mesh.get_mapped_devices(MeshShape(2, 3), /*offset=*/MeshCoordinate(1, 1)));
 
     // Offset dimensionality mismatch.
@@ -159,7 +149,7 @@ TEST_F(MeshDevice1x8ReshapeTest, From1x8To2x4ThenBackTo1x8) {
     mesh_device_->reshape(MeshShape(2, 4));
 
     EXPECT_EQ(mesh_device_->shape(), MeshShape(2, 4));
-    std::vector<chip_id_t> expected_physical_device_id_order = {
+    std::vector<ChipId> expected_physical_device_id_order = {
         original_order[0],
         original_order[1],
         original_order[2],
@@ -186,19 +176,6 @@ TEST_F(MeshDevice1x8ReshapeTest, InvalidTotalDeviceCount) {
     EXPECT_EQ(mesh_device_->shape(), MeshShape(1, 8));
 }
 
-class MeshDevice1x4ReshapeTest : public MeshDeviceFixtureBase {
-public:
-    MeshDevice1x4ReshapeTest() :
-        MeshDeviceFixtureBase(Config{
-            .mesh_shape = MeshShape{1, 4},
-        }) {}
-};
-
-TEST_F(MeshDevice1x4ReshapeTest, From1x4To2x2Invalid) {
-    // This is an invalid reshape because the 1x4 mesh does not fully cover the 2x2 mesh
-    EXPECT_THROW(mesh_device_->reshape(MeshShape(2, 2)), std::runtime_error);
-}
-
 class MeshDevice2x2ReshapeTest : public MeshDeviceFixtureBase {
 public:
     MeshDevice2x2ReshapeTest() :
@@ -210,7 +187,7 @@ public:
 TEST_F(MeshDevice2x2ReshapeTest, From1x4To2x2Valid) {
     // Fetch the device ids for a physically connected 2x2 mesh.
     EXPECT_EQ(mesh_device_->shape(), MeshShape(2, 2));
-    std::vector<chip_id_t> physical_device_ids = mesh_device_->get_device_ids();
+    std::vector<ChipId> physical_device_ids = mesh_device_->get_device_ids();
 
     // Supply the physical device ids to the mesh constructor that we know we know is 2x2 physically connected.
     // We will create a 1x4 mesh and then reshape it to 2x2.

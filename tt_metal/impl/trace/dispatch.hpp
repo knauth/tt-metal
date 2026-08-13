@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -16,14 +16,14 @@
 #include "sub_device_types.hpp"
 #include "trace_buffer.hpp"
 
-namespace tt {
-namespace tt_metal {
-class IDevice;
+namespace tt::tt_metal {
 class LaunchMessageRingBufferState;
 class SystemMemoryManager;
 class WorkerConfigBufferMgr;
-}  // namespace tt_metal
-}  // namespace tt
+namespace distributed {
+class MeshDevice;
+}
+}  // namespace tt::tt_metal
 
 namespace tt::tt_metal::trace_dispatch {
 
@@ -69,7 +69,7 @@ void load_host_dispatch_state(
     DispatchArray<WorkerConfigBufferMgr>& config_buffer_mgr_reset);
 
 void issue_trace_commands(
-    IDevice* device,
+    distributed::MeshDevice* mesh_device,
     SystemMemoryManager& sysmem_manager,
     const TraceDispatchMetadata& dispatch_md,
     uint8_t cq_id,

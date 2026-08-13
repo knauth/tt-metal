@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,7 +9,9 @@ import transformers
 import pytest
 
 from tests.ttnn.utils_for_testing import assert_with_pcc
+from tests.tests_common.skip_reasons import LEGACY_CCL_SKIP
 from ttnn.model_preprocessing import preprocess_model_parameters
+
 
 CLUSTER_AXIS_X = 1
 
@@ -25,14 +27,11 @@ class TtFalconMLP:
         ff1_linear: ttnn.Tensor = ttnn.linear(x, self.dense_h_to_4h_weights)
         gelu = ttnn.gelu(ff1_linear)
 
-        # Effectively invokes CCL Line All Gather for every row of the mesh
+        # Effectively invokes CCL Line All Gather for every row of the mesh.
         gelu = ttnn.all_gather(
             gelu,
             dim=-1,
-            num_links=1,
             cluster_axis=CLUSTER_AXIS_X,
-            mesh_device=self.mesh_device,
-            topology=ttnn.Topology.Linear,
         )
 
         ff2_linear: ttnn.Tensor = ttnn.linear(gelu, self.dense_4h_to_h_weights)
@@ -40,13 +39,12 @@ class TtFalconMLP:
         return ff2_linear
 
 
-def test_tensor_parallel_falcon_mlp():
+@pytest.mark.skip(reason=LEGACY_CCL_SKIP)
+@pytest.mark.parametrize("device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_1D}], indirect=True)
+@pytest.mark.parametrize("mesh_device", [(2, 4)], indirect=True)
+def test_tensor_parallel_falcon_mlp(mesh_device):
     if ttnn.get_num_devices() < 8:
         pytest.skip()
-
-    mesh_device = ttnn.open_mesh_device(
-        ttnn.MeshShape(2, 4),
-    )
 
     # Set PyTorch seed for reproducibility
     torch.manual_seed(0)

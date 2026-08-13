@@ -1,71 +1,86 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ttnn/deprecated/tt_dnn/kernels/dataflow/moreh_common.hpp"
+#include <cstdint>
+#include "ttnn/kernel/dataflow/moreh_common.hpp"
+#include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
+#include "experimental/kernel_args.h"
 
 void kernel_main() {
-    uint32_t src_addr = get_arg_val<uint32_t>(0);
-    uint32_t N = get_arg_val<uint32_t>(1);
-    uint32_t tile_offset = get_arg_val<uint32_t>(2);
-    uint32_t Ht = get_arg_val<uint32_t>(3);
-    uint32_t Wt = get_arg_val<uint32_t>(4);
-    uint32_t scaler = get_arg_val<uint32_t>(5);
-    uint32_t mask_h = get_arg_val<uint32_t>(6);
+    // Runtime args
+    const std::uint32_t N = get_arg(args::num_rows);
+    const std::uint32_t tile_offset = get_arg(args::tile_offset);
+    const std::uint32_t Ht = get_arg(args::Ht);
+    const std::uint32_t Wt = get_arg(args::Wt);
+    const std::uint32_t mask_h = get_arg(args::mask_h);
 
-    constexpr auto cb_in = tt::CBIndex::c_0;
-    constexpr auto cb_mask = tt::CBIndex::c_1;
-    constexpr auto cb_scaler = tt::CBIndex::c_2;
+    // Constants
+    constexpr auto dfb_in = dfb::in;
+    constexpr auto dfb_mask = dfb::mask;
+    constexpr auto dfb_max_scaler = dfb::max_scaler;
+    constexpr auto dfb_sum_scaler = dfb::sum_scaler;
 
-    uint32_t l1_write_addr_in;
+    // Ublocks size defined in tiles
+    constexpr std::uint32_t onetile = 1;
 
-    // ublocks size defined in tiles
-    constexpr uint32_t onetile = 1;
-    uint32_t src_in_tile_bytes = get_tile_size(cb_in);
+    // Input tensor
+    constexpr bool is_fp32 = get_arg(args::is_fp32) == 1;
+    const auto src_in = TensorAccessor(tensor::src);
 
-    constexpr auto in_args = TensorAccessorArgs<0>();
-    const auto src_in = TensorAccessor(in_args, src_addr, src_in_tile_bytes);
+    // Generate scaler tiles: MAX needs row-0 fill (reduce LLK), SUM needs col-0 fill (matmul)
+    dataflow_kernel_lib::
+        calculate_and_prepare_reduce_scaler<dfb_max_scaler, ckernel::PoolType::MAX, ckernel::ReduceDim::REDUCE_COL>();
+    dataflow_kernel_lib::
+        calculate_and_prepare_reduce_scaler<dfb_sum_scaler, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_COL>();
 
-    // TODO(AP): cleanup, probably with named args/param pack/reflection.
-    generate_bcast_scaler(cb_scaler, scaler);
-    generate_mask_h(cb_mask, mask_h);
+    // Generate mask tile
+    DataflowBuffer dfb_mask_obj(dfb_mask);
+    if (is_fp32) {
+        generate_mask_h<std::uint32_t>(dfb_mask_obj, mask_h);
+    } else {
+        generate_mask_h<std::uint16_t>(dfb_mask_obj, mask_h);
+    }
 
-    // read ublocks from src0 to CB0, then push ublocks to compute (unpacker)
-    uint32_t curr_tile = tile_offset;
-    for (uint32_t i = 0; i < N; i += onetile) {
-        uint32_t w_idx = curr_tile % Wt;
-        uint32_t nc_idx = curr_tile / Wt;
-        uint32_t tile_idx = nc_idx * Ht * Wt + w_idx;
-        for (uint32_t h = 0; h < Ht; h++) {
-            cb_reserve_back(cb_in, onetile);
-            l1_write_addr_in = get_write_ptr(cb_in);
-            noc_async_read_tile(tile_idx, src_in, l1_write_addr_in);
-            noc_async_read_barrier();
-            cb_push_back(cb_in, onetile);
+    Noc noc;
+    DataflowBuffer dfb_in_obj(dfb_in);
+    const auto in_tile_bytes = dfb_in_obj.get_entry_size();
+
+    std::uint32_t curr_tile = tile_offset;
+    for (std::uint32_t i = 0; i < N; i += onetile) {
+        std::uint32_t w_idx = curr_tile % Wt;
+        std::uint32_t nc_idx = curr_tile / Wt;
+        std::uint32_t tile_idx = nc_idx * Ht * Wt + w_idx;
+        for (std::uint32_t h = 0; h < Ht; h++) {
+            dfb_in_obj.reserve_back(onetile);
+            noc.async_read(src_in, dfb_in_obj, in_tile_bytes, {.page_id = tile_idx}, {.offset_bytes = 0});
+            noc.async_read_barrier();
+            dfb_in_obj.push_back(onetile);
             tile_idx += Wt;
         }
 
         w_idx = curr_tile % Wt;
         nc_idx = curr_tile / Wt;
         tile_idx = nc_idx * Ht * Wt + w_idx;
-        for (uint32_t h = 0; h < Ht; h++) {
-            cb_reserve_back(cb_in, onetile);
-            l1_write_addr_in = get_write_ptr(cb_in);
-            noc_async_read_tile(tile_idx, src_in, l1_write_addr_in);
-            noc_async_read_barrier();
-            cb_push_back(cb_in, onetile);
+        for (std::uint32_t h = 0; h < Ht; h++) {
+            dfb_in_obj.reserve_back(onetile);
+            noc.async_read(src_in, dfb_in_obj, in_tile_bytes, {.page_id = tile_idx}, {.offset_bytes = 0});
+            noc.async_read_barrier();
+            dfb_in_obj.push_back(onetile);
             tile_idx += Wt;
         }
 
         w_idx = curr_tile % Wt;
         nc_idx = curr_tile / Wt;
         tile_idx = nc_idx * Ht * Wt + w_idx;
-        for (uint32_t h = 0; h < Ht; h++) {
-            cb_reserve_back(cb_in, onetile);
-            l1_write_addr_in = get_write_ptr(cb_in);
-            noc_async_read_tile(tile_idx, src_in, l1_write_addr_in);
-            noc_async_read_barrier();
-            cb_push_back(cb_in, onetile);
+        for (std::uint32_t h = 0; h < Ht; h++) {
+            dfb_in_obj.reserve_back(onetile);
+            noc.async_read(src_in, dfb_in_obj, in_tile_bytes, {.page_id = tile_idx}, {.offset_bytes = 0});
+            noc.async_read_barrier();
+            dfb_in_obj.push_back(onetile);
             tile_idx += Wt;
         }
 

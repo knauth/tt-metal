@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,9 +9,9 @@ from typing import Optional, Tuple, Union
 from dataclasses import dataclass
 
 import ttnn
-from models.utility_functions import torch_to_tt_tensor_rm
+from models.common.utility_functions import torch_to_tt_tensor_rm
 from models.experimental.trocr.tt.trocr_decoder_wrapper import TtTrOCRDecoderWrapper
-from models.helper_funcs import Linear
+from models.common.helper_funcs import Linear
 
 
 @dataclass

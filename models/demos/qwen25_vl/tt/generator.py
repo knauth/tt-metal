@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,12 +6,14 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.common.model_capabilities import ModelCapabilitiesMixin
+from models.common.warmup import WarmupForwardMixin
 from models.demos.qwen25_vl.tt.common import get_block_size, get_max_prefill_chunk_size, num_blocks_in_seq
 from models.tt_transformers.tt.generator import Generator as TTTGenerator
 
 
-class Generator:
-    def __init__(self, model, model_args, mesh_device, tokenizer=None, formatter=None):
+class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
+    def __init__(self, model, model_args, mesh_device, processor=None, tokenizer=None):
         """
         Creating a Qwen2_5_Vision wrapper requires only a mesh_device and model_args.
         With model_args you have the checkpoint location, can specify max batch size
@@ -19,7 +21,7 @@ class Generator:
 
         """
         # favor composition over inheritance: __ is convention for private variables
-        self._ttt_generator = TTTGenerator([model], [model_args], mesh_device, tokenizer, formatter)
+        self._ttt_generator = TTTGenerator([model], [model_args], mesh_device, processor=processor, tokenizer=tokenizer)
 
     @property
     def model(self):
@@ -40,10 +42,10 @@ class Generator:
         return self._ttt_generator.tokenizer
 
     @property
-    def formatter(self):
-        return self._ttt_generator.formatter
+    def processor(self):
+        return self._ttt_generator.processor
 
-    def prefill_forward_text(self, tokens: torch.Tensor, page_table=None, kv_cache=None, prompt_lens=None):
+    def prefill_forward_text(self, tokens: torch.Tensor, rot_mats, page_table=None, kv_cache=None, prompt_lens=None):
         batch, batch_seq_len = tokens.shape[:2]
         output_logits = torch.zeros(batch, 1, self.model_args.vocab_size)
         prompt_lens = prompt_lens if prompt_lens is not None else torch.tensor([batch_seq_len] * batch)
@@ -62,11 +64,11 @@ class Generator:
                 page_table_user = self._ttt_generator._get_prefill_user_page_table(page_table, kv_cache, seq_len)
 
             logits = self.__prefill_forward_single_user_text(
-                # prefill_ids,
-                tokens[user_id : user_id + 1],  # todo)) use this if the above padding is not used
+                tokens[user_id : user_id + 1],
                 page_table=page_table_user if page_table is not None else None,
                 user_id=user_id,
                 last_token_idx=last_token_idx,
+                rot_mats=rot_mats,
                 kv_cache=kv_cache,
             )
 
@@ -77,7 +79,22 @@ class Generator:
 
         return output_logits
 
-    def decode_forward_text(
+    def update_cos_sin(self, cos_matrix_pt=None, sin_matrix_pt=None):
+        self.model.rope_setup.update_cos_sin(cos_matrix_pt=cos_matrix_pt, sin_matrix_pt=sin_matrix_pt)
+
+    def update_cos_sin_rows(self, rot_mats_seq_ids):
+        for i, (cos, sin) in enumerate(rot_mats_seq_ids):
+            self.model.rope_setup.cos_matrix_pt[i] = cos[0]
+            self.model.rope_setup.sin_matrix_pt[i] = sin[0]
+        self.update_cos_sin()
+
+    def update_rope_deltas(self, rope_deltas_list: list):
+        # pad rope_deltas_list to the batch size
+        rope_deltas_list = rope_deltas_list + [0] * (self.model.rope_setup.batch_size - len(rope_deltas_list))
+        # convert to torch tensor
+        self.model.rope_setup.rope_deltas = torch.tensor(rope_deltas_list)
+
+    def decode_forward(
         self,
         tokens,
         start_pos,
@@ -87,7 +104,7 @@ class Generator:
         read_from_device=True,
         sampling_params=None,
     ):
-        return self._ttt_generator.decode_forward_text(
+        return self._ttt_generator.decode_forward(
             tokens=tokens,
             start_pos=start_pos,
             page_table=page_table,
@@ -97,7 +114,7 @@ class Generator:
             sampling_params=sampling_params,
         )
 
-    def __prefill_forward_single_user_text(self, tokens, page_table, user_id, last_token_idx, kv_cache=None):
+    def __prefill_forward_single_user_text(self, tokens, page_table, user_id, last_token_idx, rot_mats, kv_cache=None):
         seq_len = tokens.shape[1]
         use_chunked_prefill = seq_len > self.model_args.max_prefill_chunk_size
         if use_chunked_prefill:
@@ -143,13 +160,14 @@ class Generator:
                     chunk_page_table_tt,
                 ) = self.model.prepare_inputs_prefill(
                     chunk_tokens,
+                    rot_mats=rot_mats,
                     start_pos=chunk_start,
                     page_table=page_table_user_padded,
                     chunk_page_table=chunk_page_table,
                 )
                 tt_logits = self.model.ttnn_prefill_forward(
                     chunk_prefill_input,
-                    rot_mats_global=chunk_rot_mats_prefill,
+                    rot_mats_global=[rm[user_id : user_id + 1, ...] for rm in chunk_rot_mats_prefill],
                     user_id=CHUNK_USER_ID,
                     page_table=page_table_tt,
                     chunk_page_table=chunk_page_table_tt,
@@ -159,13 +177,16 @@ class Generator:
                 )
 
                 if chunk_start == last_chunk_start:
-                    logits = self.model.process_output_prefill(tt_logits, last_token_idx=(last_token_idx_in_chunk % 32))
+                    logits = self.model.process_output_prefill(
+                        tt_logits.cpu(), last_token_idx=(last_token_idx_in_chunk % 32)
+                    )
                     return logits
                 else:
                     del tt_logits
         else:
             prefill_input, rot_mats_prefill, page_table_tt, _ = self.model.prepare_inputs_prefill(
                 tokens,
+                rot_mats=rot_mats,
                 page_table=page_table,
             )
 
@@ -178,7 +199,7 @@ class Generator:
                 kv_cache=kv_cache,
             )
 
-            logits = self.model.process_output_prefill(tt_logits, last_token_idx=(last_token_idx % 32))
+            logits = self.model.process_output_prefill(tt_logits.cpu(), last_token_idx=(last_token_idx % 32))
 
             # deallocate device tensors that are not needed by decode
             # [INFO] logits is a torch tensor
@@ -190,8 +211,16 @@ class Generator:
             return logits
 
     # [INFO] this is called by vLLM
-    def read_decode_output(self, tt_out, unpadded_batch, is_tokens=False):
-        return self._ttt_generator.read_decode_output(tt_out, unpadded_batch, is_tokens)
+    def read_decode_output(self, tt_out, async_read=False):
+        return self._ttt_generator.read_decode_output(tt_out, async_read=async_read)
+
+    # [INFO] this is called by vLLM
+    def process_decode_output_host(self, tt_out, is_tokens=False):
+        return self._ttt_generator.process_decode_output_host(tt_out, is_tokens=is_tokens)
+
+    def warmup_model_prefill(self, kv_cache, enable_trace, can_sample_on_device, greedy_only: bool = False) -> None:
+        logger.warning("Warmup model prefill not implemented for Qwen2_5_VL Generator")
+        logger.warning("Tracing in prefill mode is not supported for Qwen2_5_VL")
 
     ## Destructor (used to delete ttnn trace if exists)
 

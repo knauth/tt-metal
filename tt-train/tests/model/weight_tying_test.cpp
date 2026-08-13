@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -7,15 +7,16 @@
 #include <memory>
 
 #include "autograd/auto_context.hpp"
-#include "autograd/module_base.hpp"
+#include "core/system_utils.hpp"
 #include "core/tt_tensor_utils.hpp"
 #include "modules/embedding_module.hpp"
 #include "modules/linear_module.hpp"
+#include "modules/module_base.hpp"
 #include "ops/losses.hpp"
 #include "ops/unary_ops.hpp"
 #include "optimizers/adamw.hpp"
 
-class ModelFC : public ttml::autograd::ModuleBase {
+class ModelFC : public ttml::modules::ModuleBase {
     std::shared_ptr<ttml::modules::LinearLayer> m_fc1;
     std::shared_ptr<ttml::modules::LinearLayer> m_fc2;
 
@@ -45,7 +46,7 @@ public:
     }
 };
 
-class LanguageModel : public ttml::autograd::ModuleBase {
+class LanguageModel : public ttml::modules::ModuleBase {
     std::shared_ptr<ttml::modules::LinearLayer> m_fc1;
     std::shared_ptr<ttml::modules::Embedding> m_emb;
 
@@ -102,6 +103,7 @@ TEST_F(WeightTyingTest, ModelFC) {
     }
 
     std::vector<float> targets;
+    targets.reserve(batch_size * output_features);
     for (size_t i = 0; i < batch_size; ++i) {
         for (int j = 0; j < output_features; ++j) {
             targets.push_back(static_cast<float>(i) * 0.1F);

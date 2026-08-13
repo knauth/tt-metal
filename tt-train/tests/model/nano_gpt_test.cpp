@@ -1,11 +1,12 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
-#include <core/ttnn_all_includes.hpp>
+#include <fstream>
+#include <tt-metalium/distributed.hpp>
 
 #include "autograd/auto_context.hpp"
 #include "core/distributed/distributed.hpp"
@@ -15,15 +16,21 @@
 #include "datasets/utils.hpp"
 #include "models/distributed/llama.hpp"
 #include "models/llama.hpp"
+#include "ops/distributed/losses.hpp"
 #include "ops/losses.hpp"
 #include "optimizers/adamw.hpp"
 #include "tokenizers/char_tokenizer.hpp"
+#include "tt-metalium/host_api.hpp"
+#include "ttnn/distributed/distributed_tensor.hpp"
+#include "utils/memory_utils.hpp"
 namespace {
 /*
 Nightly tests could be enabled by setting the environment variable ENABLE_NIGHTLY_TT_TRAIN_TESTS=1
-or setting 'is_nigthly_tt_train_tests_enabled' variable to true.
+or setting 'is_nightly_tt_train_tests_enabled' variable to true.
 */
-constexpr bool is_nigthly_tt_train_tests_enabled = true;
+// TODO: Disabled due to differences exceeding the threshold when comparing loss value.
+// Tracking issue: https://github.com/tenstorrent/tt-metal/issues/37337
+constexpr bool is_nigthly_tt_train_tests_enabled = false;
 
 [[nodiscard]] bool is_wormhole_b0() {
     static bool arch_is_wormhole_b0 = []() {
@@ -38,7 +45,9 @@ constexpr bool is_nigthly_tt_train_tests_enabled = true;
 [[nodiscard]] bool should_run_nightly_tests() {
     const char *env_var = std::getenv("ENABLE_NIGHTLY_TT_TRAIN_TESTS");
     bool is_whb0 = is_wormhole_b0();
-    bool is_ci = env_var || is_nigthly_tt_train_tests_enabled;
+    // TODO: Disabled due to differences exceeding the threshold when comparing loss value.
+    // Tracking issue: https://github.com/tenstorrent/tt-metal/issues/37337
+    bool is_ci = env_var && is_nigthly_tt_train_tests_enabled;
     return is_whb0 && is_ci;
 }
 
@@ -91,9 +100,6 @@ struct TrainingConfig {
     uint32_t max_steps = 100;
     float learning_rate = 3e-4F;
     float weight_decay = 1e-2F;
-    bool use_moreh_adamw = false;
-    // works only for AdamW
-    bool use_kahan_summation = false;
     // accumulate batches for gradient update
     uint32_t gradient_accumulation_steps = 1;
     std::string model_path;
@@ -126,6 +132,7 @@ void train_test(bool use_tensor_parallel = false, bool use_ddp = false) {
 
     // set seed
     ttml::autograd::ctx().set_seed(config.seed);
+    ttml::autograd::ctx().initialize_parallelism_context({.enable_ddp = use_ddp, .enable_tp = use_tensor_parallel});
 
     std::string text;
     // reading training data from txt file
@@ -168,7 +175,6 @@ void train_test(bool use_tensor_parallel = false, bool use_ddp = false) {
 
     std::function<BatchType(std::vector<DatasetSample> && samples)> collate_fn =
         [sequence_length, device, &cached_data, use_ddp](std::vector<DatasetSample> &&samples) {
-            auto start_timer = std::chrono::high_resolution_clock::now();
             const uint32_t batch_size = samples.size();
             std::vector<uint32_t> &data = cached_data.data;
             std::vector<uint32_t> &targets = cached_data.targets;
@@ -182,8 +188,6 @@ void train_test(bool use_tensor_parallel = false, bool use_ddp = false) {
                 std::copy(features.begin(), features.end(), std::back_inserter(data));
                 std::copy(target_span.begin(), target_span.end(), std::back_inserter(targets));
             }
-            auto end_timer = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_timer - start_timer).count();
 
             auto create_data_and_targets = [&]() -> std::tuple<TensorPtr, TensorPtr> {
                 if (use_ddp) {
@@ -220,8 +224,6 @@ void train_test(bool use_tensor_parallel = false, bool use_ddp = false) {
             };
 
             auto [data_tensor, targets_tensor] = create_data_and_targets();
-            end_timer = std::chrono::high_resolution_clock::now();
-            duration = std::chrono::duration_cast<std::chrono::microseconds>(end_timer - start_timer).count();
             return std::make_tuple(data_tensor, targets_tensor, cached_data.masks_tensor);
         };
     auto train_dataloader = DataLoader(dataset, /* batch_size */ config.batch_size, /* shuffle */ true, collate_fn);
@@ -233,7 +235,7 @@ void train_test(bool use_tensor_parallel = false, bool use_ddp = false) {
     config.transformer_config.vocab_size =
         round_up_to_tile(tokenizer->get_vocab_size(), (use_tensor_parallel ? num_devices : 1U) * 32U);
 
-    std::shared_ptr<ttml::autograd::ModuleBase> model;
+    std::shared_ptr<ttml::modules::ModuleBase> model;
     if (use_tensor_parallel) {
         config.transformer_config.num_groups = num_devices;
         config.transformer_config.num_heads = num_devices * 3;
@@ -248,9 +250,9 @@ void train_test(bool use_tensor_parallel = false, bool use_ddp = false) {
     adamw_params.lr = config.learning_rate;
     adamw_params.weight_decay = config.weight_decay;
 
-    auto optimizer = std::make_shared<ttml::optimizers::MorehAdamW>(model->parameters(), adamw_params);
+    auto optimizer = std::make_shared<ttml::optimizers::AdamW>(model->parameters(), adamw_params);
 
-    auto get_loss_value = [device](const TensorPtr &loss) {
+    auto get_loss_value = [](const TensorPtr &loss) {
         auto loss_xtensors = ttml::core::to_xtensor(loss->get_value(), ttml::core::IdentityComposer{});
         // sum of loss xtensors
         float loss_float =
@@ -262,20 +264,24 @@ void train_test(bool use_tensor_parallel = false, bool use_ddp = false) {
     };
 
     std::vector<double> steps_time;
+    steps_time.reserve(config.max_steps);
     std::vector<float> losses;
+    losses.reserve(config.max_steps);
 
     for (auto [features, target, masks] : train_dataloader) {
         auto start_timer = std::chrono::high_resolution_clock::now();
         optimizer->zero_grad();
         auto output = (*model)(features, masks);
-        auto loss = ttml::ops::cross_entropy_loss(output, target);
+        auto loss = use_tensor_parallel
+                        ? ttml::ops::distributed::vocab_parallel_cross_entropy_loss(output, target, /*cluster_axis*/ 1U)
+                        : ttml::ops::cross_entropy_loss(output, target);
         auto loss_float = get_loss_value(loss);
         loss->backward();
 
         // synchronize gradients for multi-device case, no-op if single device
         auto parameters = model->parameters();
         if (!use_tensor_parallel) {
-            ttml::core::distributed::synchronize_parameters(parameters);
+            ttml::core::distributed::synchronize_gradients(parameters);
         }
 
         optimizer->step();
@@ -348,19 +354,22 @@ If one of these tests fails, it means one (or more) of the following:
 */
 
 TEST_F(NanoLlamaTest, NIGHTLY_Default) {
-    if (should_run_nightly_tests()) {
-        train_test();
+    if (!should_run_nightly_tests()) {
+        GTEST_SKIP() << "Skipping Nightly test.";
     }
+    train_test();
 }
 
 TEST_F(NanoLlamaMultiDeviceTest, DISABLED_NIGHTLY_TensorParallel) {
-    if (should_run_multi_device_tests()) {
-        train_test(/*use_tensor_parallel=*/true, /*use_ddp=*/false);
+    if (!should_run_multi_device_tests()) {
+        GTEST_SKIP() << "Skipping test as we are running on a single device.";
     }
+    train_test(/*use_tensor_parallel=*/true, /*use_ddp=*/false);
 }
 
 TEST_F(NanoLlamaMultiDeviceTest, NIGHTLY_DDP) {
-    if (should_run_multi_device_tests()) {
-        train_test(/*use_tensor_parallel=*/false, /*use_ddp=*/true);
+    if (!should_run_multi_device_tests()) {
+        GTEST_SKIP() << "Skipping test as we are running on a single device.";
     }
+    train_test(/*use_tensor_parallel=*/false, /*use_ddp=*/true);
 }

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,7 +6,6 @@
 
 #include <CLI/CLI.hpp>
 #include <chrono>
-#include <core/ttnn_all_includes.hpp>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -23,6 +22,7 @@
 #include "ops/losses.hpp"
 #include "optimizers/sgd.hpp"
 #include "serialization/serializable.hpp"
+#include "ttnn_fixed/distributed/tt_metal.hpp"
 #include "utils.hpp"
 
 using ttml::autograd::TensorPtr;
@@ -47,6 +47,7 @@ struct TrainingConfig {
     float momentum = 0.9F;
     float weight_decay = 0.F;
     int model_save_interval = 500;
+    std::string model_config = "configs/model_configs/mlp_config.yaml";
     std::string model_path = "/tmp/mnist_mlp.msgpack";
     ttml::modules::MultiLayerPerceptronParameters mlp_config;
 };
@@ -54,6 +55,8 @@ struct TrainingConfig {
 TrainingConfig parse_config(const YAML::Node &yaml_config) {
     TrainingConfig config;
     auto training_config = yaml_config["training_config"];
+    auto model_config_path = expand_config_path(training_config["model_config"].as<std::string>());
+    auto model_config = YAML::LoadFile(model_config_path)["mlp_config"];
 
     config.batch_size = training_config["batch_size"].as<uint32_t>();
     config.logging_interval = training_config["logging_interval"].as<int>();
@@ -62,7 +65,7 @@ TrainingConfig parse_config(const YAML::Node &yaml_config) {
     config.momentum = training_config["momentum"].as<float>();
     config.weight_decay = training_config["weight_decay"].as<float>();
     config.model_save_interval = training_config["model_save_interval"].as<int>();
-    config.mlp_config = ttml::models::mlp::read_config(training_config["mlp_config"]);
+    config.mlp_config = ttml::models::mlp::read_config(model_config);
     return config;
 }
 
@@ -123,7 +126,6 @@ float evaluate(DataLoader &test_dataloader, Model &model, size_t num_targets) {
     model_to_eval(model);
     float num_correct = 0;
     float num_samples = 0;
-    auto *device = &ttml::autograd::ctx().get_device();
     for (const auto &[data, target] : test_dataloader) {
         auto output = run_model(model, data);
         auto output_xtensor = ttml::core::to_xtensor(output->get_value(), ttml::core::IdentityComposer{})[0];
@@ -147,7 +149,7 @@ int main(int argc, char **argv) {
     CLI::App app{"Mnist Example"};
     argv = app.ensure_utf8(argv);
 
-    std::string config_name = std::string(CONFIGS_FOLDER) + "/training_mnist_mlp.yaml";
+    std::string config_name = std::string(CONFIGS_FOLDER) + "/training_configs/mnist.yaml";
     bool is_eval = false;
     bool enable_tp = false;
     app.add_option("-c,--config", config_name, "Yaml Config name")->default_val(config_name);
@@ -170,10 +172,14 @@ int main(int argc, char **argv) {
     ttml::datasets::InMemoryDataset<std::vector<uint8_t>, uint8_t> test_dataset(
         dataset.test_images, dataset.test_labels);
 
+    if (enable_tp) {
+        ttml::ttnn_fixed::distributed::enable_fabric(2U);
+    }
+
     auto *device = &ttml::autograd::ctx().get_device();
     device->enable_program_cache();
     std::function<BatchType(std::vector<DatasetSample> && samples)> collate_fn =
-        [num_features, num_targets, device](std::vector<DatasetSample> &&samples) {
+        [device](std::vector<DatasetSample> &&samples) {
             const uint32_t batch_size = samples.size();
             std::vector<float> data;
             std::vector<uint32_t> targets;
@@ -239,7 +245,7 @@ int main(int argc, char **argv) {
     LossAverageMeter loss_meter;
     int training_step = 0;
 
-    auto get_loss_value = [device](const TensorPtr &loss) {
+    auto get_loss_value = [](const TensorPtr &loss) {
         auto loss_xtensors = ttml::core::to_xtensor(loss->get_value(), ttml::core::IdentityComposer{});
         // sum of loss xtensors
         float loss_float =

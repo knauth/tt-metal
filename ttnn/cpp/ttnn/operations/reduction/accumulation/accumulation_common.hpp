@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -18,7 +18,7 @@ namespace ttnn::operations::reduction::accumulation::common {
 constexpr uint32_t FOUR_DIMENSIONS{4};
 constexpr uint32_t FIRST_DIMENSION{0};
 
-using permutation_t = ttnn::SmallVector<int64_t>;
+using permutation_t = ttsl::SmallVector<int64_t>;
 
 Tensor preprocess_input_tensor(
     const Tensor& input_tensor,
@@ -35,13 +35,12 @@ Tensor postprocess_output_tensor(
     const int32_t& original_rank);
 
 Tensor accumulation_invoke(
-    QueueId queue_id,
     const Tensor& input_tensor,
     int64_t dim,
     std::optional<ttnn::DataType> dtype,
     std::optional<Tensor> optional_out,
     const bool& reverse_order,
     const std::optional<MemoryConfig>& memory_config,
-    AccumulationOp op);
+    ttnn::prim::AccumulationOp op);
 
 }  // namespace ttnn::operations::reduction::accumulation::common

@@ -1,14 +1,16 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
+#include <tuple>
+
 #include "ttnn/tensor/tensor.hpp"
 
-namespace ttnn::operations::experimental::dropout {
+namespace ttnn::experimental::prim {
 
-struct operation_attributes_t {
+struct DropoutParams {
     const tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::INVALID;
     const tt::tt_metal::MemoryConfig output_memory_config;
 
@@ -19,15 +21,25 @@ struct operation_attributes_t {
 
     const float prob = 0.0f;
     const float scale = 1.0f;
+
+    // `seed` is re-applied via get_dynamic_runtime_args, so it is excluded from the program hash
+    // (calls differing only in seed cache-hit). `prob`/`scale` are baked as compile-time args and
+    // `use_per_device_seed` selects the program factory, so all three are structural and kept.
+    static constexpr auto attribute_names =
+        std::forward_as_tuple("output_dtype", "output_memory_config", "use_per_device_seed", "prob", "scale");
+    auto attribute_values() const {
+        return std::forward_as_tuple(output_dtype, output_memory_config, use_per_device_seed, prob, scale);
+    }
 };
 
-struct tensor_args_t {
+// tensor_args must stay a plain reflectable aggregate: the device-operation framework walks it
+// structurally to discover the Tensor leaves (output-spec counting, buffer extraction). Compile-time
+// attributes here would both be ambiguous against the Reflectable visitor and hide the Tensors, so
+// the input is hashed in full via its tt::tt_metal::TensorSpec (correct and stricter than the old volume-only
+// hash; the seed is still excluded via DropoutParams + get_dynamic_runtime_args).
+struct DropoutInputs {
     const Tensor& input;
     std::optional<Tensor> preallocated_output;
 };
 
-using tensor_return_value_t = Tensor;
-
-using spec_return_value_t = TensorSpec;
-
-}  // namespace ttnn::operations::experimental::dropout
+}  // namespace ttnn::experimental::prim

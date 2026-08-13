@@ -1,34 +1,45 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <kernel_types.hpp>
-#include <stdint.h>
+#include <cstdint>
 #include "impl/context/metal_context.hpp"
 #include <utility>
-
-#include "util.hpp"
+#include <llrt/tt_cluster.hpp>
 
 namespace tt::tt_metal {
 
 ReaderDataMovementConfig::ReaderDataMovementConfig(
-    std::vector<uint32_t> compile_args, std::map<std::string, std::string> defines, KernelBuildOptLevel opt_level) :
+    std::vector<uint32_t> compile_args,
+    std::map<std::string, std::string> defines,
+    std::unordered_map<std::string, uint32_t> named_compile_args,
+    KernelBuildOptLevel opt_level,
+    std::vector<std::filesystem::path> compiler_include_paths) :
     DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_1,
-        .noc = detail::GetPreferredNOCForDRAMRead(tt::tt_metal::MetalContext::instance().get_cluster().arch()),
+        .noc = detail::preferred_noc_for_dram_read(tt::tt_metal::MetalContext::instance().get_cluster().arch()),
         .noc_mode = NOC_MODE::DM_DEDICATED_NOC,
         .compile_args = std::move(compile_args),
         .defines = std::move(defines),
-        .opt_level = opt_level} {}
+        .named_compile_args = std::move(named_compile_args),
+        .opt_level = opt_level,
+        .compiler_include_paths = std::move(compiler_include_paths)} {}
 
 WriterDataMovementConfig::WriterDataMovementConfig(
-    std::vector<uint32_t> compile_args, std::map<std::string, std::string> defines, KernelBuildOptLevel opt_level) :
+    std::vector<uint32_t> compile_args,
+    std::map<std::string, std::string> defines,
+    std::unordered_map<std::string, uint32_t> named_compile_args,
+    KernelBuildOptLevel opt_level,
+    std::vector<std::filesystem::path> compiler_include_paths) :
     DataMovementConfig{
         .processor = DataMovementProcessor::RISCV_0,
-        .noc = detail::GetPreferredNOCForDRAMWrite(tt::tt_metal::MetalContext::instance().get_cluster().arch()),
+        .noc = detail::preferred_noc_for_dram_write(tt::tt_metal::MetalContext::instance().get_cluster().arch()),
         .noc_mode = NOC_MODE::DM_DEDICATED_NOC,
         .compile_args = std::move(compile_args),
         .defines = std::move(defines),
-        .opt_level = opt_level} {}
+        .named_compile_args = std::move(named_compile_args),
+        .opt_level = opt_level,
+        .compiler_include_paths = std::move(compiler_include_paths)} {}
 
 }  // namespace tt::tt_metal

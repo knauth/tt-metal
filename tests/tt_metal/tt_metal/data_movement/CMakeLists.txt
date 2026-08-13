@@ -1,24 +1,11 @@
-set(UNIT_TESTS_DATA_MOVEMENT_SRC
-    ${CMAKE_CURRENT_SOURCE_DIR}/dm_common.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/dram_unary/test_unary_dram.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/one_to_all/test_one_to_all.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/one_to_all/test_multicast_schemes.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/loopback/test_loopback.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/reshard_hardcoded/test_reshard_hardcoded.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/deinterleave_hardcoded/test_deinterleave_hardcoded.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/conv_hardcoded/test_conv_hardcoded.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/one_to_one/test_one_to_one.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/one_from_one/test_one_from_one.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/core_bidirectional/test_core_bidirectional.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/one_from_all/test_one_from_all.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/all_to_all/test_all_to_all.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/all_from_all/test_all_from_all.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/interleaved/test_interleaved.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/one_packet/test_one_packet.cpp
-)
+# Include source file lists (module owners maintain sources.cmake)
+include(sources.cmake)
+
+add_subdirectory(noc_estimator)
 
 add_executable(unit_tests_data_movement ${UNIT_TESTS_DATA_MOVEMENT_SRC})
 TT_ENABLE_UNITY_BUILD(unit_tests_data_movement)
+target_precompile_headers(unit_tests_data_movement REUSE_FROM metal_common_pch)
 
 target_link_libraries(unit_tests_data_movement PUBLIC test_metal_common_libs)
 target_include_directories(
@@ -36,3 +23,10 @@ set_target_properties(
         RUNTIME_OUTPUT_DIRECTORY
             ${PROJECT_BINARY_DIR}/test/tt_metal
 )
+
+# Let dm_common.cpp see kEmuleAsanBuild=true so it registers its raw-L1 scratch
+# extent with the emule OOB sanitizer (see dm_common.cpp / SANITIZER_CHECKS.md).
+# PRIVATE on the metal lib, so the test target must opt in explicitly.
+if(TT_METAL_USE_EMULE)
+    target_compile_definitions(unit_tests_data_movement PRIVATE TT_METAL_USE_EMULE=1)
+endif()

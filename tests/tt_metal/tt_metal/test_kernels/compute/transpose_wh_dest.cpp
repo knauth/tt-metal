@@ -1,41 +1,44 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/transpose_wh_dest.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/transpose_dest.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "experimental/kernel_args.h"
 
-namespace NAMESPACE {
-void MAIN {
-    uint32_t NHtWt = get_compile_time_arg_val(0);
+void kernel_main() {
+    constexpr uint32_t NHtWt = get_arg(args::NHtWt);
 
-    unary_op_init_common(tt::CBIndex::c_0, tt::CBIndex::c_16);
+    DataflowBuffer dfb_in(dfb::in);
+    DataflowBuffer dfb_out(dfb::out);
+
+    unary_op_init_common(dfb::in, dfb::out);
 
     // transpose a row-major block:
     // - assumes the tiles come in in column major order from reader
     // - uses reader_unary_transpose_wh
-    // - transpose_wh_dest each tile
+    // - transpose_dest each tile
     for (uint32_t n = 0; n < NHtWt; n++) {
-        cb_wait_front(tt::CBIndex::c_0, 1);
-        cb_reserve_back(tt::CBIndex::c_16, 1);
+        dfb_in.wait_front(1);
+        dfb_out.reserve_back(1);
 
         tile_regs_acquire();
-        copy_tile_init(tt::CBIndex::c_0);
-        copy_tile(tt::CBIndex::c_0, 0, 0);
+        copy_tile_init(dfb::in);
+        copy_tile(dfb::in, 0, 0);
 
-        transpose_wh_dest_init_short();
-        transpose_wh_dest(0);
+        transpose_dest_init<DST_ACCUM_MODE, true /* transpose_of_faces */>(dfb::in);
+        transpose_dest<DST_ACCUM_MODE, true /* transpose_of_faces */>(0);
         tile_regs_commit();
 
         tile_regs_wait();
-        pack_tile(0, tt::CBIndex::c_16);
+        pack_tile(0, dfb::out);
         tile_regs_release();
 
-        cb_push_back(tt::CBIndex::c_16, 1);
-        cb_pop_front(tt::CBIndex::c_0, 1);
+        dfb_in.pop_front(1);
+        dfb_out.push_back(1);
     }
 }
-}  // namespace NAMESPACE

@@ -1,9 +1,9 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
-#include "dataflow_api.h"
-#include "socket_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/socket_api.h"
 
 void kernel_main() {
     // Get this value from MeshSocket struct on host
@@ -27,8 +27,6 @@ void kernel_main() {
     uint32_t outstanding_data_size = data_size;
     set_sender_socket_page_size(sender_socket, page_size);
 
-    uint64_t receiver_noc_coord_addr = get_noc_addr(sender_socket.downstream_noc_x, sender_socket.downstream_noc_y, 0);
-
     uint64_t src_noc_addr = get_noc_addr(src_core_x, src_core_y, src_buffer_addr);
 
     uint32_t local_write_addr = get_write_ptr(scratch_cb_index);
@@ -49,7 +47,10 @@ void kernel_main() {
             // Issuing the write requires the wptr from the socket itself
             // The user can get the wptr directly from the sender_socket, or
             // we can add wrappers issue the write itself
-            noc_async_write(data_addr, data_noc_coord_addrs[i] | sender_socket.write_ptr, page_size);
+            noc_async_write(
+                data_addr,
+                data_noc_coord_addrs[i] | (sender_socket.write_ptr + sender_socket.downstream_fifo_addr),
+                page_size);
             data_addr += page_size;
         }
         outstanding_data_size -= page_size;

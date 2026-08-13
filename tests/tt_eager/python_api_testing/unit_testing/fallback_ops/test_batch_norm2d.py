@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,7 +8,7 @@ import tt_lib.fallback_ops as fallback_ops
 
 import ttnn
 
-from models.utility_functions import (
+from models.common.utility_functions import (
     comp_allclose_and_pcc,
     comp_pcc,
 )

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,10 +6,10 @@
 
 #include <circular_buffer.hpp>
 #include <device.hpp>
-#include <kernel.hpp>
 #include <tt-metalium/program.hpp>
 #include <stdint.h>
 #include <vector_aligned.hpp>
+#include <tt_stl/span.hpp>
 #include <array>
 #include <memory>
 #include <unordered_map>
@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "core_coord.hpp"
-#include "dev_msgs.h"
 #include "dispatch/dispatch_settings.hpp"
 #include "kernel_types.hpp"
 #include "program_impl.hpp"
@@ -25,11 +24,10 @@
 #include "dispatch/worker_config_buffer.hpp"
 #include "trace/trace_node.hpp"
 
-enum class CoreType;
+#include <umd/device/types/core_coordinates.hpp>
 
-namespace tt {
-
-namespace tt_metal {
+namespace tt::tt_metal {
+class Device;
 class IDevice;
 class Program;
 class Semaphore;
@@ -38,19 +36,24 @@ enum class ProgramBinaryStatus : uint8_t;
 struct KernelGroup;
 struct ProgramCommandSequence;
 
+namespace distributed {
+class MeshWorkloadImpl;
+class MeshDevice;
+}  // namespace distributed
+
 namespace program_dispatch {
 
 struct ProgramDispatchMetadata {
     std::vector<ConfigBufferEntry> kernel_config_addrs;
-    uint32_t sync_count;
-    uint32_t stall_first;
-    uint32_t stall_before_program;
+    uint32_t sync_count{};
+    uint32_t stall_first{};
+    uint32_t stall_before_program{};
 
     struct {
         uint32_t mesh_max_program_kernels_sizeB;
         bool is_cached;
         uint32_t offset;
-    } prefetcher_cache_info;
+    } prefetcher_cache_info{};
 };
 
 struct ExpectedNumWorkerUpdates {
@@ -72,18 +75,14 @@ uint32_t configure_crta_offsets_for_kernel_groups(
     uint32_t programmable_core_type_index,
     std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>& kernels,
     std::vector<std::shared_ptr<KernelGroup>>& kernel_groups,
-    uint32_t crta_base_offset,
-    std::array<uint32_t, DISPATCH_CLASS_MAX>& crta_offsets,
-    std::array<uint32_t, DISPATCH_CLASS_MAX>& crta_sizes);
+    uint32_t crta_base_offset);
 
 uint32_t finalize_rt_args(
     std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>& kernels,
     std::vector<std::shared_ptr<KernelGroup>>& kernel_groups,
     uint32_t base_offset,
     uint32_t programmable_core_type_index,
-    uint32_t& rta_offset,
-    std::array<uint32_t, DISPATCH_CLASS_MAX>& crta_offsets,
-    std::array<uint32_t, DISPATCH_CLASS_MAX>& crta_sizes);
+    uint32_t& rta_offset);
 
 uint32_t finalize_sems(
     uint32_t programmable_core_type_index,
@@ -100,6 +99,13 @@ uint32_t finalize_cbs(
     uint32_t& cb_size,
     uint32_t& local_cb_size);
 
+// On WH/BH, DFBs are initialised via setup_local_cb_read_write_interfaces and require
+// local_cb_mask to be a proper slot bitmask (one bit per DFB id).  Call this after
+// finalize_dfbs so the mask is set correctly for every kernel group.
+void finalize_dfb_masks(
+    std::vector<std::shared_ptr<KernelGroup>>& kernel_groups,
+    const std::vector<std::shared_ptr<tt::tt_metal::experimental::dfb::detail::DataflowBufferImpl>>& dataflow_buffers);
+
 uint32_t finalize_kernel_bins(
     IDevice* device,
     uint32_t programmable_core_type_index,
@@ -111,9 +117,10 @@ uint32_t finalize_kernel_bins(
 
 void insert_empty_program_dispatch_preamble_cmd(ProgramCommandSequence& program_command_sequence);
 
-void insert_stall_cmds(ProgramCommandSequence& program_command_sequence, SubDeviceId sub_device_id, IDevice* device);
+void insert_stall_cmds(ProgramCommandSequence& program_command_sequence, SubDeviceId sub_device_id);
 
-void initialize_worker_config_buf_mgr(WorkerConfigBufferMgr& config_buffer_mgr);
+void initialize_worker_config_buf_mgr(
+    const Hal& hal, WorkerConfigBufferMgr& config_buffer_mgr, uint32_t worker_l1_unreserved_start);
 
 void reserve_space_in_kernel_config_buffer(
     WorkerConfigBufferMgr& config_buffer_mgr,
@@ -130,11 +137,11 @@ void update_program_dispatch_commands(
     uint32_t unicast_cores_launch_message_wptr,
     uint32_t expected_num_workers_completed,
     CoreCoord dispatch_core,
-    CoreType dispatch_core_type,
     SubDeviceId sub_device_id,
     const ProgramDispatchMetadata& dispatch_md,
     ProgramBinaryStatus program_binary_status,
-    std::pair<bool, int> unicast_go_signal_update = {false, -1});
+    std::pair<bool, int> unicast_go_signal_update,
+    uint8_t cq_id);
 
 void update_traced_program_dispatch_commands(
     const TraceNode& node,
@@ -143,18 +150,21 @@ void update_traced_program_dispatch_commands(
     uint32_t unicast_cores_launch_message_wptr,
     uint32_t expected_num_workers_completed,
     CoreCoord dispatch_core,
-    CoreType dispatch_core_type,
     SubDeviceId sub_device_id,
     ProgramBinaryStatus program_binary_status,
-    std::pair<bool, int> unicast_go_signal_update = {false, -1});
+    std::pair<bool, int> unicast_go_signal_update,
+    uint8_t cq_id);
 
-TraceNode create_trace_node(detail::ProgramImpl& program, IDevice* device, bool use_prefetcher_cache);
+TraceNode create_trace_node(
+    detail::ProgramImpl& program,
+    distributed::MeshDevice* mesh_device,
+    uint32_t num_workers,
+    bool use_prefetcher_cache);
 
 void write_program_command_sequence(
     const ProgramCommandSequence& program_command_sequence,
     SystemMemoryManager& manager,
     uint32_t command_queue_id,
-    CoreType dispatch_core_type,
     bool stall_first,
     bool stall_before_program,
     bool send_binary = true);
@@ -162,13 +172,14 @@ void write_program_command_sequence(
 KernelHandle get_device_local_kernel_handle(KernelHandle kernel_handle);
 
 void reset_config_buf_mgrs_and_expected_workers(
+    const Hal& hal,
     DispatchArray<WorkerConfigBufferMgr>& config_buffer_mgrs,
     DispatchArray<uint32_t>& expected_num_workers_completed,
     uint32_t num_entries_to_reset,
     uint32_t worker_l1_unreserved_start);
 
 void reset_worker_dispatch_state_on_device(
-    IDevice* device,
+    distributed::MeshDevice* mesh_device,
     SystemMemoryManager& manager,
     uint8_t cq_id,
     CoreCoord dispatch_core,
@@ -176,17 +187,17 @@ void reset_worker_dispatch_state_on_device(
     bool reset_launch_msg_state);
 
 void set_num_worker_sems_on_dispatch(
-    IDevice* device, SystemMemoryManager& manager, uint8_t cq_id, uint32_t num_worker_sems);
+    SystemMemoryManager& manager,
+    uint8_t cq_id,
+    uint32_t num_worker_sems,
+    ttsl::Span<const uint32_t> workers_per_sub_device);
 
 void set_go_signal_noc_data_on_dispatch(
-    IDevice* device, const vector_aligned<uint32_t>& go_signal_noc_data, SystemMemoryManager& manager, uint8_t cq_id);
+    const vector_aligned<uint32_t>& go_signal_noc_data, SystemMemoryManager& manager, uint8_t cq_id);
 
 // Wait for number of workers to complete and then reset the counter on the device
 void reset_expected_num_workers_completed_on_device(
-    tt::tt_metal::IDevice* device,
-    tt::tt_metal::SubDeviceId sub_device_id,
-    uint32_t num_expected_workers,
-    uint8_t cq_id);
+    Device* device, SubDeviceId sub_device_id, uint32_t num_expected_workers, uint8_t cq_id);
 
 //
 // Get the expected number of workers completed values for the given Program to run on the sub device.
@@ -196,13 +207,20 @@ ExpectedNumWorkerUpdates get_expected_num_workers_completed_updates(
     uint32_t num_workers, uint32_t num_additional_workers);
 
 void set_core_go_message_mapping_on_device(
-    IDevice* device,
+    Device* device,
     const std::vector<std::pair<CoreRangeSet, uint32_t>>& core_go_message_mapping,
     SystemMemoryManager& manager,
     uint8_t cq_id);
 
+// ProgramImpl version - does not support CQs
+uint32_t program_base_addr_on_core(detail::ProgramImpl& program, IDevice* device, HalProgrammableCoreType core_type);
+
+// MeshWorkloadImpl version - supports both CQs and not having CQs
+uint32_t program_base_addr_on_core(
+    distributed::MeshWorkloadImpl& mesh_workload,
+    distributed::MeshDevice* mesh_device,
+    HalProgrammableCoreType core_type);
+
 }  // namespace program_dispatch
 
-}  // namespace tt_metal
-
-}  // namespace tt
+}  // namespace tt::tt_metal

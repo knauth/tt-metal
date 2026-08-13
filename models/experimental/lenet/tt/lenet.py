@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,7 +7,7 @@ import torch.nn as nn
 
 
 from models.experimental.lenet.lenet_utils import load_torch_lenet
-from models.utility_functions import torch2tt_tensor
+from models.common.utility_functions import torch2tt_tensor
 from tt_lib.fallback_ops import fallback_ops
 
 

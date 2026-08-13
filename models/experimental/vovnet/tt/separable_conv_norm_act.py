@@ -1,10 +1,17 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 
 import ttnn
 from models.experimental.vovnet.tt.common import Conv
+
+try:
+    from tracy import signpost
+
+    use_signpost = True
+except ModuleNotFoundError:
+    use_signpost = False
 
 
 class TtSeparableConvNormAct:
@@ -25,7 +32,7 @@ class TtSeparableConvNormAct:
             conv_params=[stride, stride, padding, padding],
             split_conv=split_conv,
             fused_op=False,
-            activation="",
+            activation=None,
             parameters=parameters,
         )
 
@@ -34,13 +41,15 @@ class TtSeparableConvNormAct:
             path=base_address,
             conv_params=[1, 1, 0, 0],
             fused_op=True,
-            activation="relu",
-            seperable_conv_norm_act=True,
+            activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
             pw=True,
             parameters=parameters,
         )
 
     def forward(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if use_signpost:
+            signpost(header="seperable_conv_norm")
+
         x = self.conv_dw(x)
         x = self.conv_pw(x[0])
 

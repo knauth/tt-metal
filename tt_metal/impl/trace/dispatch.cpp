@@ -1,17 +1,16 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dev_msgs.h"
 #include <algorithm>
-#include <functional>
 
-#include "assert.hpp"
+#include <tt_stl/assert.hpp>
 #include "device.hpp"
+#include "mesh_device.hpp"
+#include "distributed/mesh_device_impl.hpp"
 #include "impl/context/metal_context.hpp"
 #include "dispatch/kernels/cq_commands.hpp"
-#include "dispatch_core_common.hpp"
-#include "hal.hpp"
+#include "llrt/hal.hpp"
 #include "hal_types.hpp"
 #include "dispatch/launch_message_ring_buffer_state.hpp"
 #include <tt_stl/strong_type.hpp>
@@ -21,6 +20,8 @@
 #include "tt_metal/impl/dispatch/device_command.hpp"
 #include "tt_metal/impl/trace/dispatch.hpp"
 #include "dispatch/worker_config_buffer.hpp"
+#include <impl/dispatch/dispatch_query_manager.hpp>
+#include <impl/dispatch/dispatch_mem_map.hpp>
 
 namespace tt::tt_metal::trace_dispatch {
 
@@ -78,7 +79,7 @@ void load_host_dispatch_state(
 }
 
 void issue_trace_commands(
-    IDevice* device,
+    distributed::MeshDevice* mesh_device,
     SystemMemoryManager& sysmem_manager,
     const TraceDispatchMetadata& dispatch_md,
     uint8_t cq_id,
@@ -98,27 +99,25 @@ void issue_trace_commands(
         dispatcher_for_go_signal = DispatcherSelect::DISPATCH_SUBORDINATE;
     }
 
-    go_msg_t reset_launch_message_read_ptr_go_signal;
-    reset_launch_message_read_ptr_go_signal.signal = RUN_MSG_RESET_READ_PTR;
-    reset_launch_message_read_ptr_go_signal.master_x = (uint8_t)dispatch_core.x;
-    reset_launch_message_read_ptr_go_signal.master_y = (uint8_t)dispatch_core.y;
-
     for (const auto& [id, desc] : dispatch_md.trace_worker_descriptors) {
         const auto& noc_data_start_idx =
-            device->noc_data_start_index(id, desc.num_traced_programs_needing_go_signal_unicast);
+            mesh_device->impl().noc_data_start_index(id, desc.num_traced_programs_needing_go_signal_unicast);
 
         const auto& num_noc_unicast_txns =
-            desc.num_traced_programs_needing_go_signal_unicast ? device->num_virtual_eth_cores(id) : 0;
+            desc.num_traced_programs_needing_go_signal_unicast ? mesh_device->impl().num_virtual_eth_cores(id) : 0;
         auto index = *id;
-        reset_launch_message_read_ptr_go_signal.dispatch_message_offset =
-            MetalContext::instance().dispatch_mem_map().get_dispatch_message_update_offset(index);
 
         // Wait to ensure that all kernels have completed. Then send the reset_rd_ptr go_signal.
         command_sequence.add_dispatch_go_signal_mcast(
             expected_num_workers_completed[index],
-            *reinterpret_cast<uint32_t*>(&reset_launch_message_read_ptr_go_signal),
+            MetalContext::instance().hal().make_go_msg_u32(
+                dev_msgs::RUN_MSG_REPLAY_TRACE,
+                dispatch_core.x,
+                dispatch_core.y,
+                MetalContext::instance().dispatch_mem_map().get_dispatch_message_update_offset(index) +
+                    MetalContext::instance().dispatch_mem_map().get_completion_counter_offset(cq_id)),
             MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(index),
-            desc.num_traced_programs_needing_go_signal_multicast && device->has_noc_mcast_txns(id)
+            desc.num_traced_programs_needing_go_signal_multicast && mesh_device->impl().has_noc_mcast_txns(id)
                 ? index
                 : CQ_DISPATCH_CMD_GO_NO_MULTICAST_OFFSET,
             num_noc_unicast_txns,
@@ -133,10 +132,10 @@ void issue_trace_commands(
         auto index = *id;
         uint32_t expected_num_workers = expected_num_workers_completed[index];
         if (desc.num_traced_programs_needing_go_signal_multicast) {
-            expected_num_workers += device->num_worker_cores(HalProgrammableCoreType::TENSIX, id);
+            expected_num_workers += mesh_device->num_worker_cores(HalProgrammableCoreType::TENSIX, id);
         }
         if (desc.num_traced_programs_needing_go_signal_unicast) {
-            expected_num_workers += device->num_virtual_eth_cores(id);
+            expected_num_workers += mesh_device->impl().num_virtual_eth_cores(id);
         }
 
         if (MetalContext::instance().get_dispatch_query_manager().distributed_dispatcher()) {
@@ -145,13 +144,15 @@ void issue_trace_commands(
                 0,
                 MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(index),
                 expected_num_workers,
+                cq_id,
                 1);
         }
         command_sequence.add_dispatch_wait(
             CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM,
             0,
             MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(index),
-            expected_num_workers);
+            expected_num_workers,
+            cq_id);
     }
 
     uint32_t page_size_log2 = __builtin_ctz(dispatch_md.trace_buffer_page_size);
@@ -177,19 +178,19 @@ uint32_t compute_trace_cmd_size(uint32_t num_sub_devices) {
         align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd), pcie_alignment) * num_sub_devices;
 
     uint32_t cmd_sequence_sizeB =
-        MetalContext::instance().get_dispatch_query_manager().dispatch_s_enabled() *
-            hal.get_alignment(
-                HalMemType::HOST) +  // dispatch_d -> dispatch_s sem update (send only if dispatch_s is running)
-        go_signals_cmd_size +        // go signal cmd
-        (hal.get_alignment(
-             HalMemType::HOST) +  // wait to ensure that reset go signal was processed (dispatch_d)
-                                  // when dispatch_s and dispatch_d are running on 2 cores, workers update dispatch_s.
-                                  // dispatch_s is responsible for resetting worker count and giving dispatch_d the
-                                  // latest worker state. This is encapsulated in the dispatch_s wait command (only to
-                                  // be sent when dispatch is distributed on 2 cores)
-         (MetalContext::instance().get_dispatch_query_manager().distributed_dispatcher()) *
-             hal.get_alignment(HalMemType::HOST)) *
-            num_sub_devices +
+        (MetalContext::instance().get_dispatch_query_manager().dispatch_s_enabled() *
+         hal.get_alignment(
+             HalMemType::HOST)) +  // dispatch_d -> dispatch_s sem update (send only if dispatch_s is running)
+        go_signals_cmd_size +      // go signal cmd
+        ((hal.get_alignment(
+              HalMemType::HOST) +  // wait to ensure that reset go signal was processed (dispatch_d)
+                                   // when dispatch_s and dispatch_d are running on 2 cores, workers update dispatch_s.
+                                   // dispatch_s is responsible for resetting worker count and giving dispatch_d the
+                                   // latest worker state. This is encapsulated in the dispatch_s wait command (only to
+                                   // be sent when dispatch is distributed on 2 cores)
+          (MetalContext::instance().get_dispatch_query_manager().distributed_dispatcher()) *
+              hal.get_alignment(HalMemType::HOST)) *
+         num_sub_devices) +
         hal.get_alignment(HalMemType::HOST);  // CQ_PREFETCH_CMD_EXEC_BUF
 
     return cmd_sequence_sizeB;
@@ -230,10 +231,15 @@ std::size_t compute_interleaved_trace_buf_page_size(uint32_t buf_size, const uin
     // to maximize read bandwidth.
     // Min size is bounded by NOC transfer efficiency
     // Max size is bounded by Prefetcher CmdDatQ size
-    constexpr uint32_t kExecBufPageMin = 1024;
-    constexpr uint32_t kExecBufPageMax = 4096;
+    constexpr uint32_t kExecBufPageMin = kMinTraceBufPageSize;
+    constexpr uint32_t kExecBufPageMax = kMaxTraceBufPageSize;
+    // If the trace buffer uses at least 2 pages per bank (for a specific page size), require using that page size or
+    // larger to improve prefetcher read performance. This limits wasted space to at most 33% or the page size * the
+    // number of banks, whichever is smaller.
+    constexpr uint32_t kMinPagesPerBankForceUse = 2;
+
     // The algorithm below currently minimizes the amount of wasted space due to
-    // padding. TODO: Tune for performance.
+    // padding
     std::vector<uint32_t> candidates;
     candidates.reserve(__builtin_clz(kExecBufPageMin) - __builtin_clz(kExecBufPageMax) + 1);
     for (uint32_t size = 1; size <= kExecBufPageMax; size <<= 1) {
@@ -249,7 +255,7 @@ std::size_t compute_interleaved_trace_buf_page_size(uint32_t buf_size, const uin
         uint32_t fully_banked = num_banks * size;
         uint32_t padded_size = (buf_size + fully_banked - 1) / fully_banked * fully_banked;
         uint32_t waste = padded_size - buf_size;
-        if (waste <= min_waste) {
+        if (waste <= min_waste || (buf_size / (num_banks * size) >= kMinPagesPerBankForceUse)) {
             min_waste = waste;
             pick = size;
         }

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -16,12 +16,13 @@
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/shape2d.hpp>
 #include <tt-metalium/maybe_remote.hpp>
-#include <tt-metalium/routing_table_generator.hpp>
+#include <tt-metalium/experimental/fabric/routing_table_generator.hpp>
 
 namespace tt::tt_metal::distributed {
 
-// Forward declaration of MeshDevice
+// Forward declarations
 class MeshDevice;
+class MeshDeviceViewImpl;
 
 /**
  * @brief The MeshDeviceView class provides a view of a specific sub-region within the MeshDevice.
@@ -42,9 +43,6 @@ class MeshDevice;
 
 class MeshDeviceView {
 public:
-    using DeviceView = std::vector<IDevice*>;
-    using DeviceViews = std::vector<std::vector<IDevice*>>;
-
     // Constructors for MeshDeviceView for fully and partially local meshes.
     explicit MeshDeviceView(
         const MeshShape& shape,
@@ -56,9 +54,10 @@ public:
         const std::vector<tt::tt_fabric::FabricNodeId>& fabric_node_ids);
 
     // Get devices spanning the region defined by `range` in row-major order with start/end coordinates inclusive
-    [[nodiscard]] DeviceView get_devices(const MeshCoordinateRange& range) const;
-    [[nodiscard]] DeviceView get_devices(const MeshShape& submesh_shape) const;
-    [[nodiscard]] DeviceView get_devices() const;
+    [[nodiscard]] std::vector<IDevice*> get_devices(const MeshCoordinateRange& range) const;
+    [[nodiscard]] std::vector<IDevice*> get_devices() const;
+    [[nodiscard]] std::vector<tt::tt_fabric::FabricNodeId> get_fabric_node_ids(const MeshCoordinateRange& range) const;
+    [[nodiscard]] std::vector<tt::tt_fabric::FabricNodeId> get_fabric_node_ids() const;
     [[nodiscard]] size_t num_devices() const;
 
     [[nodiscard]] bool empty() const noexcept;
@@ -69,26 +68,29 @@ public:
 
     // Returns `IDevice*` instance for `coord`.
     // In multi-host context, throws if `coord` is querying a remote device.
-    [[nodiscard]] IDevice* get_device(const MeshCoordinate& coord) const;
+    [[deprecated(
+        "Deprecated, retrieving physical devices can fail in distributed contexts. This will be removed after "
+        "28-02-2026.")]] [[nodiscard]] IDevice*
+    get_device(const MeshCoordinate& coord) const;
 
     // Returns `tt::tt_fabric::FabricNodeId` for `coord`.
     // In multi-host context, fabric node IDs are always available, even for remote devices.
     [[nodiscard]] tt::tt_fabric::FabricNodeId get_fabric_node_id(const MeshCoordinate& coord) const;
 
-    auto begin() const { return devices_.values().begin(); }
-    auto end() const { return devices_.values().end(); }
+    std::vector<MaybeRemote<IDevice*>>::const_iterator begin() const;
+    std::vector<MaybeRemote<IDevice*>>::const_iterator end() const;
 
     // Throws if no device corresponds to `device_id`.
-    [[nodiscard]] MeshCoordinate find_device(chip_id_t device_id) const;
+    [[nodiscard]] MeshCoordinate find_device(ChipId device_id) const;
 
     // TODO: #17477 - Remove the methods that assume 2D mesh.
     [[nodiscard]] bool is_mesh_2d() const;
     [[nodiscard]] size_t num_rows() const;
     [[nodiscard]] size_t num_cols() const;
-    [[nodiscard]] DeviceView get_devices_on_row(size_t row) const;
-    [[nodiscard]] DeviceView get_devices_on_column(size_t col) const;
-    [[nodiscard]] DeviceViews get_row_views() const;
-    [[nodiscard]] DeviceViews get_column_views() const;
+    [[nodiscard]] std::vector<IDevice*> get_devices_on_row(size_t row) const;
+    [[nodiscard]] std::vector<IDevice*> get_devices_on_column(size_t col) const;
+    [[nodiscard]] std::vector<tt::tt_fabric::FabricNodeId> get_fabric_node_ids_on_row(size_t row) const;
+    [[nodiscard]] std::vector<tt::tt_fabric::FabricNodeId> get_fabric_node_ids_on_column(size_t col) const;
 
     // These utility methods linearize the set of devices in a mesh into a line or ring.
     // Linearizing a mesh into a line asserts the condition that device[i-1] is connected to device[i].
@@ -108,21 +110,36 @@ public:
     [[nodiscard]] std::vector<MeshCoordinate> get_ring_coordinates() const;
     [[nodiscard]] std::vector<IDevice*> get_ring_devices() const;
     [[nodiscard]] std::vector<IDevice*> get_line_devices() const;
+    [[nodiscard]] std::vector<tt::tt_fabric::FabricNodeId> get_ring_fabric_node_ids() const;
+    [[nodiscard]] std::vector<tt::tt_fabric::FabricNodeId> get_line_fabric_node_ids() const;
 
     // Returns true if the view is fully local, i.e. all devices in the view are local.
     // Throws if the coordinate is out of bounds of this view.
+    [[deprecated(
+        "Deprecated, is_local should be avoided as it is likely to cause issues in distributed contexts. This will be "
+        "removed after 28-02-2026.")]]
     bool is_local(const MeshCoordinate& coord) const;
 
+    // Returns the coordinate range of all local devices in this view.
+    // The range is a bounding box that encompasses all local coordinates.
+    MeshCoordinateRange get_local_mesh_coord_range() const;
+
+    // Destructor
+    ~MeshDeviceView();
+
+    // Copy constructor and assignment
+    MeshDeviceView(const MeshDeviceView&);
+    MeshDeviceView& operator=(const MeshDeviceView&);
+
+    // Move constructor and assignment
+    MeshDeviceView(MeshDeviceView&&) noexcept;
+    MeshDeviceView& operator=(MeshDeviceView&&) noexcept;
+
+    const MeshDeviceViewImpl& impl() const { return *pimpl_; }
+    MeshDeviceViewImpl& impl() { return *pimpl_; }
+
 private:
-    DistributedMeshContainer<IDevice*> devices_;
-    MeshContainer<tt::tt_fabric::FabricNodeId> fabric_node_ids_;
-    tt::tt_fabric::MeshId mesh_id_;
-
-    std::unordered_map<chip_id_t, MeshCoordinate> device_coordinates_;
-
-    // Set if the view is 2D to enable row/col APIs, otherwise nullopt.
-    // TODO: #17477 - Remove this?
-    std::optional<Shape2D> shape_2d_;
+    std::unique_ptr<MeshDeviceViewImpl> pimpl_;
 };
 
 }  // namespace tt::tt_metal::distributed

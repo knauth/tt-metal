@@ -1,11 +1,11 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <chrono>
 #include <fmt/base.h>
 #include <gtest/gtest.h>
-#include <stdlib.h>
+#include <cstdlib>
 #include <sys/types.h>
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -22,16 +22,14 @@
 #include <variant>
 #include <vector>
 
-#include <tt-metalium/assert.hpp>
-#include <tt-metalium/buffer.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include "mesh_dispatch_fixture.hpp"
 #include <tt-metalium/distributed.hpp>
 #include "hostdevcommon/kernel_structs.h"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include "matmul_test_utils.hpp"
 #include <tt-metalium/program.hpp>
@@ -39,10 +37,6 @@
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include "tt_metal/test_utils/comparison.hpp"
 #include "tt_metal/test_utils/deprecated/tensor.hpp"
-
-namespace tt {
-namespace tt_metal {}  // namespace tt_metal
-}  // namespace tt
 
 namespace tt::tt_metal {
 
@@ -53,7 +47,7 @@ namespace unit_tests_common::matmul::test_matmul_single_core {
 
 bool matmul_single_core(
     tt_metal::MeshDispatchFixture* fixture,
-    std::shared_ptr<distributed::MeshDevice> mesh_device,
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
     int M,
     int N,
     int K,
@@ -65,7 +59,7 @@ bool matmul_single_core(
     auto zero_coord = distributed::MeshCoordinate(0, 0);
     auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
     tt_metal::Program program = tt_metal::CreateProgram();
-    distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+    workload.add_program(device_range, std::move(program));
     auto& program_ = workload.get_programs().at(device_range);
 
     CoreCoord core = {0, 0};
@@ -133,14 +127,14 @@ bool matmul_single_core(
     tt_metal::CircularBufferConfig cb_src0_config =
         tt_metal::CircularBufferConfig(cb0_tiles * single_tile_size, {{src0_cb_index, tt::DataFormat::Float16_b}})
             .set_page_size(src0_cb_index, single_tile_size);
-    auto cb_src0 = tt_metal::CreateCircularBuffer(program_, core, cb_src0_config);
+    tt_metal::CreateCircularBuffer(program_, core, cb_src0_config);
 
     uint32_t src1_cb_index = 1;
     uint32_t cb1_tiles = N * in0_block_w * 2;
     tt_metal::CircularBufferConfig cb_src1_config =
         tt_metal::CircularBufferConfig(cb1_tiles * single_tile_size, {{src1_cb_index, tt::DataFormat::Float16_b}})
             .set_page_size(src1_cb_index, single_tile_size);
-    auto cb_src1 = tt_metal::CreateCircularBuffer(program_, core, cb_src1_config);
+    tt_metal::CreateCircularBuffer(program_, core, cb_src1_config);
 
     uint32_t ouput_cb_index = tt::CBIndex::c_16;
     uint32_t interm0_cb_index = tt::CBIndex::c_24;
@@ -153,7 +147,7 @@ bool matmul_single_core(
         tt_metal::CircularBufferConfig(num_output_tiles * single_tile_size, partials_and_out_data_format_spec)
             .set_page_size(interm0_cb_index, single_tile_size)
             .set_page_size(ouput_cb_index, single_tile_size);
-    auto cb_output = tt_metal::CreateCircularBuffer(program_, cores, cb_output_config);
+    tt_metal::CreateCircularBuffer(program_, cores, cb_output_config);
 
     std::vector<uint32_t> mm_reader_rt_args{
         src0_dram_buffer->address(),
@@ -221,7 +215,7 @@ bool matmul_single_core(
         uint(out_subblock_w),
         uint(out_subblock_num_tiles)};
 
-    auto matmul_kernel = tt_metal::CreateKernel(
+    tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/compute/matmul_large_block_zm.cpp",
         core,
@@ -232,14 +226,14 @@ bool matmul_single_core(
         shape, tt::deprecated::Initialize::RANDOM, 0, 100, std::chrono::system_clock::now().time_since_epoch().count());
     auto activations_tilized = tilize_swizzled(tensor.get_values(), M * 32, K * 32);
     auto activations_tile_layout =
-        convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(activations_tilized));
+        convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(activations_tilized));
     auto activations = pack_bfloat16_vec_into_uint32_vec(activations_tile_layout);
     auto activations_tile_transposed = tt_metal::transpose_tiles(activations, M, K, in0_block_w);
     fixture->WriteBuffer(mesh_device, src0_dram_buffer, activations_tile_transposed);
 
     auto identity = create_identity_matrix(K * 32, N * 32, std::min(K, N) * 32);  // bflaot16 32x32 identity
     auto identity_tilized = tilize_swizzled(identity, K * 32, N * 32);
-    auto weights_tile_layout = convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(identity_tilized));
+    auto weights_tile_layout = convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(identity_tilized));
     auto weights = pack_bfloat16_vec_into_uint32_vec(weights_tile_layout);
     fixture->WriteBuffer(mesh_device, src1_dram_buffer, weights);
 
@@ -255,7 +249,7 @@ bool matmul_single_core(
     fixture->ReadBuffer(mesh_device, dst_dram_buffer, result_vec);
 
     auto result_bfp16 = unpack_uint32_vec_into_bfloat16_vec(result_vec);
-    auto result_flat_layout = convert_layout_tile_nfaces_to_tile_swizzled(tt::stl::make_const_span(result_bfp16));
+    auto result_flat_layout = convert_layout_tile_nfaces_to_tile_swizzled(ttsl::make_const_span(result_bfp16));
     auto result_untilized = untilize_swizzled(result_flat_layout, M * 32, N * 32);
     auto golden = tt_metal::select_columns(tensor.get_values(), M, K, std::min(K, N));
     pass &= test_utils::is_close_vectors<bfloat16>(golden, result_untilized, [&](const bfloat16& a, const bfloat16& b) {
@@ -273,9 +267,9 @@ TEST_F(MeshDispatchFixture, TensixMatmulSingleCoreSmall) {
     int out_subblock_h = 4;
     int out_subblock_w = 4;
 
-    for (unsigned int id = 0; id < devices_.size(); id++) {
+    for (const auto& device : devices_) {
         ASSERT_TRUE(unit_tests_common::matmul::test_matmul_single_core::matmul_single_core(
-            this, devices_.at(id), M, N, K, out_subblock_h, out_subblock_w));
+            this, device, M, N, K, out_subblock_h, out_subblock_w));
     }
 }
 
@@ -289,9 +283,9 @@ TEST_F(MeshDispatchFixture, TensixMatmulSingleCore) {
     uint32_t N = 16;
     int out_subblock_h = 4;
     int out_subblock_w = 2;
-    for (unsigned int id = 0; id < devices_.size(); id++) {
+    for (const auto& device : devices_) {
         ASSERT_TRUE(unit_tests_common::matmul::test_matmul_single_core::matmul_single_core(
-            this, devices_.at(id), M, N, K, out_subblock_h, out_subblock_w));
+            this, device, M, N, K, out_subblock_h, out_subblock_w));
     }
 }
 

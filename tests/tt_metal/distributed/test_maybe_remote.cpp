@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -16,9 +16,6 @@ namespace tt::tt_metal::distributed {
 namespace {
 
 using ::testing::ElementsAre;
-using ::testing::Eq;
-using ::testing::Optional;
-using ::testing::UnorderedElementsAre;
 
 struct TestType {
     int value;

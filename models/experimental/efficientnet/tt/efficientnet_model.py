@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -12,7 +12,7 @@ import torchvision
 from functools import partial
 from loguru import logger
 
-from models.utility_functions import (
+from models.common.utility_functions import (
     torch2tt_tensor,
 )
 from models.experimental.efficientnet.tt.efficientnet_conv import TtEfficientnetConv2dNormActivation

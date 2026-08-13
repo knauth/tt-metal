@@ -1,65 +1,51 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
+#include "experimental/kernel_args.h"
 
 void kernel_main() {
-    uint32_t has_input_grad = get_arg_val<uint32_t>(0);
-    uint32_t has_other_grad = get_arg_val<uint32_t>(1);
-    uint32_t src0_addr = get_arg_val<uint32_t>(2);
-    uint32_t src1_addr = get_arg_val<uint32_t>(3);
-    uint32_t src2_addr = get_arg_val<uint32_t>(4);
-    uint32_t num_tiles = get_arg_val<uint32_t>(5);
-    uint32_t start_id = get_arg_val<uint32_t>(6);
+    uint32_t has_input_grad = get_arg(args::has_input_grad);
+    uint32_t has_other_grad = get_arg(args::has_other_grad);
+    uint32_t num_tiles = get_arg(args::num_tiles);
+    uint32_t start_id = get_arg(args::start_id);
 
-    constexpr bool src0_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr bool src1_is_dram = get_compile_time_arg_val(1) == 1;
-    constexpr bool src2_is_dram = get_compile_time_arg_val(2) == 1;
-
-    constexpr uint32_t cb_id_in0 = 0;
-    constexpr uint32_t cb_id_in1 = 1;
-    constexpr uint32_t cb_id_in2 = 2;
     constexpr uint32_t onetile = 1;
 
-    uint32_t l1_write_addr_in0;
-    uint32_t src0_tile_bytes = get_tile_size(cb_id_in0);
-    DataFormat src0_data_format = get_dataformat(cb_id_in0);
-    const InterleavedAddrGenFast<src0_is_dram> s0 = {
-        .bank_base_address = src0_addr, .page_size = src0_tile_bytes, .data_format = src0_data_format};
-    uint32_t l1_write_addr_in1;
-    uint32_t src1_tile_bytes = get_tile_size(cb_id_in1);
-    DataFormat src1_data_format = get_dataformat(cb_id_in1);
-    const InterleavedAddrGenFast<src1_is_dram> s1 = {
-        .bank_base_address = src1_addr, .page_size = src1_tile_bytes, .data_format = src1_data_format};
+    const auto s0 = TensorAccessor(tensor::s0);
+    const auto s1 = TensorAccessor(tensor::s1);
+    const auto s2 = TensorAccessor(tensor::s2);
 
-    uint32_t l1_write_addr_in2;
-    uint32_t src2_tile_bytes = get_tile_size(cb_id_in2);
-    DataFormat src2_data_format = get_dataformat(cb_id_in2);
-    const InterleavedAddrGenFast<src2_is_dram> s2 = {
-        .bank_base_address = src2_addr, .page_size = src2_tile_bytes, .data_format = src2_data_format};
+    Noc noc;
+    DataflowBuffer dfb_in0(dfb::in0);
+    DataflowBuffer dfb_in1(dfb::in1);
+    DataflowBuffer dfb_in2(dfb::in2);
+    const auto in0_tile_bytes = dfb_in0.get_entry_size();
+    const auto in1_tile_bytes = dfb_in1.get_entry_size();
+    const auto in2_tile_bytes = dfb_in2.get_entry_size();
 
-    cb_reserve_back(cb_id_in0, onetile);
-    l1_write_addr_in0 = get_write_ptr(cb_id_in0);
-    noc_async_read_tile(0, s0, l1_write_addr_in0);
-    noc_async_read_barrier();
-    cb_push_back(cb_id_in0, onetile);
+    dfb_in0.reserve_back(onetile);
+    noc.async_read(s0, dfb_in0, in0_tile_bytes, {.page_id = 0}, {.offset_bytes = 0});
+    noc.async_read_barrier();
+    dfb_in0.push_back(onetile);
 
     for (uint32_t i = start_id; i < start_id + num_tiles; i++) {
         if (has_input_grad) {
-            cb_reserve_back(cb_id_in2, onetile);
-            l1_write_addr_in2 = get_write_ptr(cb_id_in2);
-            noc_async_read_tile(i, s2, l1_write_addr_in2);
-            noc_async_read_barrier();
-            cb_push_back(cb_id_in2, onetile);
+            dfb_in2.reserve_back(onetile);
+            noc.async_read(s2, dfb_in2, in2_tile_bytes, {.page_id = i}, {.offset_bytes = 0});
+            noc.async_read_barrier();
+            dfb_in2.push_back(onetile);
         }
 
         if (has_other_grad) {
-            cb_reserve_back(cb_id_in1, onetile);
-            l1_write_addr_in1 = get_write_ptr(cb_id_in1);
-            noc_async_read_tile(i, s1, l1_write_addr_in1);
-            noc_async_read_barrier();
-            cb_push_back(cb_id_in1, onetile);
+            dfb_in1.reserve_back(onetile);
+            noc.async_read(s1, dfb_in1, in1_tile_bytes, {.page_id = i}, {.offset_bytes = 0});
+            noc.async_read_barrier();
+            dfb_in1.push_back(onetile);
         }
     }
 }

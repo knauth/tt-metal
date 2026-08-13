@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -7,15 +7,14 @@
 #include <random>
 
 #include <tt-metalium/bfloat16.hpp>
-#include <tt-metalium/constants.hpp>
 #include "ttnn/tensor/host_buffer/functions.hpp"
 #include "ttnn/tensor/tensor.hpp"
-#include "ttnn/tensor/tensor_impl.hpp"
 #include <tt-metalium/host_api.hpp>
 #include "ttnn/operations/functions.hpp"
 
 using namespace tt;
 using namespace tt_metal;
+using ttnn::Tensor;
 using namespace constants;
 
 bool test_2d_tensor(distributed::MeshDevice* device) {

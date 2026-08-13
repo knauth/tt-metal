@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -102,16 +102,18 @@ class TtFeedForwardModel:
 
         if tt_cache_path is not None:
             ff1_weight_path = str(
-                f"{tt_cache_path}/" f"{encoder_ff1_str}.weight_{model_config['OP9_FF1_MM_WEIGHTS_DTYPE'].name}.bin"
+                f"{tt_cache_path}/"
+                f"{encoder_ff1_str}.weight_{model_config['OP9_FF1_MM_WEIGHTS_DTYPE'].name}.tensorbin"
             )
             ff1_bias_path = str(
-                f"{tt_cache_path}/" f"{encoder_ff1_str}.bias_{model_config['OP9_FF1_MM_BIAS_DTYPE'].name}.bin"
+                f"{tt_cache_path}/" f"{encoder_ff1_str}.bias_{model_config['OP9_FF1_MM_BIAS_DTYPE'].name}.tensorbin"
             )
             ff2_weight_path = str(
-                f"{tt_cache_path}/" f"{encoder_ff2_str}.weight_{model_config['OP10_FF2_MM_WEIGHTS_DTYPE'].name}.bin"
+                f"{tt_cache_path}/"
+                f"{encoder_ff2_str}.weight_{model_config['OP10_FF2_MM_WEIGHTS_DTYPE'].name}.tensorbin"
             )
             ff2_bias_path = str(
-                f"{tt_cache_path}/" f"{encoder_ff2_str}.bias_{model_config['OP10_FF2_MM_BIAS_DTYPE'].name}.bin"
+                f"{tt_cache_path}/" f"{encoder_ff2_str}.bias_{model_config['OP10_FF2_MM_BIAS_DTYPE'].name}.tensorbin"
             )
 
         def compute_ff1_weight():
@@ -129,7 +131,7 @@ class TtFeedForwardModel:
             )
 
         def compute_ff1_bias():
-            ff1_bias_torch = pad_weight(state_dict[f"{encoder_ff1_str}.bias"])
+            ff1_bias_torch = state_dict[f"{encoder_ff1_str}.bias"].reshape(1, 1, 1, -1)
             return ttnn.from_torch(
                 ff1_bias_torch,
                 dtype=model_config["OP9_FF1_MM_BIAS_DTYPE"],
@@ -151,7 +153,7 @@ class TtFeedForwardModel:
             )
 
         def compute_ff2_bias():
-            ff2_bias_torch = pad_weight(state_dict[f"{encoder_ff2_str}.bias"])
+            ff2_bias_torch = state_dict[f"{encoder_ff2_str}.bias"].reshape(1, 1, 1, -1)
             return ttnn.from_torch(
                 ff2_bias_torch,
                 dtype=model_config["OP10_FF2_MM_BIAS_DTYPE"],
@@ -165,7 +167,7 @@ class TtFeedForwardModel:
             mem_config=model_config["OP9_FF1_MM_WEIGHTS_MEMCFG"],
         )
         encoder0_ff1_bias = load_or_compute_and_cache(
-            ff1_bias_path,
+            None,
             compute_ff1_bias,
             device=device,
             mem_config=model_config["OP9_FF1_MM_BIAS_MEMCFG"],
@@ -177,7 +179,7 @@ class TtFeedForwardModel:
             mem_config=model_config["OP10_FF2_MM_WEIGHTS_MEMCFG"],
         )
         encoder0_ff2_bias = load_or_compute_and_cache(
-            ff2_bias_path,
+            None,
             compute_ff2_bias,
             device=device,
             mem_config=model_config["OP10_FF2_MM_BIAS_MEMCFG"],

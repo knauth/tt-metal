@@ -1,8 +1,7 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include <boost/container/vector.hpp>
 #include <gtest/gtest.h>
 #include <xtensor/containers/xarray.hpp>
 #include <xtensor/generators/xbuilder.hpp>
@@ -22,7 +21,6 @@
 #include <tt-metalium/shape.hpp>
 #include <tt_stl/span.hpp>
 #include "ttnn/operations/functions.hpp"
-#include "ttnn/tensor/enum_types.hpp"
 #include "ttnn/tensor/layout/tensor_layout.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 #include "ttnn/tensor/tensor.hpp"
@@ -34,14 +32,14 @@ namespace {
 
 using ::testing::ElementsAre;
 using ::testing::Eq;
-using ::ttnn::experimental::xtensor::from_xtensor;
-using ::ttnn::experimental::xtensor::get_shape_from_xarray;
-using ::ttnn::experimental::xtensor::span_to_xtensor_view;
-using ::ttnn::experimental::xtensor::to_xtensor;
-using ::ttnn::experimental::xtensor::xtensor_to_span;
+using ttnn::experimental::xtensor::from_xtensor;
+using ttnn::experimental::xtensor::get_shape_from_xarray;
+using ttnn::experimental::xtensor::span_to_xtensor_view;
+using ttnn::experimental::xtensor::to_xtensor;
+using ttnn::experimental::xtensor::xtensor_to_span;
 
-TensorSpec get_tensor_spec(const ttnn::Shape& shape) {
-    return TensorSpec(
+tt::tt_metal::TensorSpec get_tensor_spec(const ttnn::Shape& shape) {
+    return tt::tt_metal::TensorSpec(
         shape, TensorLayout(tt::tt_metal::DataType::FLOAT32, tt::tt_metal::Layout::ROW_MAJOR, MemoryConfig{}));
 }
 

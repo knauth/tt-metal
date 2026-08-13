@@ -1,17 +1,56 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 import re
 from enum import Enum
-from typing import Optional
+from types import SimpleNamespace
+from typing import List, Optional, Union
 
 import torch
 from loguru import logger
+from PIL import Image as PIL_Image
 from pydantic import AliasChoices, BaseModel, Field
 
 import ttnn
+from models.common.tensor_utils import get_rot_transformation_mat as get_rot_transformation_mat_v2
+
+
+class URL(BaseModel):
+    uri: str
+
+    def __str__(self) -> str:
+        return self.uri
+
+
+class ImageMedia(BaseModel):
+    image: Union[PIL_Image.Image, URL]
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class Role(Enum):
+    system = "system"
+    user = "user"
+    assistant = "assistant"
+    ipython = "ipython"
+
+
+InterleavedTextMedia = Union[
+    str,
+    # Specific modalities can be placed here, but not generic attachments
+    # since models don't consume them in a generic way
+    ImageMedia,
+    List[Union[str, ImageMedia]],
+]
+
+
+class Mode(Enum):
+    DECODE = "decode"
+    PREFILL = "prefill"
 
 
 class HostEmbedding(torch.nn.Module):
@@ -42,10 +81,11 @@ class PagedAttentionConfig:
 class RopeScalingType(str, Enum):
     """Types of RoPE scaling."""
 
-    LINEAR = "linear"
     # DYNAMIC = "dynamic"
+    LINEAR = "linear"
     YARN = "yarn"
     LLAMA3 = "llama3"
+    PHI3 = "longrope"
     DEFAULT = "default"
 
 
@@ -55,7 +95,7 @@ class RopeScaling(BaseModel):
     rope_type: RopeScalingType = Field(
         validation_alias=AliasChoices("rope_type", "type"), exclude=True, description="RoPE scaling type"
     )
-    factor: float
+    factor: Optional[float] = None
     original_max_position_embeddings: Optional[int] = None
 
 
@@ -75,13 +115,24 @@ class RopeScalingYarn(RopeScaling):
     """RoPE scaling configuration for Yarn."""
 
     # Yarn-specific parameters
-    beta_fast: Optional[int] = 32
-    beta_slow: Optional[int] = 1
+    beta_fast: Optional[float] = 32.0
+    beta_slow: Optional[float] = 1.0
     mscale: Optional[float] = 1.0
     mscale_all_dim: Optional[float] = 0.0
+    truncate: Optional[bool] = True  # Whether to truncate the correction range (floor/ceil)
 
 
-def rope_scaling_model_factory(rope_scaling_params: dict) -> RopeScaling:
+class RopeScalingPhi3(RopeScaling):
+    """RoPE scaling configuration for Phi3."""
+
+    # Phi3-specific parameters
+    long_factor: Optional[list]
+    short_factor: Optional[list]
+
+
+def rope_scaling_model_factory(
+    rope_scaling_params: dict, original_max_context_len: Optional[int] = None
+) -> RopeScaling:
     rope_scaling_type = rope_scaling_params.get("rope_type") or rope_scaling_params.get("type")
     if rope_scaling_type == RopeScalingType.LINEAR:
         return RopeScalingLinear(**rope_scaling_params)
@@ -89,6 +140,14 @@ def rope_scaling_model_factory(rope_scaling_params: dict) -> RopeScaling:
         return RopeScalingLlama3(**rope_scaling_params)
     elif rope_scaling_type == RopeScalingType.YARN:
         return RopeScalingYarn(**rope_scaling_params)
+    elif rope_scaling_type == RopeScalingType.PHI3:
+        # transformers 5.x includes original_max_position_embeddings in the rope dict,
+        # which collides with the explicit kwarg; merge so the caller value wins and the
+        # key is only passed once.
+        phi3_params = dict(rope_scaling_params)
+        if original_max_context_len is not None:
+            phi3_params["original_max_position_embeddings"] = original_max_context_len
+        return RopeScalingPhi3(**phi3_params)
     elif rope_scaling_type in ["default", "mrope"]:
         logger.warning(
             f"Rope scaling type was set to {rope_scaling_type}, defaulting to no rope scaling as this rope type is not supported yet by TTT"
@@ -96,6 +155,69 @@ def rope_scaling_model_factory(rope_scaling_params: dict) -> RopeScaling:
         return None
     else:
         raise ValueError(f"Unexpected RoPE scaling type: {rope_scaling_type}")
+
+
+# transformers 5.x consolidated the RoPE config: the top-level `rope_theta` /
+# `rope_local_base_freq` / `rope_scaling` keys were replaced by a single nested
+# `rope_parameters` dict (flat for Qwen/Llama; per-attention-type sub-dicts —
+# `full_attention` / `sliding_attention` — for Gemma-style models). The helpers
+# below read from either layout so configs from transformers <5 and >=5 work.
+def get_rope_theta(config: dict, default=None):
+    """RoPE base period (global / full-attention)."""
+    if config.get("rope_theta") is not None:
+        return config["rope_theta"]
+    rope_parameters = config.get("rope_parameters") or {}
+    if rope_parameters.get("rope_theta") is not None:  # flat (Qwen/Llama)
+        return rope_parameters["rope_theta"]
+    return (rope_parameters.get("full_attention") or {}).get("rope_theta", default)  # Gemma-style
+
+
+def get_rope_local_base_freq(config: dict, default=None):
+    """Gemma sliding-window local RoPE base (was top-level `rope_local_base_freq`)."""
+    if config.get("rope_local_base_freq") is not None:
+        return config["rope_local_base_freq"]
+    rope_parameters = config.get("rope_parameters") or {}
+    return (rope_parameters.get("sliding_attention") or {}).get("rope_theta", default)
+
+
+def get_rope_scaling(config: dict):
+    """RoPE scaling params (factor, original_max_position_embeddings, rope_type, ...).
+
+    transformers <5 put these under `rope_scaling`; >=5 merges them into
+    `rope_parameters` (flat, or `full_attention` for Gemma-style). Returns the
+    holding dict, or None when no non-default scaling is configured.
+    """
+    rope_scaling = config.get("rope_scaling")
+    if rope_scaling:
+        return rope_scaling
+    rope_parameters = config.get("rope_parameters") or {}
+    if "full_attention" in rope_parameters:  # Gemma-style nesting
+        rope_parameters = rope_parameters.get("full_attention") or {}
+    # Only a non-default rope_type carries scaling (factor, etc.).
+    if rope_parameters.get("rope_type") not in (None, "default"):
+        return rope_parameters
+    return None
+
+
+# Minimal addition for Mistral vision support
+def position_ids_in_meshgrid_tt(tt_patch_embeds_list, max_width, device):
+    position_ids_tt = []
+    for tt_patch in tt_patch_embeds_list:
+        shape = tt_patch.shape
+        height, width = shape[-2], shape[-1]
+        mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+        h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)
+        ids = h_grid * max_width + v_grid
+
+        tt_ids = ttnn.from_torch(
+            ids,
+            device=device,
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        position_ids_tt.append(tt_ids[:, 0])
+    return ttnn.concat(position_ids_tt, dim=0)
 
 
 def encode_prompt_instruct(tokenizer, prompt_text, system_prompt_text=None):
@@ -133,12 +255,15 @@ def preprocess_inputs_prefill(
     # To avoid going out of memory, clip the max prefill length by the maximum number of tokens that will be generated
 
     for m_args in model_args:
-        if max_prefill_len >= m_args.max_context_len:
-            max_prefill_len -= max_generated_tokens
-            # all model_args should have the same max_context_len as
-            # it's assumed that all models are the same. break out of the loop once we find the first one
-            # with the max_prefill_len >= max_context_len
-            break
+        assert (
+            max_prefill_len <= m_args.max_context_len
+        ), f"max_prefill_len {max_prefill_len} cannot exceed max_context_len {m_args.max_context_len}"
+
+    # we need to make room for the generated tokens in the total token budget
+    max_prefill_len -= max_generated_tokens
+    assert (
+        max_prefill_len > 0
+    ), f"max_prefill_len ({max_prefill_len + max_generated_tokens}) must be greater than max_generated_tokens ({max_generated_tokens})"
 
     encoded_prompts = [
         model_args[idx % len(model_args)].encode_prompt(prompt, instruct=instruct)
@@ -181,9 +306,24 @@ def preprocess_inputs_prefill(
                 model_args[idx % len(model_args)].encode_prompt(prompt, instruct=instruct)
                 for idx, prompt in enumerate(shortened)
             ]
+            # Instruct re-tokenization can drift by a few tokens vs the overhead
+            # estimate (seen on Gemma4-26B-A4B: 65337 vs 65336). Re-trim / accept
+            # slightly-short prompts rather than hard-failing the demo.
+            trimmed = []
+            for e in encoded_prompts:
+                if len(e) > max_prefill_len:
+                    e = e[-max_prefill_len:]
+                trimmed.append(e)
+            encoded_prompts = trimmed
+            lens = [len(e) for e in encoded_prompts]
             assert all(
-                len(e) == max_prefill_len for e in encoded_prompts
-            ), f"Clipped prompts are not of the correct length, expected {max_prefill_len} but got {[len(e) for e in encoded_prompts]}"
+                0 < n <= max_prefill_len for n in lens
+            ), f"Clipped prompts are not of the correct length, expected <= {max_prefill_len} but got {lens}"
+            if any(n != max_prefill_len for n in lens):
+                logger.warning(
+                    f"Instruct re-clip lengths {lens} != target {max_prefill_len}; "
+                    f"continuing with trimmed/short prompts"
+                )
         else:
             encoded_prompts = [encod[-max_prefill_len:] for encod in encoded_prompts]
 
@@ -223,19 +363,47 @@ def preprocess_inputs_prefill(
     )
 
 
+def _chat_template_ids(encoded):
+    """Normalize apply_chat_template(tokenize=True) output to a flat List[int].
+
+    transformers <5 returned a plain List[int]; transformers 5.x defaults
+    apply_chat_template to ``return_dict=True`` and returns a ``BatchEncoding``
+    (a ``UserDict`` — NOT a ``dict`` subclass, so ``isinstance(x, dict)`` is
+    False), or a `tokenizers.Encoding` (exposes ``.ids``). Iterating a
+    ``BatchEncoding``/``UserDict`` yields its *keys* ("input_ids", ...), so we
+    must extract ``input_ids`` via mapping membership rather than ``isinstance``.
+    """
+    # dict / BatchEncoding / UserDict — use mapping membership, since BatchEncoding
+    # is a UserDict and fails isinstance(x, dict).
+    if hasattr(encoded, "keys") and "input_ids" in encoded:
+        encoded = encoded["input_ids"]
+    if hasattr(encoded, "ids"):  # tokenizers.Encoding
+        return list(encoded.ids)
+    if hasattr(encoded, "tolist"):  # torch tensor / np array
+        encoded = encoded.tolist()
+    # apply_chat_template(return_dict=True) on a single conversation can nest the
+    # ids in a 1-element batch dim ([[ids]]); unwrap it.
+    if isinstance(encoded, (list, tuple)) and len(encoded) == 1 and isinstance(encoded[0], (list, tuple)):
+        encoded = encoded[0]
+    return list(encoded)  # already a List[int]
+
+
 def encode_prompt_hf(tokenizer, prompt_text, system_prompt_text=None):
     """See https://huggingface.co/docs/transformers/main/en/chat_templating"""
     chat = []
-    if system_prompt_text:
-        chat.append({"role": "system", "content": system_prompt_text})
-    if prompt_text:
-        chat.append({"role": "user", "content": prompt_text})
-    return tokenizer.apply_chat_template(chat, tokenize=True, add_generation_prompt=True)
+    if isinstance(prompt_text, str):
+        if system_prompt_text:
+            chat.append({"role": "system", "content": system_prompt_text})
+        if prompt_text:
+            chat.append({"role": "user", "content": prompt_text})
+        encoded = tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=True)
+    else:
+        encoded = tokenizer.apply_chat_template(prompt_text, add_generation_prompt=True, tokenize=True)
+    return _chat_template_ids(encoded)
 
 
-def apply_scaling(freqs: torch.Tensor, scale_factor: float, orig_context_len: int):
-    # FIXME: Llama-3.x specific scaling - we need to support yarn for Qwen2.5 models
-    # Values obtained from grid search
+def compute_llama3_parameters(freqs: torch.Tensor, scale_factor: float, orig_context_len: int):
+    """Llama-3.x specific scaling for rotary embeddings."""
     low_freq_factor = 1
     high_freq_factor = 4
 
@@ -255,7 +423,70 @@ def apply_scaling(freqs: torch.Tensor, scale_factor: float, orig_context_len: in
     return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
 
-def precompute_freqs(dim: int, end: int, theta, scale_factor, orig_context_len):
+def compute_linear_parameters(freqs: torch.Tensor, scale_factor: float, orig_context_len: int):
+    """Linear scaling for rotary embeddings."""
+    freqs /= scale_factor
+    return freqs
+
+
+def compute_default_parameters(freqs: torch.Tensor, scale_factor: float, orig_context_len: int):
+    """Default scaling for rotary embeddings."""
+    return freqs
+
+
+def apply_scaling(freqs: torch.Tensor, scale_factor: float, orig_context_len: int, rope_type="llama3"):
+    # FIXME: Llama-3.x specific scaling - we need to support yarn for Qwen2.5 models
+
+    if rope_type == "default":
+        freqs = compute_default_parameters(freqs, scale_factor, orig_context_len)
+    elif rope_type == "linear":
+        freqs = compute_linear_parameters(freqs, scale_factor, orig_context_len)
+    elif rope_type == "llama3":
+        freqs = compute_llama3_parameters(freqs, scale_factor, orig_context_len)
+
+    return freqs
+
+
+# Minimal addition for Mistral vision RoPE support
+def apply_scaling_vision(freqs: torch.Tensor, scale_factor: float, orig_context_len: int):
+    return freqs / scale_factor
+
+
+# Minimal addition for Mistral vision RoPE support
+def precompute_mistral_vision_freqs(
+    dim: int, max_patches_per_side: int, theta: float, scale_factor=None, orig_context_len=None
+):
+    # Compute base frequencies
+    base_freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    if scale_factor is not None:
+        base_freqs = apply_scaling_vision(base_freqs, scale_factor, orig_context_len)
+
+    # Get height and width indices
+    h_idx = torch.arange(max_patches_per_side)
+    w_idx = torch.arange(max_patches_per_side)
+
+    # Compute 2D frequency matrices
+    freqs_h = torch.outer(h_idx, base_freqs[::2])
+    freqs_w = torch.outer(w_idx, base_freqs[1::2])
+
+    # Broadcast + merge
+    inv_freq = torch.cat(
+        [
+            freqs_h[:, None, :].repeat(1, max_patches_per_side, 1),
+            freqs_w[None, :, :].repeat(max_patches_per_side, 1, 1),
+        ],
+        dim=-1,
+    ).reshape(
+        -1, dim // 2
+    )  # Shape: [H*W, dim//2]
+
+    full_freqs = torch.cat([inv_freq, inv_freq], dim=-1)
+    cos = full_freqs.cos()
+    sin = full_freqs.sin()
+    return cos, sin  # Shape: [H*W, dim]
+
+
+def precompute_freqs(dim: int, end: int, theta, scale_factor, orig_context_len, rope_type="llama3"):
     """
     Precompute the frequency tensor for sine and cosine values with given dimensions.
 
@@ -270,7 +501,7 @@ def precompute_freqs(dim: int, end: int, theta, scale_factor, orig_context_len):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end)
     if scale_factor is not None:
-        freqs = apply_scaling(freqs, scale_factor, orig_context_len)
+        freqs = apply_scaling(freqs, scale_factor, orig_context_len, rope_type=rope_type)
     freqs = torch.outer(t, freqs).float()
     return torch.cos(freqs), torch.sin(freqs)
 
@@ -328,13 +559,11 @@ def get_prefill_rot_mat(head_dim, mesh_device, seq_len, theta, scale_factor, ori
 
 
 #  Add-Multiply method of rotary embeddings for prefill
-def get_rot_transformation_mat(dhead):
+def get_rot_transformation_mat(dhead=32):
     # ROPE op uses a single tile
     dhead = 32
-    rot_emb_matrix = torch.zeros(1, 1, dhead, dhead)
-    rot_emb_matrix[..., torch.arange(0, dhead, 2), torch.arange(1, dhead, 2)] = 1
-    rot_emb_matrix[..., torch.arange(1, dhead, 2), torch.arange(0, dhead, 2)] = -1
-    return rot_emb_matrix
+    # Delegate to TTTv2 implementation for consistency
+    return get_rot_transformation_mat_v2(dhead)
 
 
 def get_single_rot_mat(
@@ -349,7 +578,7 @@ def get_single_rot_mat(
 ):
     freqs_unscaled = 1.0 / (theta ** (torch.arange(0, dhead, 2)[: (dhead // 2)].float() / dhead))
     if scale_factor is not None:
-        freqs = apply_scaling(freqs_unscaled, scale_factor, orig_context_len)
+        freqs = apply_scaling(freqs_unscaled, scale_factor, orig_context_len, rope_type="llama3")
     rot_matrix = torch.zeros(dhead, dhead)
     # [INFO] freqs_unscaled and freqs are forced to float dtype above and it should be converted back to match dtype of rot_matrix
     sin_freqs, cos_freqs = torch.sin(freqs).to(rot_matrix.dtype), torch.cos(freqs).to(rot_matrix.dtype)
@@ -362,7 +591,7 @@ def get_single_rot_mat(
     # Support for start_pos different than 0
     freqs = start_pos * freqs_unscaled
     if scale_factor is not None:
-        freqs = apply_scaling(freqs, scale_factor, orig_context_len)
+        freqs = apply_scaling(freqs, scale_factor, orig_context_len, rope_type="llama3")
     current_rot_mat = torch.zeros(dhead, dhead)
     # [INFO] freqs_unscaled and freqs are forced to float dtype above and it should be converted back to match dtype of current_rot_mat
     sin_freqs, cos_freqs = torch.sin(freqs).to(current_rot_mat.dtype), torch.cos(freqs).to(current_rot_mat.dtype)
@@ -401,7 +630,12 @@ def num_to_core_range_set(x):
     )
 
 
-def copy_host_to_device(host_tensors, device_tensors=None, mesh_device=None):
+def copy_host_to_device(
+    host_tensors,
+    device_tensors=None,
+    mesh_device=None,
+    shard_specs=None,
+):
     """
     Helper function which copies host tensors to device tensors.
     If no device_tensors are provided, it creates new device tensors and returns them.
@@ -410,7 +644,10 @@ def copy_host_to_device(host_tensors, device_tensors=None, mesh_device=None):
         assert mesh_device is not None, "mesh_device is required when device_tensors is None"
         ret = []
         for i in range(len(host_tensors)):
-            on_device = ttnn.to_device(host_tensors[i], device=mesh_device) if host_tensors[i] else None
+            if shard_specs and shard_specs[i] is not None:
+                on_device = host_tensors[i].to(mesh_device, shard_specs[i]) if host_tensors[i] else None
+            else:
+                on_device = ttnn.to_device(host_tensors[i], device=mesh_device) if host_tensors[i] else None
             ret.append(on_device)
         return ret
     else:
@@ -492,16 +729,44 @@ def sample_host(tt_input, temperature=0.6, top_p=0.08, on_host=True):
 
 def get_padded_prefill_len(seq_len: int) -> int:
     """
-    If seq_len is less than 128, pad to 128
-    If seq_len is more than 128, pad to whichever is smaller: a power of 2 or a multiple of 2048
-    TODO: Generalize for max_mm_seq_len different from 2048
+    Get the padded prefill length for a given sequence length.
+    This is used to pad the sequence length to the nearest power of 2.
     """
+    # TODO: https://github.com/tenstorrent/tt-metal/issues/34117
     if seq_len <= 128:
         return 128
-    pow_2_pad = nearest_pow_2(seq_len)
-    mult_2048_pad = 2048 * math.ceil(seq_len / 2048)
-    min_extended_pad = min(pow_2_pad, mult_2048_pad)
-    return min_extended_pad
+    if seq_len <= 1024:
+        return 1024
+    else:
+        # return next power of 2 greater than seq_len
+        return 2 ** (seq_len - 1).bit_length()
+
+
+def get_all_padded_prefill_lengths(max_len):
+    lengths = [128]
+    k = 0
+    while (v := (1 << k) * 1024) <= max_len:
+        lengths.append(v)
+        k += 1
+    return lengths
+
+
+def calculate_prefill_warmup_seq_lens(max_seq_len_to_warmup, trace_supported_seq_lens):
+    to_warmup_seq_lens = get_all_padded_prefill_lengths(max_seq_len_to_warmup)
+    for trace_supported_seq_len in trace_supported_seq_lens:
+        if trace_supported_seq_len not in to_warmup_seq_lens:
+            to_warmup_seq_lens.append(trace_supported_seq_len)
+    to_warmup_seq_lens.sort()
+
+    return to_warmup_seq_lens
+
+
+def cap_seq_lens_to_max_prefill_chunk_size(seq_lens, cap):
+    for seq_len in seq_lens:
+        if seq_len > cap:
+            seq_lens = seq_lens[: seq_lens.index(seq_len)]
+            break
+    return seq_lens
 
 
 def get_block_size(kv_cache):
@@ -565,7 +830,7 @@ def pad_to_size(x: torch.Tensor, dim: int, size: int) -> torch.Tensor:
     if dim < 0:
         dim = x.dim() + dim
     assert isinstance(x, torch.Tensor), "Input must be a torch.Tensor"
-    assert -x.dim() <= dim < x.dim(), f"Dimension {dim} out of range (expected between {-x.dim()} and {x.dim()-1})"
+    assert -x.dim() <= dim < x.dim(), f"Dimension {dim} out of range (expected between {-x.dim()} and {x.dim() - 1})"
     dim = x.dim() + dim if dim < 0 else dim
 
     current_size = x.size(dim)
@@ -586,9 +851,42 @@ def pad_to_size(x: torch.Tensor, dim: int, size: int) -> torch.Tensor:
 
 
 def get_base_model_name(model_name: str) -> str:
+    # Explicitly handle phi-4 which doesn't follow the <Size>B format
+    if "phi-4" in model_name.lower():
+        return "Phi-4"
     # Remove the suffix after B- (case insensitive), e.g. "Llama-3.1-70B-Instruct" -> "Llama-3.1-70B"
     match = re.search(r"(.*?\d+[bB])-", model_name)
     return match.group(1) if match else model_name
+
+
+def get_hf_model_name(model_path: str) -> str:
+    # HF model name
+    if model_path.count("/") == 1:
+        return model_path
+
+    # HF cache path
+    pattern = r".*/?models--(?P<model_provider>[^/]+?)--(?P<model_name>[^/]+)/?"
+    match = pattern.search(pattern, model_path)
+    if match:
+        model_provider = match.group("model_provider")
+        model_name = match.group("model_name")
+        return f"{model_provider}/{model_name}"
+    raise ValueError(
+        f"Unsupported '{model_path}', please use HF model name or follow HF format with 'models--<model_provider>--<model_name>'"
+    )
+
+
+def get_hf_tt_cache_path(model_path: str) -> str:
+    tt_cache_home = os.getenv("TT_CACHE_HOME", "/mnt/MLPerf/huggingface/tt_cache/")
+    if not os.path.exists(tt_cache_home):
+        tt_cache_home = "model_cache"
+
+    model_name = get_hf_model_name(model_path)
+    tt_cache_path = os.path.join(tt_cache_home, model_name)
+    if not os.path.exists(tt_cache_path):
+        os.makedirs(tt_cache_path, exist_ok=True)
+
+    return tt_cache_path
 
 
 def create_tt_model(
@@ -601,9 +899,15 @@ def create_tt_model(
     dtype=ttnn.bfloat8_b,
     state_dict=None,
     num_layers=None,
+    use_prefetcher=False,
+    use_hf_rope=False,
 ):
     from models.tt_transformers.tt.model import Transformer
     from models.tt_transformers.tt.model_config import ModelArgs
+    from models.tt_transformers.tt.prefetcher import Prefetcher
+
+    num_tensors = 5 if use_prefetcher else 0
+    prefetcher = Prefetcher(mesh_device, num_tensors, num_layers) if use_prefetcher else None
 
     tt_model_args = ModelArgs(
         mesh_device,
@@ -611,9 +915,15 @@ def create_tt_model(
         max_batch_size=max_batch_size,
         optimizations=optimizations,
         max_seq_len=max_seq_len,
+        prefetcher=prefetcher,
+        use_hf_rope=use_hf_rope,
     )
+
     if num_layers is not None:
         tt_model_args.n_layers = num_layers
+
+    if prefetcher is not None:
+        prefetcher.num_layers = tt_model_args.n_layers
 
     # Avoid loading state_dict for every DP model
     if not state_dict:
@@ -626,8 +936,105 @@ def create_tt_model(
         state_dict=state_dict,
         weight_cache_path=tt_model_args.weight_cache_path(dtype),
         paged_attention_config=paged_attention_config,
+        prefetcher=prefetcher,
     )
 
     tt_kv_cache = [l.attention.layer_past for l in model.layers] if paged_attention_config else None
 
     return tt_model_args, model, tt_kv_cache, state_dict
+
+
+def hf_multimodal_encode(messages, processor):
+    hf_messages = []
+
+    for msg in messages:
+        hf_content = []
+
+        for item in msg.content:
+            if isinstance(item, ImageMedia):
+                hf_content.append(
+                    {
+                        "type": "image",
+                        "image": item.image,
+                    }
+                )
+            elif isinstance(item, str):
+                hf_content.append(
+                    {
+                        "type": "text",
+                        "text": item,
+                    }
+                )
+
+        hf_messages.append(
+            {
+                "role": msg.role,
+                "content": hf_content,
+            }
+        )
+
+    encoded = processor.apply_chat_template(
+        hf_messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+    ).to("cpu", dtype=torch.bfloat16)
+
+    return SimpleNamespace(
+        **encoded,
+        tokens=encoded["input_ids"].squeeze(0),
+        vision=SimpleNamespace(
+            images=encoded.get("pixel_values", None),
+            mask=None,
+        ),
+    )
+
+
+def get_decode_mask(args, mesh_device, paged_attention_config=None):
+    """Function to create a decoding mask for the attention mechanism."""
+    if paged_attention_config is not None:
+        max_seq_len = (paged_attention_config.max_num_blocks * paged_attention_config.block_size) // args.max_batch_size
+    else:
+        max_seq_len = args.max_seq_len
+    mask = torch.triu(
+        torch.full(
+            (args.max_batch_size, args.n_heads // mesh_device.shape[1], max_seq_len, max_seq_len),
+            -float("inf"),
+            dtype=torch.bfloat16,
+        ),
+        diagonal=1,
+    )
+    if args.sliding_window > 0:
+        mask += torch.tril(
+            torch.full(
+                (args.max_batch_size, args.n_heads // mesh_device.shape[1], max_seq_len, max_seq_len),
+                -float("inf"),
+                dtype=torch.bfloat16,
+            ),
+            diagonal=-args.sliding_window,
+        )
+
+    return mask
+
+
+def build_encoder_attention_mask(
+    x: torch.Tensor,
+    ar: torch.Tensor,
+    ntok: int,
+    num_chunks: int,
+    n_heads: int,
+):
+    """
+    Build vision encoder attention mask that omits padding tokens.
+    """
+
+    def get_negative_inf_value(dtype):
+        return torch.finfo(dtype).min
+
+    masks = []
+    for arx in ar:
+        mask_i = torch.ones((num_chunks, x.shape[2], 1), dtype=x.dtype)
+        mask_i[: arx[0] * arx[1], :ntok] = 0
+        mask_i = mask_i.view(num_chunks * x.shape[2], -1)
+        mask_i = mask_i @ mask_i.T * get_negative_inf_value(x.dtype)
+        mask_i = mask_i.unsqueeze(0)
+        masks.append(mask_i)
+    masks = torch.stack(masks).to(x.device).expand(-1, n_heads, -1, -1)
+    return masks

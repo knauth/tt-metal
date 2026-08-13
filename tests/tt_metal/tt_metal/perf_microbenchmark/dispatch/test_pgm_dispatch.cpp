@@ -1,12 +1,11 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <benchmark/benchmark.h>
 #include <chrono>
 #include <fmt/base.h>
-#include <stdint.h>
-#include <tt-metalium/command_queue.hpp>
+#include <cstdint>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/hal.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -27,23 +26,25 @@
 
 #include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/dispatch_core_common.hpp>
 #include <tt-metalium/distributed.hpp>
 #include "hostdevcommon/common_values.hpp"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include <tt-metalium/program.hpp>
 #include "impl/context/metal_context.hpp"
-#include <tt-metalium/semaphore.hpp>
+#include "impl/buffers/semaphore.hpp"
+#include "impl/kernels/kernel.hpp"
 #include <tt_stl/span.hpp>
 #include "test_common.hpp"
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include "tt_metal/tt_metal/perf_microbenchmark/common/util.hpp"
-#include "umd/device/types/xy_pair.h"
+#include <umd/device/types/xy_pair.hpp>
 #include <tt-metalium/math.hpp>
 #include "tt_metal/impl/dispatch/device_command.hpp"
 #include <tt-metalium/sub_device.hpp>
+#include <impl/dispatch/dispatch_mem_map.hpp>
+#include <distributed/mesh_device_impl.hpp>
 
 constexpr uint32_t DEFAULT_ITERATIONS = 10000;
 constexpr uint32_t DEFAULT_WARMUP_ITERATIONS = 100;
@@ -62,6 +63,8 @@ using namespace tt;
 using namespace tt::tt_metal::distributed;
 
 static bool dump_test_info = false;
+
+static bool slow_dispatch_enabled() { return std::getenv("TT_METAL_SLOW_DISPATCH_MODE") != nullptr; }
 
 struct TestInfo {
     uint32_t iterations = DEFAULT_ITERATIONS;
@@ -93,20 +96,21 @@ struct TestInfo {
     bool use_left_cores{false};
 };
 
+// Returns the address of the last core in the last column of the mesh. Picks a configuration that works with worst-case
+// harvesting, for consistency.
 std::tuple<uint32_t, uint32_t> get_core_count() {
     uint32_t core_x = 0;
     uint32_t core_y = 0;
 
     std::string arch_name = tt::tt_metal::hal::get_arch_name();
-    if (arch_name == "grayskull") {
-        core_x = 11;
-        core_y = 8;
-    } else if (arch_name == "wormhole_b0") {
+    if (arch_name == "wormhole_b0") {
+        // Three rows harvested.
         core_x = 7;
         core_y = 6;
     } else if (arch_name == "blackhole") {
-        core_x = 12;
-        core_y = 9;
+        // Two columns harvested, plus a row and column used for dispatch cores.
+        core_x = 10;
+        core_y = 8;
     } else {
         log_fatal(tt::LogTest, "Unexpected ARCH_NAME {}", arch_name);
         exit(0);
@@ -227,7 +231,7 @@ void init(const std::vector<std::string>& input_args, TestInfo& info) {
 
 void set_runtime_args(
     tt_metal::Program& program, tt_metal::KernelHandle kernel_id, vector<uint32_t>& args, const CoreRangeSet& kgset) {
-    for (auto& kg : kgset.ranges()) {
+    for (const auto& kg : kgset.ranges()) {
         for (int core_idx_y = kg.start_coord.y; core_idx_y <= kg.end_coord.y; core_idx_y++) {
             for (int core_idx_x = kg.start_coord.x; core_idx_x <= kg.end_coord.x; core_idx_x++) {
                 CoreCoord core = {(std::size_t)core_idx_x, (std::size_t)core_idx_y};
@@ -282,7 +286,10 @@ uint32_t get_num_kernels(const TestInfo& info) {
 }
 
 bool initialize_program(
-    const TestInfo& info, std::shared_ptr<MeshDevice> mesh_device, tt_metal::Program& program, uint32_t run_cycles) {
+    const TestInfo& info,
+    const std::shared_ptr<MeshDevice>& mesh_device,
+    tt_metal::Program& program,
+    uint32_t run_cycles) {
     program = tt_metal::CreateProgram();
 
     std::map<std::string, std::string> defines = {{"KERNEL_BYTES", std::to_string(info.kernel_size)}};
@@ -308,7 +315,7 @@ bool initialize_program(
         for (int j = 0; j < info.n_cbs; j++) {
             tt_metal::CircularBufferConfig cb_config =
                 tt_metal::CircularBufferConfig(16, {{j, tt::DataFormat::Float16_b}}).set_page_size(j, 16);
-            auto cb = tt_metal::CreateCircularBuffer(program, cbg, cb_config);
+            tt_metal::CreateCircularBuffer(program, cbg, cb_config);
         }
         cbg.start_coord = {cbg.end_coord.x + 1, cbg.end_coord.y};
         cbg.end_coord = cbg.start_coord;
@@ -366,7 +373,7 @@ bool initialize_program(
     }
 
     if (info.erisc_enabled) {
-        auto erisc_cores = mesh_device->get_device(0, 0)->get_active_ethernet_cores(true);
+        auto erisc_cores = mesh_device->impl().get_device(0, 0)->get_active_ethernet_cores(true);
         if (info.erisc_count > erisc_cores.size()) {
             log_fatal(
                 tt::LogTest,
@@ -407,7 +414,7 @@ struct ProgramExecutor {
     uint32_t total_program_iterations;
 
     ProgramExecutor(std::function<void()> exec, std::function<void()> warm, uint32_t total_iters) :
-        execute_programs(exec), warmup_programs(warm), total_program_iterations(total_iters) {}
+        execute_programs(std::move(exec)), warmup_programs(std::move(warm)), total_program_iterations(total_iters) {}
 };
 
 // Helper function to create program executor for standard test
@@ -419,8 +426,8 @@ ProgramExecutor create_standard_executor(
     // Create mesh workloads
     mesh_workloads.resize(programs.size());
     for (auto i = 0; i < programs.size(); i++) {
-        AddProgramToMeshWorkload(
-            mesh_workloads[i], std::move(programs[i]), MeshCoordinateRange(MeshCoordinate(0, 0), MeshCoordinate(0, 0)));
+        mesh_workloads[i].add_program(
+            MeshCoordinateRange(MeshCoordinate(0, 0), MeshCoordinate(0, 0)), std::move(programs[i]));
     }
     std::function warmup_func{[&info, &mesh_cq, &mesh_workloads]() {
         for (int i = 0; i < info.warmup_iterations; i++) {
@@ -452,8 +459,8 @@ ProgramExecutor create_load_prefetcher_executor(
     // Create mesh workload
     mesh_workloads.resize(programs.size());
     for (auto i = 0; i < programs.size(); i++) {
-        AddProgramToMeshWorkload(
-            mesh_workloads[i], std::move(programs[i]), MeshCoordinateRange(MeshCoordinate(0, 0), MeshCoordinate(0, 0)));
+        mesh_workloads[i].add_program(
+            MeshCoordinateRange(MeshCoordinate(0, 0), MeshCoordinate(0, 0)), std::move(programs[i]));
     }
 
     std::function warmup_func{[&info, &mesh_cq, &mesh_workloads]() {
@@ -478,13 +485,13 @@ ProgramExecutor create_load_prefetcher_executor(
 // Helper function to setup trace if enabled
 template <typename T>
 MeshTraceId setup_trace_if_enabled(
-    const TestInfo& info, std::shared_ptr<MeshDevice> mesh_device, ProgramExecutor& executor) {
+    const TestInfo& info, const std::shared_ptr<MeshDevice>& mesh_device, ProgramExecutor& executor) {
     MeshTraceId tid;
     if (info.use_trace) {
         const std::size_t cq_id = 0;
         tid = BeginTraceCapture(mesh_device.get(), cq_id);
         executor.execute_programs();
-        EndTraceCapture(mesh_device.get(), cq_id, tid);
+        mesh_device->end_mesh_trace(cq_id, tid);
         Finish(mesh_device->mesh_command_queue(cq_id));
     }
     return tid;
@@ -498,13 +505,13 @@ void run_benchmark_timing_loop(
     MeshCommandQueue& mesh_cq,
     ProgramExecutor& executor,
     MeshTraceId tid,
-    std::shared_ptr<MeshDevice> mesh_device) {
+    const std::shared_ptr<MeshDevice>& mesh_device) {
     constexpr std::size_t cq_id = 0;
     auto execute_func = executor.execute_programs;
-    for (auto _ : state) {
+    for ([[maybe_unused]] auto _ : state) {
         auto start = std::chrono::system_clock::now();
         if (info.use_trace) {
-            ReplayTrace(mesh_device.get(), cq_id, tid, false);
+            mesh_device->replay_mesh_trace(cq_id, tid, false);
         } else {
             execute_func();
         }
@@ -578,7 +585,7 @@ CoreType dispatch_core_type_to_core_type(DispatchCoreType dispatch_core_type) {
 
 // Helper function to create standard programs
 std::array<tt_metal::Program, 2> create_standard_programs(
-    const TestInfo& info, std::shared_ptr<MeshDevice> mesh_device, DispatchCoreType dispatch_core_type) {
+    const TestInfo& info, const std::shared_ptr<MeshDevice>& mesh_device, DispatchCoreType /*dispatch_core_type*/) {
     std::array<tt_metal::Program, 2> programs;
     if (!initialize_program(info, mesh_device, programs[0], info.slow_kernel_cycles) ||
         !initialize_program(info, mesh_device, programs[1], info.fast_kernel_cycles)) {
@@ -588,10 +595,8 @@ std::array<tt_metal::Program, 2> create_standard_programs(
 }
 // Helper function to create prefetcher cache load programs
 std::pair<std::vector<tt_metal::Program>, std::unordered_map<std::string, uint32_t>> create_load_prefetcher_programs(
-    const TestInfo& info, std::shared_ptr<MeshDevice> mesh_device, DispatchCoreType dispatch_core_type) {
-    uint32_t prefetcher_cache_size = tt::tt_metal::MetalContext::instance()
-                                         .dispatch_mem_map(dispatch_core_type_to_core_type(dispatch_core_type))
-                                         .ringbuffer_size();
+    const TestInfo& info, const std::shared_ptr<MeshDevice>& mesh_device) {
+    uint32_t prefetcher_cache_size = tt::tt_metal::MetalContext::instance().dispatch_mem_map().ringbuffer_size();
     uint32_t target_total_size = (3 * prefetcher_cache_size) / 2;
     uint32_t num_kernels = get_num_kernels(info);
     uint32_t estimated_program_size =
@@ -681,12 +686,33 @@ static int pgm_dispatch(T& state, TestInfo info) {
     bool pass = true;
     std::shared_ptr<MeshDevice> mesh_device;
     try {
-        const chip_id_t device_id = 0;
+        const ChipId device_id = 0;
         const std::size_t cq_id = 0;
         DispatchCoreType dispatch_core_type = info.dispatch_from_eth ? DispatchCoreType::ETH : DispatchCoreType::WORKER;
+        // load_prefetcher_test captures hundreds of programs in a single trace to overflow the
+        // prefetcher cache; the captured trace is ~1.03 GB on wormhole_b0 (refs #46983), so the
+        // region must comfortably exceed 1 GB.
+        size_t trace_region_size = 1'500'000'000;
+        std::string arch_name = tt::tt_metal::hal::get_arch_name();
+        if (arch_name == std::string("blackhole")) {
+            // Blackhole has more cores, so we need more room to store RTAs.
+            trace_region_size = 2'500'000'000;
+        }
         mesh_device = MeshDevice::create_unit_mesh(
-            device_id, DEFAULT_L1_SMALL_SIZE, 900 * 1024 * 1024, 1, DispatchCoreConfig{dispatch_core_type});
+            device_id, DEFAULT_L1_SMALL_SIZE, trace_region_size, 1, DispatchCoreConfig{dispatch_core_type});
         auto& mesh_cq = mesh_device->mesh_command_queue(cq_id);
+
+        auto grid_size = mesh_device->compute_with_storage_grid_size();
+        if (info.workers.end_coord.x >= grid_size.x || info.workers.end_coord.y >= grid_size.y) {
+            log_fatal(
+                LogTest,
+                "Requested worker range ({},{}) exceeds device grid ({}x{})",
+                info.workers.end_coord.x,
+                info.workers.end_coord.y,
+                grid_size.x,
+                grid_size.y);
+            return 1;
+        }
 
         std::vector<tt_metal::SubDevice> sub_devices;
         if (info.n_subdevice_ranges > 1) {
@@ -704,7 +730,7 @@ static int pgm_dispatch(T& state, TestInfo info) {
         ProgramExecutor executor([]() {}, []() {}, 0);  // Initialize with placeholder
         std::vector<MeshWorkload> mesh_workloads;
         if (info.load_prefetcher) {
-            auto [programs, extra_counters] = create_load_prefetcher_programs(info, mesh_device, dispatch_core_type);
+            auto [programs, extra_counters] = create_load_prefetcher_programs(info, mesh_device);
             executor = create_load_prefetcher_executor(info, mesh_workloads, programs, mesh_cq);
             // Store extra counters for later use
             if constexpr (std::is_same_v<T, benchmark::State>) {
@@ -720,7 +746,7 @@ static int pgm_dispatch(T& state, TestInfo info) {
         }
 
         // Set benchmark counters before timing (all values are known at this point)
-        set_benchmark_counters(state, info, mesh_device->get_device(0, 0), executor.total_program_iterations);
+        set_benchmark_counters(state, info, mesh_device->impl().get_device(0, 0), executor.total_program_iterations);
 
         // Run warmup
         executor.warmup_programs();
@@ -743,14 +769,13 @@ static int pgm_dispatch(T& state, TestInfo info) {
     if (pass) {
         log_info(LogTest, "Test Passed");
         return 0;
-    } else {
-        if constexpr (std::is_same_v<T, benchmark::State>) {
-            state.SkipWithError("Test failed");
-        } else {
-            log_info(LogTest, "Test failed");
-        }
-        return 1;
     }
+    if constexpr (std::is_same_v<T, benchmark::State>) {
+        state.SkipWithError("Test failed");
+    } else {
+        log_info(LogTest, "Test failed");
+    }
+    return 1;
 }
 
 static void BM_pgm_dispatch(benchmark::State& state, TestInfo info) {
@@ -981,20 +1006,28 @@ BENCHMARK_CAPTURE(
 BENCHMARK_CAPTURE(
     BM_pgm_dispatch,
     10000_kernel_all_cores_all_processors_32_cbs_trace,
-    TestInfo{.warmup_iterations = 5000, .slow_kernel_cycles = 10000, .n_cbs = 32, .use_trace = true, .use_all_cores = true})
+    TestInfo{
+        .warmup_iterations = 5000, .slow_kernel_cycles = 10000, .n_cbs = 32, .use_trace = true, .use_all_cores = true})
     ->Apply(Max8192Args)
     ->UseManualTime();
 BENCHMARK_CAPTURE(
     BM_pgm_dispatch,
     5000_kernel_all_cores_all_processors_32_cbs_trace,
-    TestInfo{.warmup_iterations = 5000, .slow_kernel_cycles = 5000, .n_cbs = 32, .use_trace = true, .use_all_cores = true})
+    TestInfo{
+        .warmup_iterations = 5000, .slow_kernel_cycles = 5000, .n_cbs = 32, .use_trace = true, .use_all_cores = true})
     ->Apply(Max8192Args)
     ->UseManualTime();
 // Intended to be GO-latency-bound
 BENCHMARK_CAPTURE(
     BM_pgm_dispatch_vary_slow_cycles,
     256_bytes_brisc_only_all_processors_trace,
-    TestInfo{.warmup_iterations = 5000, .kernel_size = 256, .ncrisc_enabled = false, .trisc_enabled = false, .use_trace = true, .use_all_cores = true})
+    TestInfo{
+        .warmup_iterations = 5000,
+        .kernel_size = 256,
+        .ncrisc_enabled = false,
+        .trisc_enabled = false,
+        .use_trace = true,
+        .use_all_cores = true})
     ->Apply(KernelCycleArgs)
     ->UseManualTime();
 BENCHMARK_CAPTURE(
@@ -1025,8 +1058,17 @@ int main(int argc, char** argv) {
     if (test_args::has_command_option(input_args, "--custom")) {
         TestInfo info;
         init(input_args, info);
+        if (info.use_trace && slow_dispatch_enabled()) {
+            log_info(tt::LogTest, "Trace capture is not supported for slow dispatch; skipping test");
+            return 0;
+        }
         FakeBenchmarkState state;
         return pgm_dispatch(state, info);
+    }
+
+    if (slow_dispatch_enabled()) {
+        log_info(tt::LogTest, "Program dispatch trace benchmarks are not supported for slow dispatch; skipping suite");
+        return 0;
     }
 
     if (test_args::has_command_option(input_args, "--dump-test-info")) {
@@ -1102,37 +1144,12 @@ int main(int argc, char** argv) {
             BM_pgm_dispatch,
             TestInfo{
                 .warmup_iterations = 5000,
-                .brisc_enabled = false,
+                .brisc_enabled = true,
                 .ncrisc_enabled = false,
                 .trisc_enabled = false,
-                .erisc_enabled = true,
-                .use_trace = true})
-            ->Apply(Max8192Args)
-            ->UseManualTime();
-        benchmark::RegisterBenchmark(
-            "BM_pgm_dispatch/tensix_eth_2",
-            BM_pgm_dispatch,
-            TestInfo{
-                .warmup_iterations = 5000,
-                .n_args = 16,
-                .n_kgs = std::get<0>(core_count),
-                .erisc_enabled = true,
+                .erisc_enabled = false,
                 .use_trace = true,
-                .use_all_cores = true})
-            ->Apply(Max8192Args)
-            ->UseManualTime();
-        benchmark::RegisterBenchmark(
-            "BM_pgm_dispatch/tensix_eth_2_4_shadow",
-            BM_pgm_dispatch,
-            TestInfo{
-                .warmup_iterations = 5000,
-                .slow_kernel_cycles = 40000,
-                .nfast_kernels = 4,
-                .n_args = 16,
-                .n_kgs = std::get<0>(core_count),
-                .erisc_enabled = true,
-                .use_trace = true,
-                .use_all_cores = true})
+                .dispatch_from_eth = true})
             ->Apply(Max8192Args)
             ->UseManualTime();
     }

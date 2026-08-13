@@ -1,20 +1,27 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include <tt-metalium/blockfloat_common.hpp>
+#include <algorithm>
+#include <tt-logger/tt-logger.hpp>
 #include <tt_stl/span.hpp>
 #include <array>
 #include <vector>
+#include <thread>
+#include <future>
 
-#include "assert.hpp"
+#include <tt_stl/assert.hpp>
+#include "blockfloat_common.hpp"
+#include "common/executor.hpp"
 #include "constants.hpp"
 #include "hal_types.hpp"
 #include "impl/context/metal_context.hpp"
 #include "math.hpp"
 #include "tile.hpp"
-#include "tracy/Tracy.hpp"
+#include "tt_metal/tools/profiler/tracy_debug_zones.hpp"
 #include "tt_backend_api_types.hpp"
+
+namespace {
 
 uint8_t get_max_exp(const std::vector<uint32_t>& vec, bool is_exp_a) {
     TT_ASSERT(vec.size() == 16);
@@ -38,9 +45,7 @@ uint8_t get_max_exp(const std::vector<uint32_t>& vec, bool is_exp_a) {
             exp = static_cast<uint32_t>(se);
         }
 
-        if (exp > max) {
-            max = exp;
-        }
+        max = std::max(exp, max);
     }
     return max;
 }
@@ -76,6 +81,48 @@ std::vector<uint32_t> pack_exponents(const std::vector<uint8_t>& exponents, size
 
     return packed_result;
 }
+
+template <tt::DataFormat BfpFormat>
+uint32_t create_packed_bfp_packed_as_u32(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a) {
+    TT_ASSERT(
+        BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp8 ||
+        BfpFormat == tt::DataFormat::Bfp2_b || BfpFormat == tt::DataFormat::Bfp4_b ||
+        BfpFormat == tt::DataFormat::Bfp8_b);
+    constexpr int nums_in_dword = []() {
+        if constexpr (BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp2_b) {
+            return 16;
+        } else if constexpr (BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp4_b) {
+            return 8;
+        } else {
+            return 4;
+        }
+    }();
+
+    uint32_t tmp_o = 0;
+    uint32_t mask = (1 << (32 / nums_in_dword)) - 1;
+    for (int i = nums_in_dword - 1; i >= 0; --i)  // [0] in LSBs of dword
+    {
+        uint32_t conv_num = convert_u32_to_bfp<BfpFormat, false>(u32_vec[i], shared_exp, is_exp_a);
+        tmp_o = tmp_o << (32 / nums_in_dword);
+        tmp_o = tmp_o | (conv_num & mask);
+    }
+    return tmp_o;
+}
+
+template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp2>(
+    const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
+template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp4>(
+    const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
+template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp8>(
+    const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
+template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp2_b>(
+    const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
+template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp4_b>(
+    const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
+template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp8_b>(
+    const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
+
+}  // namespace
 
 uint32_t get_byte(uint32_t word, uint32_t index) {
     TT_ASSERT(index < 4);
@@ -194,10 +241,15 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
         BfpFormat == tt::DataFormat::Bfp2_b || BfpFormat == tt::DataFormat::Bfp4_b ||
         BfpFormat == tt::DataFormat::Bfp8_b);
 
-    constexpr uint32_t MANTISSA_BFP_WIDTH =
-        (BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp2_b)   ? 1
-        : (BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp4_b) ? 3
-                                                                                     : 7;
+    constexpr uint32_t MANTISSA_BFP_WIDTH = []() {
+        if constexpr (BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp2_b) {
+            return 1;
+        } else if constexpr (BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp4_b) {
+            return 3;
+        } else {
+            return 7;
+        }
+    }();
     constexpr uint32_t MANTISSA_BFP_SHIFT = 24 - MANTISSA_BFP_WIDTH;
     constexpr uint32_t MANTISSA_BFP_MAX_VAL = (1 << MANTISSA_BFP_WIDTH) - 1;
 
@@ -269,9 +321,7 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
             mantissa += 1;
         }
 
-        if (mantissa > MANTISSA_BFP_MAX_VAL) {
-            mantissa = MANTISSA_BFP_MAX_VAL;
-        }
+        mantissa = std::min(mantissa, MANTISSA_BFP_MAX_VAL);
     }
 
     // add sign bit only if result is not 0
@@ -283,33 +333,21 @@ uint8_t convert_u32_to_bfp(uint32_t input, uint32_t shared_exp, bool is_exp_a) {
 }
 
 template <tt::DataFormat BfpFormat>
-uint32_t create_packed_bfp_packed_as_u32(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a) {
-    TT_ASSERT(
-        BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp8 ||
-        BfpFormat == tt::DataFormat::Bfp2_b || BfpFormat == tt::DataFormat::Bfp4_b ||
-        BfpFormat == tt::DataFormat::Bfp8_b);
-    constexpr int nums_in_dword = (BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp2_b)   ? 16
-                                  : (BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp4_b) ? 8
-                                                                                                               : 4;
-
-    uint32_t tmp_o = 0;
-    uint32_t mask = (1 << (32 / nums_in_dword)) - 1;
-    for (int i = nums_in_dword - 1; i >= 0; --i)  // [0] in LSBs of dword
-    {
-        uint32_t conv_num = convert_u32_to_bfp<BfpFormat, false>(u32_vec[i], shared_exp, is_exp_a);
-        tmp_o = tmp_o << (32 / nums_in_dword);
-        tmp_o = tmp_o | (conv_num & mask);
-    }
-    return tmp_o;
-}
-
-template <tt::DataFormat BfpFormat>
 std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles(
-    tt::stl::Span<const float> fp32_vec,
+    ttsl::Span<const float> fp32_vec,
     bool row_major_input,
     bool is_exp_a,
     const std::optional<tt::tt_metal::Tile>& tile) {
-    ZoneScoped;
+    return pack_as_bfp_tiles<BfpFormat, float>(fp32_vec, row_major_input, is_exp_a, tile);
+}
+
+template <tt::DataFormat BfpFormat, typename T>
+std::vector<uint32_t> pack_as_bfp_tiles(
+    ttsl::Span<const T> input_data,
+    bool row_major_input,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile) {
+    TTZoneScopedD(DATA_FORMAT);
 
     TT_ASSERT(
         BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp8 ||
@@ -330,84 +368,170 @@ std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles(
     bool exponent_padding = (subtile_rows * subtiles_in_tile_col * subtiles_in_tile_row) < l1_alignment;
 
     int num_float_in_tile = tile_HW;
-    TT_ASSERT(fp32_vec.size() % num_float_in_tile == 0);
-    uint32_t num_tiles = fp32_vec.size() / num_float_in_tile;
-
-    std::vector<uint32_t> packed_result;
-
-    std::vector<uint8_t> exponents;
-    std::vector<uint32_t> data;
+    TT_ASSERT(input_data.size() % num_float_in_tile == 0);
+    uint32_t num_tiles = input_data.size() / num_float_in_tile;
 
     int num_exponents_in_dword = 4;
-    int num_mantissas_in_dword = (BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp2_b)   ? 16
-                                 : (BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp4_b) ? 8
-                                                                                                              : 4;
-    int fp32_element_index = 0;
-    for (int tile_index = 0; tile_index < num_tiles; ++tile_index) {
-        std::vector<uint32_t> packed_data;
-        std::vector<uint8_t> exponents_with_padding;
-        exponents_with_padding.reserve(l1_alignment * subtiles_in_tile_row * subtiles_in_tile_col);
-        for (int tr = 0; tr < subtiles_in_tile_row; ++tr) {
-            for (int tc = 0; tc < subtiles_in_tile_col; ++tc) {
-                for (int i = 0; i < subtile_rows; ++i) {
-                    std::vector<uint32_t> single_row;
-                    // populate a single row
-                    for (int j = 0; j < subtile_cols; ++j) {
-                        int data_index;
-                        if (row_major_input) {
-                            data_index =
-                                (tr * face_H + i) * tile_W + (tc * face_W + j) + (num_float_in_tile * tile_index);
+    int num_mantissas_in_dword;
+    if constexpr (BfpFormat == tt::DataFormat::Bfp2 || BfpFormat == tt::DataFormat::Bfp2_b) {
+        num_mantissas_in_dword = 16;
+    } else if constexpr (BfpFormat == tt::DataFormat::Bfp4 || BfpFormat == tt::DataFormat::Bfp4_b) {
+        num_mantissas_in_dword = 8;
+    } else {
+        num_mantissas_in_dword = 4;
+    }
+
+    // Lambda to process a range of tiles
+    auto process_tile_range = [&](int start_tile, int end_tile) -> std::vector<uint32_t> {
+        const int rows_per_tile = subtiles_in_tile_row * subtiles_in_tile_col * subtile_rows;
+        const int mantissa_dwords_per_tile = num_float_in_tile / num_mantissas_in_dword;
+        const int exp_dwords_per_tile =
+            exponent_padding ? static_cast<int>(tt::round_up(static_cast<uint32_t>(rows_per_tile), l1_alignment)) /
+                                   num_exponents_in_dword
+                             : rows_per_tile / num_exponents_in_dword;
+
+        std::vector<uint32_t> local_result;
+        local_result.reserve(
+            static_cast<size_t>(end_tile - start_tile) * (exp_dwords_per_tile + mantissa_dwords_per_tile));
+        std::vector<uint8_t> exponents;
+        exponents.reserve(num_exponents_in_dword);
+        std::vector<uint32_t> data;
+        data.reserve(num_mantissas_in_dword);
+
+        for (int tile_index = start_tile; tile_index < end_tile; ++tile_index) {
+            std::vector<uint32_t> packed_data;
+            packed_data.reserve(mantissa_dwords_per_tile);
+            std::vector<uint8_t> exponents_with_padding;
+            exponents_with_padding.reserve(l1_alignment * subtiles_in_tile_row * subtiles_in_tile_col);
+
+            size_t fp32_element_base = row_major_input ? 0 : (tile_index * num_float_in_tile);
+
+            for (int tr = 0; tr < subtiles_in_tile_row; ++tr) {
+                for (int tc = 0; tc < subtiles_in_tile_col; ++tc) {
+                    for (int i = 0; i < subtile_rows; ++i) {
+                        std::vector<uint32_t> single_row;
+                        single_row.reserve(subtile_cols);
+                        // populate a single row
+                        for (int j = 0; j < subtile_cols; ++j) {
+                            size_t data_index;
+                            if (row_major_input) {
+                                data_index =
+                                    (tr * face_H + i) * tile_W + (tc * face_W + j) + (num_float_in_tile * tile_index);
+                            } else {
+                                data_index = fp32_element_base +
+                                             (tr * subtiles_in_tile_col + tc) * (subtile_rows * subtile_cols) +
+                                             i * subtile_cols + j;
+                            }
+                            float float_num = static_cast<float>(input_data[data_index]);
+                            uint32_t uint32_num = *reinterpret_cast<uint32_t*>(&float_num);
+                            single_row.push_back(uint32_num);
+                        }
+
+                        uint8_t exp = get_max_exp(single_row, is_exp_a);
+
+                        // check if it satisfies the 16B alignment
+                        if (exponent_padding) {
+                            exponents_with_padding.push_back(exp);
                         } else {
-                            data_index = fp32_element_index++;
+                            exponents.push_back(exp);
+                            if (exponents.size() % num_exponents_in_dword == 0) {
+                                local_result.push_back(get_exp_dword(exponents));
+                                exponents.clear();
+                            }
                         }
-                        float float_num = fp32_vec[data_index];
-                        uint32_t uint32_num = *reinterpret_cast<uint32_t*>(&float_num);
-                        single_row.push_back(uint32_num);
-                    }
 
-                    uint8_t exp = get_max_exp(single_row, is_exp_a);
-
-                    // check if it satifies the 16B alignment
-                    if (exponent_padding) {
-                        exponents_with_padding.push_back(exp);
-                    } else {
-                        exponents.push_back(exp);
-                        if (exponents.size() % num_exponents_in_dword == 0) {
-                            packed_result.push_back(get_exp_dword(exponents));
-                            exponents.clear();
-                        }
-                    }
-
-                    for (uint32_t u32_datum : single_row) {
-                        data.push_back(u32_datum);
-                        if (data.size() % num_mantissas_in_dword == 0) {
-                            uint32_t datum = create_packed_bfp_packed_as_u32<BfpFormat>(data, exp, is_exp_a);
-                            packed_data.push_back(datum);
-                            data.clear();
+                        for (uint32_t u32_datum : single_row) {
+                            data.push_back(u32_datum);
+                            if (data.size() % num_mantissas_in_dword == 0) {
+                                uint32_t datum = create_packed_bfp_packed_as_u32<BfpFormat>(data, exp, is_exp_a);
+                                packed_data.push_back(datum);
+                                data.clear();
+                            }
                         }
                     }
                 }
             }
+            // prepend exponents to follow data packing order:
+            //  16 exponents for sub-tile 0​
+            //      exp_row0, exp_row1, … exp_row15​
+            //  16 exponents for sub-tile 1​
+            //  16 exponents for sub-tile 2​
+            //  16 exponents for sub-tile 3​
+            //  entire sub-tile 0 (RM layout)​
+            //  entire sub-tile 1 (RM layout)​
+            //  entire sub-tile 2 (RM layout)​
+            //  entire sub-tile 3 (RM layout)
+            // align the exponent section to 16B
+            if (exponent_padding) {
+                std::vector<uint8_t> pads(
+                    tt::round_up(exponents_with_padding.size(), l1_alignment) - exponents_with_padding.size(), 0);
+                exponents_with_padding.insert(exponents_with_padding.end(), pads.begin(), pads.end());
+                std::vector<uint32_t> packed = pack_exponents(exponents_with_padding, num_exponents_in_dword);
+                local_result.insert(local_result.end(), packed.begin(), packed.end());
+            }
+            local_result.insert(local_result.end(), packed_data.begin(), packed_data.end());
         }
-        // prepend exponents to follow data packing order:
-        //  16 exponents for sub-tile 0​
-        //      exp_row0, exp_row1, … exp_row15​
-        //  16 exponents for sub-tile 1​
-        //  16 exponents for sub-tile 2​
-        //  16 exponents for sub-tile 3​
-        //  entire sub-tile 0 (RM layout)​
-        //  entire sub-tile 1 (RM layout)​
-        //  entire sub-tile 2 (RM layout)​
-        //  entire sub-tile 3 (RM layout)
-        // align the exponent section to 16B
-        if (exponent_padding) {
-            std::vector<uint8_t> pads(
-                tt::round_up(exponents_with_padding.size(), l1_alignment) - exponents_with_padding.size(), 0);
-            exponents_with_padding.insert(exponents_with_padding.end(), pads.begin(), pads.end());
-            std::vector<uint32_t> packed = pack_exponents(exponents_with_padding, num_exponents_in_dword);
-            packed_result.insert(packed_result.end(), packed.begin(), packed.end());
-        }
-        packed_result.insert(packed_result.end(), packed_data.begin(), packed_data.end());
+
+        return local_result;
+    };
+
+    // Determine how many parallel work items to split the tiles into.
+    // Only parallelize if we have enough tiles to justify the overhead.
+    constexpr uint32_t MIN_TILES_PER_CHUNK = 4;
+    uint32_t max_chunks = std::thread::hardware_concurrency();
+    if (max_chunks == 0) {
+        max_chunks = 1;
+    }
+    uint32_t num_chunks = std::min(max_chunks, num_tiles / MIN_TILES_PER_CHUNK);
+    num_chunks = std::max(1u, num_chunks);
+
+    if (num_chunks == 1) {
+        // Single-threaded execution
+        return process_tile_range(0, num_tiles);
+    }
+
+    log_debug(
+        tt::LogAlways,
+        "Converting {} block-float tiles with {} chunks ({} tiles/chunk)",
+        num_tiles,
+        num_chunks,
+        num_tiles / num_chunks);
+
+    std::vector<std::vector<uint32_t>> chunk_results(num_chunks);
+    std::vector<std::shared_future<void>> futures;
+    futures.reserve(num_chunks);
+
+    uint32_t tiles_per_chunk = num_tiles / num_chunks;
+    uint32_t remainder = num_tiles % num_chunks;
+
+    uint32_t start_tile = 0;
+    for (uint32_t t = 0; t < num_chunks; ++t) {
+        uint32_t tiles_for_this_chunk = tiles_per_chunk + (t < remainder ? 1 : 0);
+        uint32_t end_tile = start_tile + tiles_for_this_chunk;
+
+        futures.emplace_back(
+            tt::tt_metal::detail::async([&chunk_results, &process_tile_range, t, start_tile, end_tile]() {
+                chunk_results[t] = process_tile_range(start_tile, end_tile);
+            }));
+
+        start_tile = end_tile;
+    }
+
+    // Wait for all chunks to complete. get() also rethrows the first exception raised in any chunk.
+    for (auto& future : futures) {
+        future.get();
+    }
+
+    // Concatenate results from all chunks
+    std::vector<uint32_t> packed_result;
+    size_t total_size = 0;
+    for (const auto& result : chunk_results) {
+        total_size += result.size();
+    }
+    packed_result.reserve(total_size);
+
+    for (auto& result : chunk_results) {
+        packed_result.insert(packed_result.end(), result.begin(), result.end());
     }
 
     return packed_result;
@@ -432,17 +556,62 @@ template uint8_t convert_u32_to_bfp<tt::DataFormat::Bfp2_b, true>(uint32_t input
 template uint8_t convert_u32_to_bfp<tt::DataFormat::Bfp4_b, true>(uint32_t input, uint32_t shared_exp, bool is_exp_a);
 template uint8_t convert_u32_to_bfp<tt::DataFormat::Bfp8_b, true>(uint32_t input, uint32_t shared_exp, bool is_exp_a);
 
-template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp2>(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
-template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp4>(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
-template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp8>(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
-template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp2_b>(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
-template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp4_b>(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
-template uint32_t create_packed_bfp_packed_as_u32<tt::DataFormat::Bfp8_b>(const std::vector<uint32_t>& u32_vec, uint32_t shared_exp, bool is_exp_a);
+template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
 
-template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp2>(tt::stl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
-template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp4>(tt::stl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
-template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp8>(tt::stl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
-template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp2_b>(tt::stl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
-template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp4_b>(tt::stl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
-template std::vector<uint32_t> pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp8_b>(tt::stl::Span<const float> fp32_vec, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const float> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const float> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const float> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const float> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const float> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const float> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const bfloat16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const bfloat16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const bfloat16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const bfloat16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const bfloat16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const bfloat16> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const int32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const uint32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const uint32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const uint32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const uint32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const uint32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const uint32_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+
+
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const uint16_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const uint16_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const uint16_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const uint16_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const uint16_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const uint16_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+
+
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const uint8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const uint8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const uint8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const uint8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const uint8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const uint8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2>(ttsl::Span<const int8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4>(ttsl::Span<const int8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8>(ttsl::Span<const int8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp2_b>(ttsl::Span<const int8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp4_b>(ttsl::Span<const int8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(ttsl::Span<const int8_t> input_data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+
 // clang-format on

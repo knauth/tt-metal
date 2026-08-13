@@ -1,7 +1,20 @@
 ############################################################################################################################
 # CPM
 ############################################################################################################################
-include(${PROJECT_SOURCE_DIR}/cmake/CPM.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/CPM.cmake)
+
+# Shadow clang-tidy for all CPM-fetched targets — mirrors third_party/CMakeLists.txt.
+# Placing a no-op .clang-tidy in the CPM cache root is insufficient (some packages
+# ship their own .clang-tidy). Blanking the cache variable disables it for every
+# target defined while it is blank.
+#
+# IMPORTANT: this file is include()d (not add_subdirectory()), so variable changes
+# leak into the caller's scope. Save and restore so that tt-train source targets
+# defined after this include() are still scanned by clang-tidy.
+set(_tt_train_saved_c_clang_tidy "${CMAKE_C_CLANG_TIDY}")
+set(_tt_train_saved_cxx_clang_tidy "${CMAKE_CXX_CLANG_TIDY}")
+set(CMAKE_C_CLANG_TIDY "")
+set(CMAKE_CXX_CLANG_TIDY "")
 
 ############################################################################################################################
 # Boost
@@ -28,7 +41,8 @@ CPMAddPackage(
 CPMAddPackage(
     NAME yaml-cpp
     GITHUB_REPOSITORY jbeder/yaml-cpp
-    GIT_TAG 0.8.0
+    GIT_TAG
+        2f86d13775d119edbb69af52e5f566fd65c6953b # 0.8.0 + patches
     OPTIONS
         "YAML_CPP_BUILD_TESTS OFF"
         "YAML_CPP_BUILD_TOOLS OFF"
@@ -39,14 +53,8 @@ CPMAddPackage(
 # googletest
 ############################################################################################################################
 
-CPMAddPackage(
-    NAME googletest
-    GITHUB_REPOSITORY google/googletest
-    GIT_TAG v1.13.0
-    VERSION 1.13.0
-    OPTIONS
-        "INSTALL_GTEST OFF"
-)
+CPMAddPackage(NAME GTest GITHUB_REPOSITORY google/googletest GIT_TAG v1.13.0 VERSION 1.13.0 OPTIONS "INSTALL_GTEST OFF")
+CPMRegisterPackage("googletest" "1.13.0")
 
 ############################################################################################################################
 # boost-ext reflect : https://github.com/boost-ext/reflect
@@ -90,39 +98,7 @@ CPMAddPackage(
         "XTENSOR_ENABLE_TESTS OFF"
 )
 
-include(${PROJECT_SOURCE_DIR}/cmake/fetch_cli11.cmake)
-
-# gersemi: off
-CPMAddPackage(
-    NAME msgpack
-    GIT_REPOSITORY https://github.com/msgpack/msgpack-c.git
-    GIT_TAG cpp-6.1.0
-    PATCH_COMMAND
-        patch --dry-run -p1 -R < ${CMAKE_CURRENT_LIST_DIR}/msgpack.patch || patch -p1 < ${CMAKE_CURRENT_LIST_DIR}/msgpack.patch
-    OPTIONS
-        "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
-        "MSGPACK_BUILD_EXAMPLES OFF"
-        "MSGPACK_BUILD_TESTS OFF"
-        "MSGPACK_BUILD_DOCS OFF"
-        "MSGPACK_ENABLE_CXX ON"
-        "MSGPACK_USE_BOOST OFF"
-        "MSGPACK_BUILD_HEADER_ONLY ON"
-        "MSGPACK_ENABLE_SHARED OFF"
-        "MSGPACK_ENABLE_STATIC OFF"
-        "MSGPACK_CXX20 ON"
-        "MSGPACK_NO_BOOST ON"
-)
-
-CPMAddPackage(
-    NAME tokenizers-cpp
-    GITHUB_REPOSITORY mlc-ai/tokenizers-cpp
-    GIT_TAG 55d53aa38dc8df7d9c8bd9ed50907e82ae83ce66
-    PATCH_COMMAND
-        patch --dry-run -p1 -R < ${CMAKE_CURRENT_LIST_DIR}/tokenizers-cpp.patch || patch -p1 < ${CMAKE_CURRENT_LIST_DIR}/tokenizers-cpp.patch
-    OPTIONS
-        "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
-)
-# gersemi: on
+include(${CMAKE_CURRENT_LIST_DIR}/fetch_cli11.cmake)
 
 ####################################################################################################################
 # spdlog
@@ -137,6 +113,7 @@ CPMAddPackage(
         "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
         "SPDLOG_FMT_EXTERNAL_HO ON"
         "SPDLOG_INSTALL ON"
+        "BUILD_SHARED_LIBS OFF"
 )
 set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME ${DEFAULT_COMPONENT_NAME})
 
@@ -146,8 +123,73 @@ set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME ${DEFAULT_COMPONENT_NAME})
 CPMAddPackage(
     NAME tt-logger
     GITHUB_REPOSITORY tenstorrent/tt-logger
-    VERSION 1.1.4
+    VERSION 1.1.8
     OPTIONS
         "TT_LOGGER_INSTALL ON"
         "TT_LOGGER_BUILD_TESTING OFF"
 )
+####################################################################################################################
+# nanobind
+####################################################################################################################
+find_package(
+    Python
+    COMPONENTS
+        Development
+        Development.Module
+        Interpreter
+    REQUIRED
+)
+CPMAddPackage(
+    NAME nanobind
+    GITHUB_REPOSITORY wjakob/nanobind
+    GIT_TAG
+        c5a3a378aa61d104c82ca053cb1e367782cd3618 # v2.10.2
+    OPTIONS
+        "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
+        "NB_USE_SUBMODULE_DEPS ON"
+)
+
+####################################################################################################################
+# simd-everywhere
+####################################################################################################################
+CPMAddPackage(NAME simd-everywhere GITHUB_REPOSITORY simd-everywhere/simde GIT_TAG v0.8.2)
+if(simd-everywhere_ADDED)
+    add_library(simde INTERFACE)
+    add_library(simde::simde ALIAS simde)
+    target_include_directories(simde SYSTEM INTERFACE ${simd-everywhere_SOURCE_DIR})
+endif()
+
+############################################################################################################################
+# flatbuffers : https://github.com/google/flatbuffers
+############################################################################################################################
+
+CPMAddPackage(
+    NAME flatbuffers
+    GITHUB_REPOSITORY google/flatbuffers
+    GIT_TAG v24.3.25
+    OPTIONS
+        "FLATBUFFERS_BUILD_FLATC ON"
+        "FLATBUFFERS_BUILD_TESTS OFF"
+        "FLATBUFFERS_SKIP_MONSTER_EXTRA ON"
+        "FLATBUFFERS_STRICT_MODE ON"
+)
+
+if(flatbuffers_ADDED)
+    # Few files including idl_gen_dart.cpp:175:18, Possibly related: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105329
+    target_compile_options(
+        flatc
+        PRIVATE
+            -Wno-restrict
+            -Wno-deprecated-declarations
+    )
+    target_compile_options(
+        flatbuffers
+        PRIVATE
+            -Wno-restrict
+            -Wno-deprecated-declarations
+    )
+endif()
+
+# Restore clang-tidy so tt-train source targets defined after this include() are scanned.
+set(CMAKE_C_CLANG_TIDY "${_tt_train_saved_c_clang_tidy}")
+set(CMAKE_CXX_CLANG_TIDY "${_tt_train_saved_cxx_clang_tidy}")

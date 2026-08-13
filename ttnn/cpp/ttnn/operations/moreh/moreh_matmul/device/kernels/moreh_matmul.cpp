@@ -1,13 +1,13 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 // Implemented based on bmm.cpp
-#include "compute_kernel_api/matmul.h"
-#include "compute_kernel_api/transpose_wh.h"
-#include "ttnn/deprecated/tt_dnn/kernels/compute/moreh_common.hpp"
-
-namespace NAMESPACE {
+#include "api/compute/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/transpose.h"
+#include "ttnn/kernel/compute/moreh_common.hpp"
+#include "api/dataflow/dataflow_buffer.h"
 
 ////////////////////
 // global variables
@@ -41,49 +41,52 @@ FORCE_INLINE void unravel_output_tidx(uint32_t output_tidx, uint32_t* output_idx
 }
 
 // TODO: move it to moreh_common.hpp if more use cases.
-FORCE_INLINE void transpose_wh_tile_to_cb(uint32_t icb, uint32_t ocb, uint32_t itile = 0, uint32_t idst = 0) {
+FORCE_INLINE void transpose_tile_to_cb(uint32_t icb, uint32_t ocb, uint32_t itile = 0, uint32_t idst = 0) {
+    DataflowBuffer ocb_obj(ocb);
 #if defined FP32_DEST_ACC_EN
     reconfig_data_format_srca(icb);
 #endif
-    transpose_wh_init_short(icb);
+    transpose_init(icb);
     tile_regs_acquire();
-    transpose_wh_tile(icb, itile, idst);
+    transpose_tile(icb, itile, idst);
     tile_regs_commit();
-    cb_reserve_back(ocb, onetile);
+    ocb_obj.reserve_back(onetile);
     tile_regs_wait();
 #if defined FP32_DEST_ACC_EN
     pack_reconfig_data_format(ocb);
 #endif
     pack_tile(idst, ocb);
     tile_regs_release();
-    cb_push_back(ocb, onetile);
+    ocb_obj.push_back(onetile);
 }
 
-FORCE_INLINE void transpose_tile(uint32_t& mm_src, bool transpose, bool need_mask, bool is_input) {
+FORCE_INLINE void transpose_src_tile(uint32_t& mm_src, bool transpose, bool need_mask, bool is_input) {
     if (!transpose) {
         return;
     }
 
     if (need_mask) {
-        cb_wait_front(mm_src, onetile);
-        transpose_wh_tile_to_cb(mm_src, mm_src);
-        cb_pop_front(mm_src, onetile);
+        DataflowBuffer mm_src_obj(mm_src);
+        mm_src_obj.wait_front(onetile);
+        transpose_tile_to_cb(mm_src, mm_src);
+        mm_src_obj.pop_front(onetile);
     } else {
         uint32_t trans_src = (is_input) ? (cb_in0) : (cb_in1);
         mm_src = (is_input) ? (cb_intermed1) : (cb_intermed2);
-        transpose_wh_tile_to_cb(trans_src, mm_src);
+        transpose_tile_to_cb(trans_src, mm_src);
     }
 }
 
 FORCE_INLINE void pack_onetile_to_cb(uint32_t ocb = 16, uint32_t idst = 0) {
-    cb_reserve_back(ocb, onetile);
+    DataflowBuffer ocb_obj(ocb);
+    ocb_obj.reserve_back(onetile);
     tile_regs_wait();
 #if defined FP32_DEST_ACC_EN
     pack_reconfig_data_format(ocb);
 #endif
     pack_tile(idst, ocb);
     tile_regs_release();
-    cb_push_back(ocb, onetile);
+    ocb_obj.push_back(onetile);
 }
 
 FORCE_INLINE void mask_tile_to_cb(
@@ -137,7 +140,7 @@ FORCE_INLINE void mask_tile_to_cb(
 #if defined FP32_DEST_ACC_EN
         reconfig_data_format(cb_in0, cb_mask);
 #endif
-        mul_tiles_init(cb_in, cb_mask);
+        mul_init(cb_in, cb_mask);
         mul_tiles(cb_in, cb_mask, 0, mask_tidx, 0);
         tile_regs_commit();
 
@@ -148,41 +151,37 @@ FORCE_INLINE void mask_tile_to_cb(
 }
 
 #ifdef FUSE_BIAS
-FORCE_INLINE void bias_add(bool is_scalar_bias) {
-    static bool scalar_bias_loaded = false;
+template <bool is_scalar_bias>
+FORCE_INLINE void bias_add() {
+    DataflowBuffer dfb_intermed3_obj(cb_intermed3);
+    DataflowBuffer bias_cb_id_obj(bias_cb_id);
     pack_onetile_to_cb(cb_intermed3);
-    cb_wait_front(cb_intermed3, onetile);
-
-    if (is_scalar_bias && !scalar_bias_loaded) {
-        cb_wait_front(bias_cb_id, onetile);
-        scalar_bias_loaded = true;
-    } else {
-        cb_wait_front(bias_cb_id, onetile);
-    }
-
+    dfb_intermed3_obj.wait_front(onetile);
+    bias_cb_id_obj.wait_front(onetile);
     tile_regs_acquire();
     if (is_scalar_bias) {
 #if defined FP32_DEST_ACC_EN
         reconfig_data_format(cb_intermed3, bias_cb_id);
 #endif
-        add_bcast_scalar_init_short(cb_intermed3, bias_cb_id);
+        add_bcast_scalar_init(cb_intermed3, bias_cb_id);
         add_tiles_bcast_scalar(cb_intermed3, bias_cb_id, 0, 0, 0);
     } else {
 #if defined FP32_DEST_ACC_EN
         reconfig_data_format(cb_intermed3, bias_cb_id);
 #endif
-        add_bcast_rows_init_short(cb_intermed3, bias_cb_id);
+        add_bcast_rows_init(cb_intermed3, bias_cb_id);
         add_tiles_bcast_rows(cb_intermed3, bias_cb_id, 0, 0, 0);
     }
     tile_regs_commit();
 
-    cb_pop_front(cb_intermed3, onetile);
-    if (!is_scalar_bias) {
-        cb_pop_front(bias_cb_id, onetile);
+    dfb_intermed3_obj.pop_front(onetile);
+    if constexpr (!is_scalar_bias) {
+        bias_cb_id_obj.pop_front(onetile);
     }
 }
 #endif
 
+template <bool is_scalar_bias>
 FORCE_INLINE void matmul_with_transpose_and_mask(
     uint32_t output_tidx,
     uint32_t num_output_tiles,
@@ -195,20 +194,24 @@ FORCE_INLINE void matmul_with_transpose_and_mask(
     uint32_t Mt,
     uint32_t Nt,
     bool need_other_mask_h,
-    bool need_other_mask_w,
-    bool is_scalar_bias) {
+    bool need_other_mask_w) {
+    DataflowBuffer dfb_in0_obj(cb_in0);
+    DataflowBuffer dfb_in1_obj(cb_in1);
+    DataflowBuffer dfb_in2_obj(cb_in2);
+    DataflowBuffer dfb_in3_obj(cb_in3);
+    DataflowBuffer dfb_intermed0_obj(cb_intermed0);
     // TODO: checking required when the input cb format and intermediate cb format are different.
-    mm_init(cb_in0, cb_in1, cb_out0);
+    matmul_init(cb_in0, cb_in1);
     if (transpose_input || transpose_other) {
-        transpose_wh_init(cb_in0, cb_out0);
+        transpose_init(cb_in0);
     }
 
     if (need_input_mask_h || need_input_mask_w) {
-        cb_wait_front(cb_in2, num_mask_tiles);
+        dfb_in2_obj.wait_front(num_mask_tiles);
     }
 
     if (need_other_mask_h || need_other_mask_w) {
-        cb_wait_front(cb_in3, num_mask_tiles);
+        dfb_in3_obj.wait_front(num_mask_tiles);
     }
 
 #pragma GCC unroll 0
@@ -231,8 +234,8 @@ FORCE_INLINE void matmul_with_transpose_and_mask(
             uint32_t mm_src0 = cb_in0;
             uint32_t mm_src1 = cb_in0;
 
-            cb_wait_front(cb_in0, onetile);
-            cb_wait_front(cb_in1, onetile);
+            dfb_in0_obj.wait_front(onetile);
+            dfb_in1_obj.wait_front(onetile);
 
             mm_src0 = cb_in0;
             mm_src1 = cb_in1;
@@ -250,7 +253,7 @@ FORCE_INLINE void matmul_with_transpose_and_mask(
                 input_last_row,
                 transpose_input,
                 true);
-            transpose_tile(mm_src0, transpose_input, need_input_mask, true);
+            transpose_src_tile(mm_src0, transpose_input, need_input_mask, true);
 
             mask_tile_to_cb(
                 mm_src1,
@@ -261,45 +264,47 @@ FORCE_INLINE void matmul_with_transpose_and_mask(
                 other_last_col,
                 transpose_other,
                 false);
-            transpose_tile(mm_src1, transpose_other, need_other_mask, false);
+            transpose_src_tile(mm_src1, transpose_other, need_other_mask, false);
 
             ////////////////////
             // matmul
             ////////////////////
             tile_regs_acquire();
             if (enable_reload) {
-                cb_wait_front(cb_intermed0, onetile);
+                dfb_intermed0_obj.wait_front(onetile);
 #if defined FP32_DEST_ACC_EN
                 reconfig_data_format_srca(cb_intermed0);
 #endif
                 copy_tile_to_dst_init_short(cb_intermed0);
                 copy_tile(cb_intermed0, 0, 0);
-                cb_pop_front(cb_intermed0, onetile);
+                dfb_intermed0_obj.pop_front(onetile);
             }
 
+            DataflowBuffer mm_src0_obj(mm_src0);
+            DataflowBuffer mm_src1_obj(mm_src1);
             if (transpose_input || need_input_mask) {
-                cb_wait_front(mm_src0, onetile);
+                mm_src0_obj.wait_front(onetile);
             }
 
             if (transpose_other || need_other_mask) {
-                cb_wait_front(mm_src1, onetile);
+                mm_src1_obj.wait_front(onetile);
             }
 
-            mm_init_short(mm_src0, mm_src1);
 #if defined FP32_DEST_ACC_EN
             reconfig_data_format(mm_src0, mm_src1);
 #endif
-            matmul_tiles(mm_src0, mm_src1, 0, 0, 0, false);
+            matmul_init(mm_src0, mm_src1);
+            matmul_tiles(mm_src0, mm_src1, 0, 0, 0);
             tile_regs_commit();
 
-            cb_pop_front(cb_in0, onetile);
-            cb_pop_front(cb_in1, onetile);
+            dfb_in0_obj.pop_front(onetile);
+            dfb_in1_obj.pop_front(onetile);
 
             if (transpose_input || need_input_mask) {
-                cb_pop_front(mm_src0, onetile);
+                mm_src0_obj.pop_front(onetile);
             }
             if (transpose_other || need_other_mask) {
-                cb_pop_front(mm_src1, onetile);
+                mm_src1_obj.pop_front(onetile);
             }
 
             if (last_out) {
@@ -307,7 +312,7 @@ FORCE_INLINE void matmul_with_transpose_and_mask(
 // bias add
 ////////////////////
 #ifdef FUSE_BIAS
-                bias_add(is_scalar_bias);
+                bias_add<is_scalar_bias>();
 #endif
                 pack_onetile_to_cb(cb_out0);
             } else {
@@ -323,22 +328,24 @@ FORCE_INLINE void matmul_with_transpose_and_mask(
 }
 
 FORCE_INLINE void matmul(uint32_t num_output_tiles, uint32_t Kt) {
-    mm_init(cb_in0, cb_in1, cb_out0);
+    DataflowBuffer dfb_in0_obj(cb_in0);
+    DataflowBuffer dfb_in1_obj(cb_in1);
+    matmul_init(cb_in0, cb_in1);
     for (uint32_t i = 0; i < num_output_tiles; ++i) {
         tile_regs_acquire();
         for (uint32_t kt = 0; kt < Kt; kt++) {
-            cb_wait_front(cb_in0, onetile);
-            cb_wait_front(cb_in1, onetile);
-            matmul_tiles(cb_in0, cb_in1, 0, 0, 0, false);
-            cb_pop_front(cb_in0, onetile);
-            cb_pop_front(cb_in1, onetile);
+            dfb_in0_obj.wait_front(onetile);
+            dfb_in1_obj.wait_front(onetile);
+            matmul_tiles(cb_in0, cb_in1, 0, 0, 0);
+            dfb_in0_obj.pop_front(onetile);
+            dfb_in1_obj.pop_front(onetile);
         }
         tile_regs_commit();
         pack_onetile_to_cb(cb_out0);
     }
 }
 
-void MAIN {
+void kernel_main() {
     // compile-time args
     constexpr uint32_t num_output_tiles = get_compile_time_arg_val(0);
     constexpr uint32_t Mt = get_compile_time_arg_val(1);
@@ -372,8 +379,10 @@ void MAIN {
         output_stride[i] = arg_fetcher.get_next_arg_val<uint32_t>();
     }
 
+    compute_kernel_hw_startup<SrcOrder::Reverse>(cb_in0, cb_in1, cb_out0);
+
     if (need_transpose || need_mask || need_bias_add) {
-        matmul_with_transpose_and_mask(
+        matmul_with_transpose_and_mask<is_scalar_bias>(
             output_tile_start_idx,
             num_output_tiles,
             Kt,
@@ -385,10 +394,8 @@ void MAIN {
             Mt,
             Nt,
             need_other_mask_h,
-            need_other_mask_w,
-            is_scalar_bias);
+            need_other_mask_w);
     } else {
         matmul(num_output_tiles, Kt);
     }
 }
-}  // namespace NAMESPACE

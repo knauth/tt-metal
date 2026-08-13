@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -8,16 +8,18 @@
 //      Need to make sure no other file includes these lists since it also include global parameter definitions
 // 2) instantiate global variables
 
-#include "firmware_common.h"
+#include "internal/firmware_common.h"
 
 #include "chlkc_list.h"
 
 #include "tools/profiler/kernel_profiler.hpp"
 
 #if defined ALIGN_LOCAL_CBS_TO_REMOTE_CBS
-#include "remote_circular_buffer_api.h"
+#include "api/remote_circular_buffer.h"
 #endif
-#include "debug/stack_usage.h"
+#include "internal/debug/stack_usage.h"
+
+#include "sanitizer/api.h"
 
 // Global vars
 uint32_t unp_cfg_context = 0;
@@ -26,14 +28,34 @@ uint32_t math_sync_tile_dst_index = 0;
 uint32_t gl_alu_format_spec_reg = 0;
 uint32_t op_info_offset = 0;
 
+#if defined(LLK_SAN_ENABLE)
+namespace llk::san {
+
+static_assert(
+    sizeof(SanitizerState) <= MEM_LLK_DEBUG_SIZE, "llk_san: sanitizer state must fit in MEM_LLK_DEBUG region");
+
+extern SanitizerState* const sanitizer = reinterpret_cast<SanitizerState*>(MEM_LLK_DEBUG_BASE);
+}  // namespace llk::san
+#endif
+
 namespace ckernel {
-volatile tt_reg_ptr uint* regfile = reinterpret_cast<volatile uint*>(REGFILE_BASE);
-volatile tt_reg_ptr uint* pc_buf_base = reinterpret_cast<volatile uint*>(PC_BUF_BASE);
-volatile tt_reg_ptr uint* mailbox_base[4] = {
+// Transition shim
+#if defined(__PTR_CONST)
+#define PTR_CONST const
+#else
+#define PTR_CONST
+#endif
+volatile tt_reg_ptr uint* PTR_CONST regfile = reinterpret_cast<volatile uint*>(REGFILE_BASE);
+volatile tt_reg_ptr uint* PTR_CONST pc_buf_base = reinterpret_cast<volatile uint*>(PC_BUF_BASE);
+#if defined(__INSTRN_BUFFER_TOS)
+volatile tt_reg_ptr uint32_t* const instrn_buffer = reinterpret_cast<volatile uint32_t*>(INSTRN_BUF_BASE);
+#endif
+volatile tt_reg_ptr uint* PTR_CONST mailbox_base[4] = {
     reinterpret_cast<volatile uint tt_reg_ptr*>(TENSIX_MAILBOX0_BASE),
     reinterpret_cast<volatile uint tt_reg_ptr*>(TENSIX_MAILBOX1_BASE),
     reinterpret_cast<volatile uint tt_reg_ptr*>(TENSIX_MAILBOX2_BASE),
     reinterpret_cast<volatile uint tt_reg_ptr*>(TENSIX_MAILBOX3_BASE)};
+#undef PTR_CONST
 }  // namespace ckernel
 
 extern "C" [[gnu::section(".start")]]
@@ -59,6 +81,8 @@ uint32_t _start() {
     ALIGN_LOCAL_CBS_TO_REMOTE_CBS
 #endif
     wait_for_go_message();
+    llk::san::thread_init();
+    RecordPerfCounters();
     DeviceZoneScopedMainChildN("TRISC-KERNEL");
     EARLY_RETURN_FOR_DEBUG
     WAYPOINT("K");

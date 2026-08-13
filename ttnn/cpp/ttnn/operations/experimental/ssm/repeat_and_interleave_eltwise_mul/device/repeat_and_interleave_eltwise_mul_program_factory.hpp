@@ -1,19 +1,19 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
 
-namespace ttnn::operations::experimental::ssm::detail {
+#include "repeat_and_interleave_eltwise_mul_device_operation_types.hpp"
+#include "ttnn/tensor/tensor.hpp"
 
-tt::tt_metal::operation::ProgramWithCallbacks multi_core_ssm_eltwise_mul(
-    const Tensor& a,
-    const Tensor& b,
-    Tensor& output,
-    uint32_t hidden_size,
-    MathFidelity math_fidelity,
-    CoreCoord compute_with_storage_grid_size);
+namespace ttnn::experimental::prim {
 
-}  // namespace ttnn::operations::experimental::ssm::detail
+struct RepeatAndInterleaveEltwiseMulProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const RepeatMulParams& operation_attributes, const RepeatMulInputs& tensor_args, Tensor& tensor_return_value);
+};
+
+}  // namespace ttnn::experimental::prim

@@ -1,19 +1,18 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
+#include "conv3d_device_operation_types.hpp"
+#include "ttnn/device_operation.hpp"
 
-namespace ttnn::operations::experimental::conv3d::detail {
+namespace ttnn::experimental::prim {
 
-tt::tt_metal::operation::ProgramWithCallbacks conv3d_factory(
-    const Tensor& input_tensor,
-    const Tensor& weight_tensor,
-    const std::optional<const Tensor>& bias_tensor,
-    const Conv3dConfig& config,
-    const Tensor& output_tensor,
-    const DeviceComputeKernelConfig& compute_kernel_config);
+struct Conv3dProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const Conv3dParams& operation_attributes, const Conv3dInputs& tensor_args, Tensor& tensor_return_value);
+};
 
-}  // namespace ttnn::operations::experimental::conv3d::detail
+}  // namespace ttnn::experimental::prim

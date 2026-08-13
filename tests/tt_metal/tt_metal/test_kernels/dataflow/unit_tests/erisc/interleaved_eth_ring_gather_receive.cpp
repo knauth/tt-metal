@@ -1,9 +1,9 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 /**
  * Any two RISC processors cannot use the same CMD_BUF
@@ -25,7 +25,8 @@ void kernel_main() {
 
     constexpr bool dst_is_dram = get_compile_time_arg_val(2) == 1;
 
-    const InterleavedAddrGen<dst_is_dram> d = {.bank_base_address = dst_addr, .page_size = page_size};
+    constexpr auto dst_args = TensorAccessorArgs<3>();
+    const auto d = TensorAccessor(dst_args, dst_addr);
 
     volatile tt_l1_ptr uint32_t* receiver_semaphore_addr_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sem_addr);
     uint64_t sender_semaphore_noc_addr = get_noc_addr(sender_noc_x, sender_noc_y, sem_addr);

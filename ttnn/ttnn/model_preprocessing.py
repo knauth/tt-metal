@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -22,15 +22,15 @@ except ImportError:
     raise ImportError("Torch is not installed. Model preprocessing functions require torch to be installed.")
 
 
-def preprocess_linear_weight(weight, *, dtype, layout=ttnn.TILE_LAYOUT):
+def preprocess_linear_weight(weight, *, dtype, layout=ttnn.TILE_LAYOUT, weights_mesh_mapper=None):
     weight = weight.T.contiguous()
-    weight = ttnn.from_torch(weight, dtype=dtype, layout=layout)
+    weight = ttnn.from_torch(weight, dtype=dtype, layout=layout, mesh_mapper=weights_mesh_mapper)
     return weight
 
 
-def preprocess_linear_bias(bias, *, dtype, layout=ttnn.TILE_LAYOUT):
+def preprocess_linear_bias(bias, *, dtype, layout=ttnn.TILE_LAYOUT, weights_mesh_mapper=None):
     bias = bias.reshape((1, -1))
-    bias = ttnn.from_torch(bias, dtype=dtype, layout=layout)
+    bias = ttnn.from_torch(bias, dtype=dtype, layout=layout, mesh_mapper=weights_mesh_mapper)
     return bias
 
 
@@ -159,6 +159,7 @@ def default_preprocessor(model, name, ttnn_module_args) -> ParameterDict:
 
 torch_dtype_to_ttnn_dtype = {
     torch.uint8: ttnn.uint8,
+    torch.int8: ttnn.int8,
     torch.int16: ttnn.uint16,
     torch.int32: ttnn.int32,
     torch.int64: ttnn.uint32,
@@ -286,7 +287,7 @@ def _load_parameters(model_cache_path: pathlib.Path) -> ParameterDict:
                 parameters = {int(key): value for key, value in parameters.items()}
                 parameters = ParameterList([parameters[index] for index in sorted(parameters.keys())])
             output[name] = parameters
-        elif extension == ".bin":
+        elif extension == ".tensorbin":
             output[name] = ttnn.load_tensor(path)
         elif extension == ".pt":
             output[name] = torch.load(path)
@@ -308,7 +309,7 @@ def _dump_parameters(model_cache_path: pathlib.Path, parameters: ParameterDict) 
                 _dump_parameters(model_cache_path / name / str(index), element)
         elif isinstance(value, ttnn.Tensor):
             file_path = str(model_cache_path / name)
-            file_name = file_path + ".bin"
+            file_name = file_path + ".tensorbin"
             ttnn.dump_tensor(file_name, value)
         elif isinstance(value, (torch.Tensor, torch.nn.Parameter)):
             file_path = str(model_cache_path / name)
@@ -368,6 +369,14 @@ class ConvTranspose2dArgs(ModuleArgs):
 
 
 class MaxPool2dArgs(ModuleArgs):
+    __getattr__ = dict.__getitem__
+    __delattr__ = dict.__delitem__
+
+    def __repr__(self):
+        return super().__repr__()
+
+
+class GroupNormArgs(ModuleArgs):
     __getattr__ = dict.__getitem__
     __delattr__ = dict.__delitem__
 
@@ -442,6 +451,18 @@ def infer_ttnn_module_args(*, model, run_model, device):
                         stride=operation.module.stride,
                         padding=operation.module.padding,
                         dilation=operation.module.dilation,
+                        batch_size=input_shape[0],
+                        input_channels=input_shape[1],
+                        input_height=input_shape[-2],
+                        input_width=input_shape[-1],
+                        dtype=ttnn.bfloat16,
+                    )
+                elif isinstance(operation.module, torch.nn.GroupNorm):
+                    ttnn_module_args[module_name] = GroupNormArgs(
+                        num_groups=operation.module.num_groups,
+                        num_channels=operation.module.num_channels,
+                        eps=operation.module.eps,
+                        affine=operation.module.affine,
                         batch_size=input_shape[0],
                         input_height=input_shape[-2],
                         input_width=input_shape[-1],

@@ -1,10 +1,9 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import ttnn
 from models.experimental.functional_common.attention_mask_functions import get_extended_attention_mask
-from models.utility_functions import is_grayskull
 
 
 def bert_attention(
@@ -13,7 +12,7 @@ def bert_attention(
     attention_mask,
     *,
     parameters,
-    num_cores_x=12 if is_grayskull() else 8,
+    num_cores_x=8,
 ):
     num_heads = config.num_attention_heads
     batch_size, _, hidden_size = hidden_states.shape
@@ -96,7 +95,7 @@ def bert_intermediate(
     hidden_states,
     *,
     parameters,
-    num_cores_x=12 if is_grayskull() else 8,
+    num_cores_x=8,
 ):
     batch_size, *_ = hidden_states.shape
 
@@ -107,7 +106,7 @@ def bert_intermediate(
         memory_config=ttnn.L1_MEMORY_CONFIG,
         dtype=ttnn.bfloat8_b,
         core_grid=ttnn.CoreGrid(y=batch_size, x=num_cores_x),
-        activation="gelu",
+        activation="gelu_approx",
         compute_kernel_config=ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi2,
             math_approx_mode=False,
@@ -123,7 +122,7 @@ def bert_output(
     residual,
     *,
     parameters,
-    num_cores_x=12 if is_grayskull() else 8,
+    num_cores_x=8,
 ):
     batch_size, *_ = hidden_states.shape
 
@@ -296,7 +295,7 @@ def preprocess_inputs(
     if attention_mask is not None:
         attention_mask = get_extended_attention_mask(attention_mask, input_ids.shape, torch.float32)
         attention_mask = attention_mask.expand((batch_size, -1, -1, -1))
-        attention_mask = torch.clamp(attention_mask, min=-100000)
+        attention_mask = torch.clamp(attention_mask, min=-100000).to(torch.bfloat16)  # GH issue: #35371
         attention_mask = ttnn.from_torch(
             attention_mask,
             dtype=ttnn.bfloat16,

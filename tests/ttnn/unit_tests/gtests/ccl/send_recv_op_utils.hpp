@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -14,7 +14,7 @@ struct SocketTestArgs {
     BufferType socket_storage_type;
 };
 
-const auto& get_socket_test_args() {
+inline const auto& get_socket_test_args() {
     static const std::array socket_test_args = {
         // Basic sanity configs
         SocketTestArgs{

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -10,7 +10,11 @@
 #include <thread>
 #include <vector>
 
+#include "random_parallel.hpp"
+#include "random_sse.hpp"
+
 namespace ttml::core {
+namespace legacy {
 
 template <typename T, typename DistGenFunc>
 void sequential_generate(std::span<T> seq, const DistGenFunc& dist_factory, uint32_t seed) {
@@ -25,33 +29,42 @@ void parallel_generate(
     DistGenFunc dist_factory,
     uint32_t seed,
     uint32_t max_threads = std::thread::hardware_concurrency()) {
-    constexpr size_t min_size = 1 << 12;  // determined empirically that this is where we see an advantage over
-                                          // sequential generation even with 2 threads.
-    if (seq.size() < min_size) {
-        sequential_generate(seq, dist_factory, seed);
-        return;
+    ttml::core::rng::generate_parallel_chunks(
+        seq,
+        [dist_factory](std::span<T> s, uint32_t s_seed) {
+            sequential_generate<T, DistGenFunc>(s, dist_factory, s_seed);
+        },
+        seed,
+        max_threads);
+}
+
+}  // namespace legacy
+
+static inline bool use_simd_rng() {
+    constexpr auto ENABLE_SIMD_RNG = "TT_TRAIN_ENABLE_SIMD_RNG";
+    static bool simd_enabled = (std::getenv(ENABLE_SIMD_RNG) != nullptr);
+
+    return simd_enabled;
+}
+
+template <typename T, typename DistGenFunc>
+void sequential_generate(std::span<T> seq, const DistGenFunc& dist_factory, uint32_t seed) {
+    if (use_simd_rng()) {
+        return sse::sequential_generate(seq, dist_factory, seed);
     }
+    return legacy::sequential_generate(seq, dist_factory, seed);
+}
 
-    size_t num_threads = std::min(max_threads, std::thread::hardware_concurrency());
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
-    size_t chunk_size = seq.size() / num_threads;
-    size_t remainder = seq.size() % num_threads;
-
-    size_t offset = 0;
-    for (size_t i = 0; i < num_threads; ++i) {
-        auto adjusted_chunk_size = chunk_size + (i == num_threads - 1 ? remainder : 0);
-        threads.emplace_back([&dist_factory, &seq, offset, adjusted_chunk_size, seed, i]() {
-            std::span<T> chunk{seq.data() + offset, adjusted_chunk_size};
-            sequential_generate(chunk, dist_factory, seed + i);
-        });
-        offset += adjusted_chunk_size;
+template <typename T, typename DistGenFunc>
+void parallel_generate(
+    std::span<T> seq,
+    DistGenFunc dist_factory,
+    uint32_t seed,
+    uint32_t max_threads = std::thread::hardware_concurrency()) {
+    if (use_simd_rng()) {
+        return sse::parallel_generate(seq, dist_factory, seed, max_threads);
     }
-
-    for (auto& thread : threads) {
-        thread.join();
-    }
+    return legacy::parallel_generate(seq, dist_factory, seed, max_threads);
 }
 
 }  // namespace ttml::core

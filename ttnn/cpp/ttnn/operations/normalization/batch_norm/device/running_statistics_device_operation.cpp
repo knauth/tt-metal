@@ -1,9 +1,11 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "running_statistics_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
 
+#include "ttnn/device_operation.hpp"
 #include "ttnn/operations/moreh/moreh_helper_functions.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "batch_norm_utils.hpp"
@@ -28,7 +30,7 @@ inline void check_tensor_stat(const Tensor& tensor, std::string_view name, std::
 }  // namespace
 
 void RunningStatistics::validate_tensors(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
+    const operation_attributes_t& /*operation_attributes*/, const tensor_args_t& tensor_args) {
     const auto& [batch_mean, batch_var, running_mean, running_var] = tensor_args;
 
     // mean (1, C, 1, 1)
@@ -36,6 +38,10 @@ void RunningStatistics::validate_tensors(
 
     check_tensor_stat(batch_mean, "batch_mean_shape", C);
     check_tensor_stat(batch_var, "batch_var_shape", C);
+
+    TT_FATAL(
+        running_mean.has_value() || running_var.has_value(),
+        "running_statistics requires at least one of running_mean / running_var");
 
     // running_mean (1, C, 1, 1)
     if (running_mean.has_value()) {
@@ -46,11 +52,6 @@ void RunningStatistics::validate_tensors(
     if (running_var.has_value()) {
         check_tensor_stat(running_var.value(), "running_var_shape", C);
     }
-}
-
-RunningStatistics::program_factory_t RunningStatistics::select_program_factory(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    return RunningStatisticsProgramFactory();
 }
 
 void RunningStatistics::validate_on_program_cache_miss(
@@ -84,11 +85,6 @@ void RunningStatistics::validate_on_program_cache_miss(
     validate_tensors(operation_attributes, tensor_args);
 };
 
-void RunningStatistics::validate_on_program_cache_hit(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    validate_tensors(operation_attributes, tensor_args);
-};
-
 DataType RunningStatistics::operation_attributes_t::get_dtype() const {
     return this->dtype.value_or(this->input_dtype);
 }
@@ -97,7 +93,7 @@ RunningStatistics::spec_return_value_t RunningStatistics::compute_output_specs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     using namespace tt::constants;
     const auto output_shape = tensor_args.batch_mean.logical_shape();
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         output_shape,
         TensorLayout(operation_attributes.get_dtype(), PageConfig(Layout::TILE), operation_attributes.memory_config));
 }
@@ -108,20 +104,25 @@ RunningStatistics::tensor_return_value_t RunningStatistics::create_output_tensor
         compute_output_specs(operation_attributes, tensor_args), tensor_args.batch_mean.device());
 }
 
-std::tuple<RunningStatistics::operation_attributes_t, RunningStatistics::tensor_args_t> RunningStatistics::invoke(
+}  // namespace ttnn::operations::normalization
+
+namespace ttnn::prim {
+ttnn::operations::normalization::RunningStatistics::tensor_return_value_t running_statistics(
     const Tensor& batch_mean,
     const Tensor& batch_var,
-    const float momentum,
+    float momentum,
     std::optional<Tensor> running_mean,
     std::optional<Tensor> running_var,
     const std::optional<MemoryConfig>& memory_config,
     const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
-    operation_attributes_t operation_attributes{
+    using OperationType = ttnn::operations::normalization::RunningStatistics;
+    OperationType::operation_attributes_t operation_attributes{
         momentum,
         memory_config.value_or(batch_mean.memory_config()),
-        batch_norm::utils::resolve_compute_kernel_config(compute_kernel_config, batch_mean),
+        ttnn::operations::normalization::batch_norm::utils::resolve_compute_kernel_config(compute_kernel_config, batch_mean),
         batch_mean.dtype()};
-    tensor_args_t tensor_args{batch_mean, batch_var, std::move(running_mean), std::move(running_var)};
-    return {operation_attributes, tensor_args};
+    OperationType::tensor_args_t tensor_args{batch_mean, batch_var, std::move(running_mean), std::move(running_var)};
+
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
-}  // namespace ttnn::operations::normalization
+}  // namespace ttnn::prim

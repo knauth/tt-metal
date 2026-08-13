@@ -3,24 +3,29 @@
 In this example, we will implement a simple TT-Metalium program to demonstrate how sharding works for untilized data. The code for this program can be found in
 [shard_data_rm.cpp](../../../tt_metal/programming_examples/sharding/shard_data_rm.cpp).
 
+## Building and Running the Example
+
 To build and execute, you may use the following commands:
 ```bash
-    export TT_METAL_HOME=$(pwd)
-    ./build_metal.sh --build-programming-examples
-    ./build/programming_examples/metal_example_shard_data_rm
+export TT_METAL_HOME=$(pwd)
+./build_metal.sh --build-programming-examples
+./build/programming_examples/metal_example_shard_data_rm
 ```
+
 # Device setup
 
 ``` cpp
 int device_id = 0;
-Device *device = CreateDevice(device_id);
-CommandQueue& cq = device->command_queue();
-Program program = CreateProgram();
+std::shared_ptr<distributed::MeshDevice> mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
+distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
+distributed::MeshWorkload workload;
+distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
+distributed::Program program = distributed::CreateProgram();
 ```
 
-We start the source code by creating an object that designates the hardware device that we will be using for the program. For this example, we select the device with an ID of 0.
-In order to dispatch commands to the device for execution we must also retrieve the `CommandQueue` object associated with `device`. Commands will be dispatched through this object to be executed on the device.
-The `Program` object is created to encapsulate our kernels and buffers.
+We start the source code by creating an object that designates the physical mesh of devices that we will be using for the program. For this example, we select the device with an ID of 0 to create a 1x1 mesh.
+In order to dispatch commands to the device for execution we must also retrieve the `MeshCommandQueue` object associated with `mesh_device`. Commands will be dispatched through this object to be executed on the mesh.
+The `Program` object is created to encapsulate our kernels and buffers. We also create a `MeshWorkload` object to encapsulate the program and the range of devices that we will be using for the program.
 
 # Initialize source data
 
@@ -150,17 +155,16 @@ const auto s0 = TensorAccessor(s1_args, src_addr, stick_size);
 uint32_t stick_id = start_id;
 cb_reserve_back(cb_id_in0, shard_height);
 uint32_t l1_write_addr = get_write_ptr(cb_id_in0);
-DPRINT_DATA0(DPRINT << "Core (0," << current_core << "): ");
+DPRINT_DATA0("Core (0,{}): ", current_core);
 for (uint32_t h = 0; h < shard_height; ++h) {
-    uint64_t src_noc_addr = get_noc_addr(stick_id, s0);
+    uint64_t src_noc_addr = s0.get_noc_addr(stick_id);
     noc_async_read(src_noc_addr, l1_write_addr, stick_size);
     uint32_t* read_ptr = (uint32_t*)l1_write_addr;
-    DPRINT_DATA0(DPRINT << (uint16_t)*read_ptr << " ");
-    DPRINT_DATA0(DPRINT << (uint16_t)(*read_ptr >> 16) << " ");
+    DPRINT_DATA0("{} {} ", (uint16_t)*read_ptr, (uint16_t)(*read_ptr >> 16));
     stick_id++;
     l1_write_addr += padded_offset_bytes;
 }
-DPRINT_DATA0(DPRINT << ENDL());
+DPRINT_DATA0("\n");
 noc_async_read_barrier();
 cb_push_back(cb_id_in0, shard_height);
 ```
@@ -177,14 +181,15 @@ Once the data is written to the circular buffer, `cb_push_back` is called to mak
 # Program execution
 
 ``` cpp
-EnqueueWriteBuffer(cq, src_buffer, src_vec.data(), false);
-EnqueueProgram(cq, program, false);
-Finish(cq);
-CloseDevice(device);
+distributed::EnqueueWriteMeshBuffer(cq, src_buffer, src_vec, false);
+workload.add_program(device_range, std::move(program));
+distributed::EnqueueMeshWorkload(cq, workload, false);
+distributed::Finish(cq);
+mesh_device->close();
 ```
 
-`EnqueueWriteBuffer` is called in order to load the source vector into the interleaved DRAM buffer.
-`EnqueueProgram` is then called to dispatch the program to the device for execution. Upon conclusion of the program execution, the device is closed.
+`EnqueueWriteMeshBuffer` is called in order to load the source vector into the interleaved DRAM buffer on the unit mesh.
+`EnqueueMeshWorkload` is then called to dispatch the program to the device for execution. Upon conclusion of the program execution, the device is closed.
 
 # Conclusion
 

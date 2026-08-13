@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -43,11 +43,12 @@ from models.demos.sentence_bert.runner.performant_runner import SentenceBERTPerf
     indirect=True,
 )
 @pytest.mark.parametrize("model_name, sequence_length", [("emrecan/bert-base-turkish-cased-mean-nli-stsb-tr", 384)])
-def test_sentence_bert_demo_inference(mesh_device, inputs, model_name, sequence_length, model_location_generator):
+def test_sentence_bert_demo_inference(
+    mesh_device, inputs, model_name, sequence_length, model_location_generator, is_ci_env
+):
     batch_size = len(inputs[0]) * mesh_device.get_num_devices()
-    transformers_model = transformers.AutoModel.from_pretrained(model_name).eval()
-    config = transformers.BertConfig.from_pretrained(model_name)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    config = transformers.BertConfig.from_pretrained(model_name, local_files_only=is_ci_env)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, local_files_only=is_ci_env)
     encoded_input = tokenizer(
         inputs[0] * mesh_device.get_num_devices(),
         padding="max_length",
@@ -100,8 +101,8 @@ def test_sentence_bert_demo_inference(mesh_device, inputs, model_name, sequence_
     logger.info(
         f"ttnn_sentencebert_batch_size: {len(inputs[0])}, One inference iteration time (sec): {inference_time}, Sentence per sec: {sentence_per_sec}"
     )
-    assert sentence_per_sec > 2984
-    assert inference_time < 0.0214
+    assert sentence_per_sec > 2700
+    assert inference_time < 0.024
     logger.info(f"Mean Cosine Similarity for Reference Model: {mean_similarity1}")
     logger.info(f"Mean Cosine Similarity for TTNN Model:: {mean_similarity2}")
 

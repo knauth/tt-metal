@@ -1,22 +1,20 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
+
+from pathlib import Path
 
 import pytest
 import torch
 from loguru import logger
 
 import ttnn
-from models.demos.t3000.falcon40b.reference.hf_modeling_falcon import FalconForCausalLM
+from models.common.utility_functions import profiler
+from models.demos.t3000.falcon40b.tests.test_utils import load_falcon_reference_model
 from models.demos.t3000.falcon40b.tt.falcon_causallm import TtFalconCausalLM
 from models.demos.t3000.falcon40b.tt.model_config import get_model_config
 from models.perf.perf_utils import prep_perf_report
-from models.utility_functions import (
-    disable_persistent_kernel_cache,
-    enable_persistent_kernel_cache,
-    profiler,
-    skip_for_grayskull,
-)
+from models.tt_transformers.tt.common import get_hf_tt_cache_path
 from ttnn import ConcatMeshToTensor
 
 
@@ -32,7 +30,6 @@ def run_test_FalconCausalLM_end_to_end(
     model_config,
     model_config_str,
     tt_cache_path,
-    model_location_generator,
     expected_compile_time,
     expected_inference_time,
     warmup_iterations,
@@ -43,13 +40,9 @@ def run_test_FalconCausalLM_end_to_end(
 
     # Clear global profiler state before starting measurements
     profiler.clear()
-    model_name = model_location_generator(model_version, model_subdir="Falcon")
 
     profiler.start("hugging_face_model_setup")
-    hugging_face_reference_model = FalconForCausalLM.from_pretrained(
-        model_name, low_cpu_mem_usage=True, num_hidden_layers=num_layers
-    )
-    hugging_face_reference_model.eval()
+    hugging_face_reference_model = load_falcon_reference_model(model_version, num_hidden_layers=num_layers)
     configuration = hugging_face_reference_model.config
     state_dict = hugging_face_reference_model.state_dict()
     profiler.end("hugging_face_model_setup")
@@ -222,7 +215,6 @@ def run_test_FalconCausalLM_end_to_end(
     # Run for perf iteration - profiler enabled
     ttnn.ReadDeviceProfiler(mesh_device)
     profiler.enable()
-    enable_persistent_kernel_cache()
     logger.info(f"Enable profiler and enable binary and compile cache")
     profiler.start(f"model_run_for_inference")
 
@@ -306,19 +298,18 @@ def run_test_FalconCausalLM_end_to_end(
     # This script does not asser the expected vs actual time since this is done based on the perf report and as part of the perf pipeline
 
 
-@skip_for_grayskull("Requires eth connected devices to run")
 @pytest.mark.model_perf_t3000
 @pytest.mark.parametrize("num_devices", (8,), ids=["8chips"])
 @pytest.mark.parametrize(
     "llm_mode, batch, seq_len, kv_cache_len, expected_compile_time, expected_inference_time, num_layers, model_config_str",
     (
-        ("prefill", 1, 32, 0, 62, 0.37 + 0.04, 60, "BFLOAT8_B-DRAM"),
-        ("prefill", 1, 128, 0, 60, 0.39 + 0.04, 60, "BFLOAT8_B-DRAM"),
-        ("prefill", 1, 2048, 0, 60, 0.94 + 0.1, 60, "BFLOAT8_B-DRAM"),
-        ("prefill", 1, 32, 0, 60, 0.42 + 0.04, 60, "BFLOAT16-DRAM"),
-        ("prefill", 1, 128, 0, 60, 0.46 + 0.04, 60, "BFLOAT16-DRAM"),
-        ("prefill", 1, 2048, 0, 60, 1.18 + 0.1, 60, "BFLOAT16-DRAM"),
-        ("decode", 32, 1, 128, 60, 0.21 + 0.02, 60, "BFLOAT8_B-SHARDED"),
+        ("prefill", 1, 32, 0, 62, 0.11 + 0.02, 60, "BFLOAT8_B-DRAM"),
+        ("prefill", 1, 128, 0, 60, 0.11 + 0.03, 60, "BFLOAT8_B-DRAM"),
+        ("prefill", 1, 2048, 0, 60, 0.67 + 0.05, 60, "BFLOAT8_B-DRAM"),
+        ("prefill", 1, 32, 0, 60, 0.11 + 0.02, 60, "BFLOAT16-DRAM"),
+        ("prefill", 1, 128, 0, 60, 0.11 + 0.02, 60, "BFLOAT16-DRAM"),
+        ("prefill", 1, 2048, 0, 60, 0.95 + 0.07, 60, "BFLOAT16-DRAM"),
+        ("decode", 32, 1, 128, 60, 0.13 + 0.02, 60, "BFLOAT8_B-SHARDED"),
     ),
     ids=[
         "prefill_seq32_bfp8",
@@ -336,6 +327,7 @@ def run_test_FalconCausalLM_end_to_end(
     ids=["falcon_40b"],
 )
 @pytest.mark.parametrize("device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_1D}], indirect=True)
+@pytest.mark.parametrize("mesh_device", [(1, 8)], indirect=True)
 def test_perf_bare_metal(
     num_devices,
     model_version,
@@ -348,9 +340,7 @@ def test_perf_bare_metal(
     num_layers,
     request,
     model_config_str,
-    model_location_generator,
-    get_tt_cache_path,
-    t3k_mesh_device,
+    mesh_device,
     is_ci_env,
 ):
     if llm_mode == "prefill" and (model_config_str not in ["BFLOAT8_B-DRAM", "BFLOAT16-DRAM"] or num_devices != 8):
@@ -360,18 +350,14 @@ def test_perf_bare_metal(
 
     input_shape = [batch, seq_len]
     model_config = get_model_config(model_config_str, llm_mode, input_shape, num_devices)
-    compute_grid_size = t3k_mesh_device.compute_with_storage_grid_size()
+    compute_grid_size = mesh_device.compute_with_storage_grid_size()
     if compute_grid_size.x < model_config["MAX_GRID_SIZE"][0] or compute_grid_size.y < model_config["MAX_GRID_SIZE"][1]:
         pytest.skip(f"Requires grid size of at least {model_config['MAX_GRID_SIZE']} to run")
 
-    tt_cache_path = get_tt_cache_path(
-        model_version, model_subdir="Falcon", default_dir=model_config["DEFAULT_CACHE_PATH"]
-    )
-
-    disable_persistent_kernel_cache()
+    tt_cache_path = Path(get_hf_tt_cache_path(model_version))
 
     run_test_FalconCausalLM_end_to_end(
-        t3k_mesh_device,
+        mesh_device,
         model_version,
         llm_mode,
         batch,
@@ -381,7 +367,6 @@ def test_perf_bare_metal(
         model_config,
         model_config_str,
         tt_cache_path,
-        model_location_generator,
         expected_compile_time,
         expected_inference_time,
         warmup_iterations=10,
@@ -389,7 +374,6 @@ def test_perf_bare_metal(
     )
 
 
-@skip_for_grayskull("Requires eth connected devices to run")
 @pytest.mark.parametrize("num_devices", (8,), ids=["8chips"])
 @pytest.mark.parametrize(
     "llm_mode, batch, seq_len, kv_cache_len, expected_compile_time, expected_inference_time, num_layers, model_config_str",
@@ -408,6 +392,7 @@ def test_perf_bare_metal(
     ids=["falcon_40b"],
 )
 @pytest.mark.parametrize("device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_1D}], indirect=True)
+@pytest.mark.parametrize("mesh_device", [(1, 8)], indirect=True)
 def test_device_perf_bare_metal(
     num_devices,
     model_version,
@@ -420,9 +405,7 @@ def test_device_perf_bare_metal(
     num_layers,
     request,
     model_config_str,
-    model_location_generator,
-    get_tt_cache_path,
-    t3k_mesh_device,
+    mesh_device,
     is_ci_env,
 ):
     if llm_mode == "prefill" and (model_config_str not in ["BFLOAT8_B-DRAM", "BFLOAT16-DRAM"] or num_devices != 8):
@@ -432,18 +415,14 @@ def test_device_perf_bare_metal(
 
     input_shape = [batch, seq_len]
     model_config = get_model_config(model_config_str, llm_mode, input_shape, num_devices)
-    compute_grid_size = t3k_mesh_device.compute_with_storage_grid_size()
+    compute_grid_size = mesh_device.compute_with_storage_grid_size()
     if compute_grid_size.x < model_config["MAX_GRID_SIZE"][0] or compute_grid_size.y < model_config["MAX_GRID_SIZE"][1]:
         pytest.skip(f"Requires grid size of at least {model_config['MAX_GRID_SIZE']} to run")
 
-    tt_cache_path = get_tt_cache_path(
-        model_version, model_subdir="Falcon", default_dir=model_config["DEFAULT_CACHE_PATH"]
-    )
-
-    disable_persistent_kernel_cache()
+    tt_cache_path = Path(get_hf_tt_cache_path(model_version))
 
     run_test_FalconCausalLM_end_to_end(
-        t3k_mesh_device,
+        mesh_device,
         model_version,
         llm_mode,
         batch,
@@ -453,7 +432,6 @@ def test_device_perf_bare_metal(
         model_config,
         model_config_str,
         tt_cache_path,
-        model_location_generator,
         expected_compile_time,
         expected_inference_time,
         warmup_iterations=10,

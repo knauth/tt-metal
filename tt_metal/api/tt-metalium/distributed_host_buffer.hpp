@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -7,7 +7,6 @@
 #include <tt_stl/span.hpp>
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/host_buffer.hpp>
-#include <tt-metalium/assert.hpp>
 #include <tt-metalium/mesh_device_view.hpp>
 #include <tt-metalium/distributed_context.hpp>
 
@@ -52,6 +51,7 @@ public:
     // Emplaces the shard at the specified `coord`, calling `produce_buffer` to create the buffer only when needed.
     // No-op if the index is out of local bounds.
     // Throws if the index is out of global bounds.
+    using ProduceBufferFn = std::function<HostBuffer(const distributed::MeshCoordinate&)>;
     void emplace_shard(const distributed::MeshCoordinate& coord, const std::function<HostBuffer()>& produce_buffer);
 
     // Returns true if the shard at the specified `coord` is local, false if remote.
@@ -71,6 +71,13 @@ public:
 
     using ApplyFn = std::function<void(const HostBuffer& buffer)>;
     void apply(const ApplyFn& fn, ProcessShardExecutionPolicy policy = ProcessShardExecutionPolicy::SEQUENTIAL) const;
+
+    // NOTE: `coords` are global, so this will skip non local shards.
+    // Calls emplace_shard for each coordinate in `coords` using the specified execution policy.
+    void emplace_shards(
+        const std::vector<distributed::MeshCoordinate>& coords,
+        const ProduceBufferFn& produce_buffer,
+        ProcessShardExecutionPolicy policy = ProcessShardExecutionPolicy::SEQUENTIAL);
 
     // Returns the global shape of the buffer.
     const distributed::MeshShape& shape() const;

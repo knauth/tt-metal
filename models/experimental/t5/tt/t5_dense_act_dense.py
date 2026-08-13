@@ -1,10 +1,10 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 from torch import nn
 import ttnn
-from models.utility_functions import torch2tt_tensor
+from models.common.utility_functions import torch2tt_tensor
 
 
 class TtT5DenseActDense(nn.Module):

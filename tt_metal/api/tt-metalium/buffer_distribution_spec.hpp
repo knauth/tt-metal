@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -13,8 +13,17 @@
 namespace tt::tt_metal {
 
 namespace detail {
+// TODO: These functions in the detail namespace are sharding utility functions and should be moved to a separate
+// header.
 UncompressedBufferPageMapping compute_page_mapping(
-    const Shape& tensor_shape, const Shape& shard_shape, const std::vector<CoreCoord>& cores);
+    const Shape& tensor_shape,
+    const Shape& shard_shape,
+    const std::vector<CoreCoord>& cores,
+    ShardDistributionStrategy shard_distribution_strategy = ShardDistributionStrategy::ROUND_ROBIN_1D);
+
+// Squeezes tensor and shard shapes to minimize rank while preserving sharding semantics.
+// The returned shapes are guaranteed to have the same rank.
+std::pair<Shape, Shape> squeeze_shape_ranks(const Shape& tensor_shape, const Shape& shard_shape);
 }
 
 class BufferDistributionSpec {
@@ -23,18 +32,19 @@ public:
         Shape tensor_shape,
         Shape shard_shape,
         Shape2D page_shape,
-        CoreRangeSet core_range_set,
+        const CoreRangeSet& core_range_set,
         ShardOrientation shard_orientation,
         ShardDistributionStrategy shard_distribution_strategy = ShardDistributionStrategy::ROUND_ROBIN_1D);
 
     BufferDistributionSpec(
-        Shape tensor_shape_in_pages,
-        Shape shard_shape_in_pages,
-        CoreRangeSet core_range_set,
+        const Shape& tensor_shape_in_pages,
+        const Shape& shard_shape_in_pages,
+        const CoreRangeSet& core_range_set,
         ShardOrientation shard_orientation,
         ShardDistributionStrategy shard_distribution_strategy = ShardDistributionStrategy::ROUND_ROBIN_1D);
 
-    BufferDistributionSpec(Shape tensor_shape_in_pages, Shape shard_shape_in_pages, std::vector<CoreCoord> cores);
+    BufferDistributionSpec(
+        const Shape& tensor_shape_in_pages, const Shape& shard_shape_in_pages, std::vector<CoreCoord> cores);
 
     const Shape& tensor_shape_in_pages() const { return tensor_shape_in_pages_; }
     const Shape& shard_shape_in_pages() const { return shard_shape_in_pages_; }
@@ -50,6 +60,8 @@ public:
     size_t num_shards_per_core(size_t core_idx) const;
     size_t num_dev_pages_per_core(size_t core_idx) const;
 
+    ShardDistributionStrategy shard_distribution_strategy() const { return shard_distribution_strategy_; }
+
     struct CoreGroups {
         CoreRangeSet cores_with_data;
         CoreRangeSet cores_in_group_1;
@@ -64,7 +76,8 @@ public:
     std::tuple<uint32_t, CoreRangeSet, CoreRangeSet, CoreRangeSet, uint32_t, uint32_t> core_groups_tuple() const;
 
     UncompressedBufferPageMapping compute_page_mapping() const {
-        return detail::compute_page_mapping(tensor_shape_in_pages_, shard_shape_in_pages_, cores_);
+        return detail::compute_page_mapping(
+            tensor_shape_in_pages_, shard_shape_in_pages_, cores_, shard_distribution_strategy_);
     }
 
 private:
@@ -80,6 +93,7 @@ private:
     Shape shard_shape_in_pages_;
 
     std::vector<CoreCoord> cores_;
+    ShardDistributionStrategy shard_distribution_strategy_ = ShardDistributionStrategy::ROUND_ROBIN_1D;
 
     // Precomputed data
     CoreGroups core_groups_;

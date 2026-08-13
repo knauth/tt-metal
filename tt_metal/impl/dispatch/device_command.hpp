@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -14,8 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "command_queue_interface.hpp"
-#include "env_lib.hpp"
+#include "common/env_lib.hpp"
 #include "hal_types.hpp"
 #include "impl/context/metal_context.hpp"
 #include "memcpy.hpp"
@@ -53,11 +52,14 @@ public:
     vector_aligned<uint32_t> cmd_vector() const;
 
     void add_dispatch_wait(
-        uint32_t flags, uint32_t address, uint32_t stream, uint32_t count, uint8_t dispatcher_type = 0);
+        uint32_t flags, uint32_t address, uint32_t stream, uint32_t count, uint8_t cq_id, uint8_t dispatcher_type = 0);
 
-    void add_dispatch_wait_with_prefetch_stall(uint32_t flags, uint32_t address, uint32_t stream, uint32_t count);
+    void add_dispatch_wait_with_prefetch_stall(
+        uint32_t flags, uint32_t address, uint32_t stream, uint32_t count, uint8_t cq_id);
 
-    void add_prefetch_relay_linear(uint32_t noc_xy_addr, uint32_t lengthB, uint32_t addr);
+    void add_prefetch_relay_linear(uint32_t noc_xy_addr, DeviceAddr lengthB, DeviceAddr addr);
+
+    void add_prefetch_relay_linear_h(uint32_t noc_xy_addr, DeviceAddr lengthB, DeviceAddr addr);
 
     void add_prefetch_relay_paged(
         uint8_t is_dram,
@@ -73,6 +75,20 @@ public:
         uint16_t num_sub_cmds,
         uint32_t offset_idx = 0);
 
+    void add_prefetch_relay_linear_packed(
+        uint32_t noc_xy_addr,
+        uint32_t total_length,
+        const std::vector<CQPrefetchRelayLinearPackedSubCmd>& sub_cmds,
+        uint16_t num_sub_cmds,
+        uint32_t offset_idx = 0);
+
+    void add_prefetch_relay_linear_packed_h(
+        uint32_t noc_xy_addr,
+        uint32_t total_length,
+        const std::vector<CQPrefetchRelayLinearPackedSubCmd>& sub_cmds,
+        uint16_t num_sub_cmds,
+        uint32_t offset_idx = 0);
+
     void add_prefetch_paged_to_ringbuffer(const CQPrefetchPagedToRingbufferCmd& paged_to_ringbuffer_info);
 
     void add_prefetch_set_ringbuffer_offset(uint32_t offset, bool update_wp = false);
@@ -84,21 +100,33 @@ public:
     void add_dispatch_write_linear(
         uint8_t num_mcast_dests,
         uint32_t noc_xy_addr,
-        uint32_t addr,
-        uint32_t data_sizeB,
+        DeviceAddr addr,
+        DeviceAddr data_sizeB,
+        const void* data = nullptr,
+        uint32_t write_offset_index = 0);
+
+    // Like add_dispatch_write_linear, but emits CQ_DISPATCH_CMD_WRITE_LINEAR_H (dispatch_h variant).
+    template <bool flush_prefetch = true, bool inline_data = false>
+    void add_dispatch_write_linear_h(
+        uint8_t num_mcast_dests,
+        uint32_t noc_xy_addr,
+        DeviceAddr addr,
+        DeviceAddr data_sizeB,
         const void* data = nullptr,
         uint32_t write_offset_index = 0);
 
     void add_dispatch_go_signal_mcast(
         uint32_t wait_count,
         uint32_t go_signal,
-        uint32_t wait_addr,
+        uint32_t wait_stream,
         uint8_t multicast_go_offset,
         uint8_t num_unicast_txns,
         uint8_t noc_data_start_index,
         DispatcherSelect dispatcher_type);
 
     void add_notify_dispatch_s_go_signal_cmd(uint8_t wait, uint16_t index_bitmask);
+
+    void add_dispatch_rt_profiler_flush(uint32_t wait_count, uint32_t wait_stream);
 
     template <bool inline_data = false>
     void add_dispatch_write_paged(
@@ -110,17 +138,34 @@ public:
         uint32_t pages,
         const void* data = nullptr);
 
+    // Variant that allows specifying a different inline data size than write_paged pages * page_size
+    // Used when we need to pass through alignment prefix bytes directly via relay_inline
+    // Always inlines the data (no template parameter needed)
+    void add_dispatch_write_paged_with_custom_inline_size(
+        bool flush_prefetch,
+        uint8_t is_dram,
+        uint16_t start_page,
+        uint32_t base_addr,
+        uint32_t page_size,
+        uint32_t pages,
+        uint32_t inline_data_sizeB,
+        const void* data);
+
     template <bool inline_data = false>
-    void add_dispatch_write_host(bool flush_prefetch, uint32_t data_sizeB, bool is_event, const void* data = nullptr);
+    void add_dispatch_write_host(
+        bool flush_prefetch, uint64_t data_sizeB, bool is_event, uint16_t pad1, const void* data = nullptr);
 
     void add_prefetch_exec_buf(uint32_t base_addr, uint32_t log_page_size, uint32_t pages);
 
     void add_dispatch_set_num_worker_sems(uint32_t num_worker_sems, DispatcherSelect dispatcher_type);
 
+    void add_dispatch_set_sub_device_worker_counts(
+        ttsl::Span<const uint32_t> workers_per_sub_device, DispatcherSelect dispatcher_type);
+
     void add_dispatch_set_go_signal_noc_data(
         const vector_aligned<uint32_t>& noc_mcast_unicast_data, DispatcherSelect dispatcher_type);
 
-    void add_dispatch_set_write_offsets(tt::stl::Span<const uint32_t> write_offsets);
+    void add_dispatch_set_write_offsets(ttsl::Span<const uint32_t> write_offsets);
 
     void add_dispatch_terminate(DispatcherSelect dispatcher_type = DispatcherSelect::DISPATCH_MASTER);
 
@@ -132,6 +177,8 @@ public:
 
     void add_data(const void* data, uint32_t data_size_to_copyB, uint32_t cmd_write_offset_incrementB)
         __attribute((nonnull(2)));
+
+    void align_write_offset();
 
     template <typename PackedSubCmd>
     void add_dispatch_write_packed(
@@ -178,7 +225,28 @@ public:
         uint16_t alignment,
         uint16_t num_sub_cmds,
         const std::vector<CQDispatchWritePackedLargeSubCmd>& sub_cmds,
-        const std::vector<tt::stl::Span<const uint8_t>>& data_collection,
+        const std::vector<ttsl::Span<const uint8_t>>& data_collection,
+        std::vector<uint8_t*>*
+            data_collection_buffer_ptr,  // optional. Stores the location each data segment was written to
+        uint32_t offset_idx = 0,
+        uint32_t write_offset_index = 0);
+
+    // Add write packed large unicast, with no data.
+    void add_dispatch_write_packed_large_unicast(
+        uint8_t type,
+        uint16_t alignment,
+        uint16_t num_sub_cmds,
+        const std::vector<CQDispatchWritePackedLargeUnicastSubCmd>& sub_cmds,
+        uint32_t offset_idx = 0,
+        uint32_t write_offset_index = 0);
+
+    // Add write packed large unicast, with data inlined.
+    void add_dispatch_write_packed_large_unicast(
+        uint8_t type,
+        uint16_t alignment,
+        uint16_t num_sub_cmds,
+        const std::vector<CQDispatchWritePackedLargeUnicastSubCmd>& sub_cmds,
+        const std::vector<ttsl::Span<const uint8_t>>& data_collection,
         std::vector<uint8_t*>*
             data_collection_buffer_ptr,  // optional. Stores the location each data segment was written to
         uint32_t offset_idx = 0,
@@ -198,6 +266,10 @@ public:
         return cmd;
     }
 
+    // This value is random, but stable for the lifetime of the program. It is used to pad the command for event
+    // commands, so we can check the value on the host side.
+    static uint32_t random_padding_value();
+
 private:
     static bool zero_init_enable;
 
@@ -212,6 +284,17 @@ private:
         uint32_t payload_sizeB,
         uint16_t num_sub_cmds,
         const std::vector<CQDispatchWritePackedLargeSubCmd>& sub_cmds,
+        uint32_t offset_idx,
+        uint32_t write_offset_index);
+
+    // Write packed large unicast cmd and subcmds, but not data.
+    void add_dispatch_write_packed_large_unicast_internal(
+        uint8_t type,
+        bool flush_prefetch,
+        uint16_t alignment,
+        uint32_t payload_sizeB,
+        uint16_t num_sub_cmds,
+        const std::vector<CQDispatchWritePackedLargeUnicastSubCmd>& sub_cmds,
         uint32_t offset_idx,
         uint32_t write_offset_index);
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -51,4 +51,45 @@ def pytest_addoption(parser):
         default=False,
         type=bool,
         help="Run stress test (same decode iteration over a large number of iterations",
+    )
+    parser.addoption("--enable_trace", action="store_true", default=None, help="Enable tracing")
+    parser.addoption("--disable_trace", action="store_false", dest="enable_trace", default=None, help="Disable tracing")
+    parser.addoption(
+        "--num_layers",
+        action="store",
+        default=None,
+        type=int,
+        help="Number of layers to use",
+    )
+    parser.addoption(
+        "--mode",
+        action="store",
+        default="full",
+        type=str,
+        help="Mode to use for full model demo tests (values can be 'prefill','decode','full')",
+    )
+    parser.addoption(
+        "--use_prefetcher",
+        action="store",
+        default=False,
+        type=bool,
+        help="Whether to use DRAM prefetcher for prefetching weights into L1 during decode (only available on BH)",
+    )
+    parser.addoption(
+        "--use_hf_rope",
+        action="store_true",
+        default=False,
+        help="Whether to use HF-style rope, if not passed, the default mllama will be used",
+    )
+    parser.addoption(
+        "--skip_perf_report",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip writing the perf benchmark JSON and the CI perf-target check for this run. "
+            "Use when the same test is run in more than one configuration and only one of them "
+            "should report/validate perf (e.g. Llama-8B runs ci-eval-32 both without the prefetcher "
+            "for repeat-batch coverage and with the prefetcher on a single batch for perf; only the "
+            "latter should report perf). See issue #47820."
+        ),
     )

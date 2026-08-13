@@ -1,35 +1,64 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include <optional>
+
+#include <tt-metalium/constants.hpp>
+#include <tt-metalium/program.hpp>
+#include <tt-metalium/program_descriptors.hpp>
+#include <tt-metalium/workload_descriptor.hpp>
+
+#include "ttnn/device_operation.hpp"
+#include "ttnn/mesh_device_operation_adapter.hpp"
 #include "ttnn/operation.hpp"
-#include "ttnn/operations/transformer/sdpa_config.hpp"
+#include "ttnn/operations/ccl/ccl_common.hpp"
+#include "ttnn/operations/ccl/ccl_host_types.hpp"
 #include "ttnn/operations/ccl/ccl_op_fusion.hpp"
-#include "ring_fusion.hpp"
+#include "ttnn/operations/transformer/sdpa/device/ring_joint_sdpa_device_operation_types.hpp"
+#include "ttnn/operations/experimental/ccl/ring_attention_all_gather_async/device/ring_attention_all_gather_async_multi_core_with_workers_program_factory.hpp"
 
-namespace ttnn::operations::transformer::detail {
+namespace ttnn::prim {
 
-tt::tt_metal::operation::ProgramWithCallbacks ring_joint_sdpa(
-    tt::tt_metal::Program& program,
-    const Tensor& input_tensor_q,
-    const Tensor& input_tensor_k,
-    const Tensor& input_tensor_v,
-    const Tensor& joint_tensor_q,
-    const Tensor& joint_tensor_k,
-    const Tensor& joint_tensor_v,
-    const Tensor& output_tensor,
-    const Tensor& joint_output_tensor,
-    const Tensor& lse_output_tensor,
-    std::size_t logical_n,
-    std::optional<float> scale,
-    std::size_t q_chunk_size,
-    std::size_t k_chunk_size,
-    std::size_t ring_size,
-    DeviceComputeKernelConfig compute_kernel_config,
-    std::optional<SDPAProgramConfig> program_config,
-    std::optional<RingSDPAFusedOpSignaler>& sdpa_fused_op_signaler);
+namespace detail {
 
-}  // namespace ttnn::operations::transformer::detail
+struct RingJointSDPADescriptorAdapterOperation {
+    using operation_attributes_t = RingJointSDPAParams;
+    using tensor_args_t = RingJointSDPAInputs;
+    using spec_return_value_t = RingJointSDPAResultSpec;
+    using tensor_return_value_t = RingJointSDPAResult;
+};
+
+}  // namespace detail
+
+struct RingJointSDPAProgramFactory {
+    static tt::tt_metal::WorkloadDescriptor create_workload_descriptor(
+        const RingJointSDPAParams& args,
+        const RingJointSDPAInputs& tensor_args,
+        RingJointSDPAResult& output_tensors,
+        const ttnn::MeshCoordinateRangeSet& tensor_coords);
+};
+
+struct RingJointSDPAMeshWorkloadFactory {
+    using descriptor_adapter_t = ttnn::device_operation::MeshDeviceOperationAdapter<
+        detail::RingJointSDPADescriptorAdapterOperation>::DescriptorMeshWorkloadAdapter<RingJointSDPAProgramFactory>;
+    using cached_mesh_workload_t = typename descriptor_adapter_t::cached_mesh_workload_t;
+
+    static cached_mesh_workload_t create_mesh_workload(
+        const RingJointSDPAParams& args,
+        const ttnn::MeshCoordinateRangeSet& tensor_coords,
+        const RingJointSDPAInputs& tensor_args,
+        RingJointSDPAResult& output_tensors);
+
+    static void override_runtime_arguments(
+        cached_mesh_workload_t& cached_workload,
+        const RingJointSDPAParams& args,
+        const RingJointSDPAInputs& tensor_args,
+        RingJointSDPAResult& output_tensors);
+};
+
+static_assert(ttnn::device_operation::MeshWorkloadFactoryConcept<RingJointSDPAMeshWorkloadFactory>);
+
+}  // namespace ttnn::prim

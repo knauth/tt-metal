@@ -2,7 +2,7 @@
 
 ## Overview
 
-The [TensorAccessor](../../tt_metal/hw/inc/accessor/tensor_accessor.h) is a utility for efficiently accessing all tensors distributed across multiple memory banks. It provides an abstraction that handles the mapping from logical tensor indices to physical memory locations.
+The [TensorAccessor](../../tt_metal/hw/inc/api/tensor/tensor_accessor.h) is a utility for efficiently accessing all tensors distributed across multiple memory banks. It provides an abstraction that handles the mapping from logical tensor indices to physical memory locations.
 
 The main thing to keep in mind when working with it is that developer can choose which arguments of accessor are passed through compile time arguments, which through common-runtime arguments.
 Parameters may consist of rank, number of banks, tensor shape, shard shape, banks coordinates, etc.
@@ -44,7 +44,7 @@ You can configure which parts of the accessor arguments are passed through runti
 
 These flags can be combined with bitwise OR (|) to specify multiple runtime parameters.
 
-There is one important limitation: In case size of container (rank/num_banks) is runtime argument, then values of containers (tensor_shape/shard_shape/bank_coords) must also be runtime arguments. The reason is that all compile-time indecies must be constexpr expressions, and it's impossible to calculate offset for shapes without knowing their sizes.
+There is one important limitation: In case size of container (rank/num_banks) is runtime argument, then values of containers (tensor_shape/shard_shape/bank_coords) must also be runtime arguments. The reason is that all compile-time indices must be constexpr expressions, and it's impossible to calculate offset for shapes without knowing their sizes.
 
 ## Device-Side Usage
 **Creating an Accessor**
@@ -66,7 +66,9 @@ constexpr uint32_t new_base_idx_cta = args.next_compile_time_args_offset();
 // new_base_idx_crta might be constexpr if rank and number of banks are static
 uint32_t new_base_idx_crta = args.next_common_runtime_args_offset();
 
-// Create a TensorAccessor with runtime page size
+// Option 1 (preferred, less error-prone): Using default tensor buffer's aligned_page_size to create a TensorAccessor
+auto tensor_accessor = TensorAccessor(args, bank_base_address);
+// Option 2: Create a TensorAccessor with custom runtime page size passed in as the 3rd argument. Used when we need to override the compile-time aligned_page_size if we have a program cache hit on a buffer with a different aligned_page_size.
 auto tensor_accessor = TensorAccessor(args, bank_base_address, page_size);
 ```
 
@@ -98,21 +100,21 @@ Address Calculation
 
 ```c++
 // Get the NOC address for a given page
-uint32_t noc_addr = tensor_accessor.get_noc_addr(page_id);
+uint64_t noc_addr = tensor_accessor.get_noc_addr(page_id);
 
 // Get bank ID and offset for a given page
 auto [bank_id, bank_offset] = tensor_accessor.get_bank_and_offset(page_id);
 
 // You can also address pages by nd coordinate (such address calculation is a little bit cheaper)
 std::array<uint32_t, 4> page_coord{0, 1, 2, 3};
-uint32_t noc_addr = tensor_accessor.get_noc_addr(page_coord);   // <- Anything with operator[] should work
+uint64_t noc_addr = tensor_accessor.get_noc_addr(page_coord);   // <- Anything with operator[] should work
 
 // For sharded tensor, you can get address of shards:
 static_assert(args::is_sharded, "Sharded API requires sharded tensor");
-uint32_t noc_addr = tensor_accessor.get_shard_noc_addr(shard_id);
+uint64_t noc_addr = tensor_accessor.get_shard_noc_addr(shard_id);
 
 std::array<uint32_t, 4> shard_coord{0, 1, 2, 3};
-uint32_t noc_addr = tensor_accessor.get_shard_noc_addr(shard_coord); // <- Anything with operator[] should work
+uint64_t noc_addr = tensor_accessor.get_shard_noc_addr(shard_coord); // <- Anything with operator[] should work
 ```
 
 Data Transfer
@@ -170,12 +172,16 @@ bool is_local = tensor_accessor.is_local_page(page_id);
 bool is_local = tensor_accessor.is_local_shard(shard_id);
 ```
 
-Note: In case containers size is compile-time, then shapes, strides, coords are `std::array<uint32_t, rank/num_banks>`, otherwide `Span<uint32_t>`
+Note: In case containers size is compile-time, then shapes, strides, coords are `std::array<uint32_t, rank/num_banks>`, otherwise `Span<uint32_t>`
 
+## Tensor Accessor iterators
+You can use TensorAccessor iterators to speed up and/or simplify iteration over pages in a tensor.
+[Tensor Accessor iterators documentation.](./tensor_accessor_iterator.md)
 
 ## Performance Considerations
 - If rank is static, then construction of TensorAccessor is 0-cost, meaning that everything is precomputed in compile time.
-- Calculation of address scales ~lineary with number rank
+- Calculation of address scales ~linearly with rank
+- Iterator-based approaches are more efficient than repeated calls to get_noc_addr() due to state caching (especially shard_pages)
 
 
 ## Examples:

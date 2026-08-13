@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,7 +14,7 @@ from tests.sweep_framework.sweep_utils.utils import gen_shapes
 from tests.tt_eager.python_api_testing.sweep_tests.generation_funcs import gen_func_with_cast_tt
 
 from tests.ttnn.utils_for_testing import check_with_pcc, start_measuring_time, stop_measuring_time
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 
 # Override the default timeout in seconds for hang detection.
 TIMEOUT = 360
@@ -113,7 +113,7 @@ def run(
 
     # If we store result to L1 required volume should not be larger than 1Mb
     while input_a_memory_config == ttnn.L1_MEMORY_CONFIG and max_volume(rehape_shape) > 1024 * 1024 and i < num_tries:
-        rehape_shape = gen_reshape_shape(input_shape)
+        rehape_shape = gen_reshape_shape(tuple(input_shape))
         i += 1
 
     torch_output_tensor = torch.reshape(torch_input_tensor_a, rehape_shape)

@@ -1,13 +1,12 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
 #include <fmt/base.h>
-#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include <stdint.h>
-#include <tt_stl/reflection.hpp>
 #include <tt_stl/span.hpp>
 #include <algorithm>
 #include <cstddef>
@@ -17,47 +16,23 @@
 #include <string>
 #include <vector>
 
-#include <umd/device/tt_xy_pair.h>
-#include <umd/device/types/xy_pair.h>
+// UMD: re-exports tt_xy_pair, aliased as CoreCoord in this header.
+#include <umd/device/types/xy_pair.hpp>
 
-namespace tt {
-namespace stl {
-namespace json {
+namespace ttsl::json {
 template <typename T>
 struct from_json_t;
 template <typename T>
 struct to_json_t;
-}  // namespace json
-}  // namespace stl
-}  // namespace tt
+}  // namespace ttsl::json
+
+namespace tt::tt_metal {
 
 using CoreCoord = tt_xy_pair;
 
 class CoreRangeSet;
 
-template <>
-struct fmt::formatter<CoreCoord> {
-    constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.end(); }
-
-    auto format(const CoreCoord& core_coord, format_context& ctx) const -> format_context::iterator;
-};
-
-constexpr inline bool operator<=(const CoreCoord& a, const CoreCoord& b) { return (a < b) or (a == b); }
-
-struct RelativeCoreCoord {
-    long x = 0;
-    long y = 0;
-
-    std::string str() const;
-};
-
-constexpr inline bool operator==(const RelativeCoreCoord& a, const RelativeCoreCoord& b) {
-    return a.x == b.x && a.y == b.y;
-}
-
-constexpr inline bool operator!=(const RelativeCoreCoord& a, const RelativeCoreCoord& b) { return !(a == b); }
-
-CoreCoord get_core_coord_from_relative(const RelativeCoreCoord& in, const CoreCoord& grid_size);
+constexpr bool operator<=(const CoreCoord& a, const CoreCoord& b) { return (a < b) or (a == b); }
 
 class CoreRange {
 public:
@@ -127,26 +102,19 @@ constexpr bool operator<(const CoreRange& left, const CoreRange& right) {
         (left.start_coord == right.start_coord && left.end_coord < right.end_coord));
 }
 
-template <>
-struct fmt::formatter<CoreRange> {
-    constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.end(); }
-
-    auto format(const CoreRange& core_range, format_context& ctx) const -> format_context::iterator;
-};
-
 class CoreRangeSet {
 public:
-    CoreRangeSet(tt::stl::Span<const CoreRange> core_ranges);
+    CoreRangeSet(ttsl::Span<const CoreRange> core_ranges);
 
     CoreRangeSet(const std::set<CoreRange>& core_ranges);
 
     CoreRangeSet(const CoreRange& core_range);
 
-    CoreRangeSet(tt::stl::Span<const CoreCoord> core_coords);
+    CoreRangeSet(ttsl::Span<const CoreCoord> core_coords);
 
     CoreRangeSet() = default;
 
-    friend void swap(CoreRangeSet& first, CoreRangeSet& second);
+    friend void swap(CoreRangeSet& first, CoreRangeSet& second) noexcept;
 
     CoreRangeSet(const CoreRangeSet& other);
 
@@ -239,35 +207,89 @@ std::optional<CoreRange> select_contiguous_range_from_corerangeset(const CoreRan
 
 bool operator!=(const CoreRangeSet& a, const CoreRangeSet& b);
 
-template <>
-struct fmt::formatter<CoreRangeSet> {
-    constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.end(); }
-
-    auto format(const CoreRangeSet& core_range_set, format_context& ctx) const -> format_context::iterator;
-};
+}  // namespace tt::tt_metal
 
 // Adding to tt::tt_metal namespace as we transition to moving this out of global namespace eventually.
-namespace tt::tt_metal {
-using ::CoreCoord;
-using ::CoreRange;
-using ::CoreRangeSet;
-}  // namespace tt::tt_metal
+using CoreRange [[deprecated("Use tt::tt_metal::CoreRange")]] = tt::tt_metal::CoreRange;
+using CoreRangeSet [[deprecated("Use tt::tt_metal::CoreRangeSet")]] = tt::tt_metal::CoreRangeSet;
+
+// Deprecated function wrappers - use tt::tt_metal namespace versions instead
+// template to depriorize the wrappers in overloading to avoid ambiguous selection from compiler.
+
+template <bool _compiler_deprioritize_this = true>
+[[deprecated("Use tt::tt_metal::corerange_to_cores")]] inline std::vector<tt::tt_metal::CoreCoord> corerange_to_cores(
+    const CoreRangeSet& crs, std::optional<uint32_t> max_cores = std::nullopt, bool row_wise = false) {
+    return tt::tt_metal::corerange_to_cores(crs, max_cores, row_wise);
+}
+
+template <bool _compiler_deprioritize_this = true>
+[[deprecated("Use tt::tt_metal::grid_to_cores")]] inline std::vector<tt::tt_metal::CoreCoord> grid_to_cores(
+    uint32_t num_cores, uint32_t grid_size_x, uint32_t grid_size_y, bool row_wise = false) {
+    return tt::tt_metal::grid_to_cores(num_cores, grid_size_x, grid_size_y, row_wise);
+}
+
+template <bool _compiler_deprioritize_this = true>
+[[deprecated("Use tt::tt_metal::grid_to_cores")]] inline std::vector<tt::tt_metal::CoreCoord> grid_to_cores(
+    tt::tt_metal::CoreCoord start, tt::tt_metal::CoreCoord end, bool row_wise = false) {
+    return tt::tt_metal::grid_to_cores(start, end, row_wise);
+}
+
+template <bool _compiler_deprioritize_this = true>
+[[deprecated("Use tt::tt_metal::grid_to_cores_with_noop")]] inline std::vector<tt::tt_metal::CoreCoord> grid_to_cores_with_noop(
+    uint32_t bbox_x, uint32_t bbox_y, uint32_t grid_size_x, uint32_t grid_size_y, bool row_wise = false) {
+    return tt::tt_metal::grid_to_cores_with_noop(bbox_x, bbox_y, grid_size_x, grid_size_y, row_wise);
+}
+
+template <bool _compiler_deprioritize_this = true>
+[[deprecated("Use tt::tt_metal::grid_to_cores_with_noop")]] inline std::vector<tt::tt_metal::CoreCoord> grid_to_cores_with_noop(
+    const CoreRangeSet& used_cores, const CoreRangeSet& all_cores, bool row_wise = false) {
+    return tt::tt_metal::grid_to_cores_with_noop(used_cores, all_cores, row_wise);
+}
+
+template <bool _compiler_deprioritize_this = true>
+[[deprecated("Use tt::tt_metal::select_contiguous_range_from_corerangeset")]] inline std::optional<CoreRange>
+select_contiguous_range_from_corerangeset(const CoreRangeSet& crs, uint32_t x, uint32_t y) {
+    return tt::tt_metal::select_contiguous_range_from_corerangeset(crs, x, y);
+}
+
+template <bool _compiler_deprioritize_this = true>
+[[deprecated("Use tt::tt_metal::select_from_corerangeset")]] inline CoreRangeSet select_from_corerangeset(
+    const CoreRangeSet& crs, uint32_t start_index, uint32_t end_index, bool row_wise = false) {
+    return tt::tt_metal::select_from_corerangeset(crs, start_index, end_index, row_wise);
+}
+
+template <>
+struct fmt::formatter<tt::tt_metal::CoreRangeSet> {
+    constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.end(); }
+
+    auto format(const tt::tt_metal::CoreRangeSet& core_range_set, format_context& ctx) const
+        -> format_context::iterator;
+};
+
+template <>
+struct fmt::formatter<tt::tt_metal::CoreRange> {
+    constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.end(); }
+
+    auto format(const tt::tt_metal::CoreRange& core_range, format_context& ctx) const -> format_context::iterator;
+};
+
+template <>
+struct fmt::formatter<tt::tt_metal::CoreCoord> {
+    constexpr auto parse(format_parse_context& ctx) -> format_parse_context::iterator { return ctx.end(); }
+
+    auto format(const tt::tt_metal::CoreCoord& core_coord, format_context& ctx) const -> format_context::iterator;
+};
 
 namespace std {
 
 template <>
-struct hash<CoreRange> {
-    std::size_t operator()(const CoreRange& core_range) const;
+struct hash<tt::tt_metal::CoreRange> {
+    std::size_t operator()(const tt::tt_metal::CoreRange& core_range) const;
 };
 
 template <>
-struct hash<RelativeCoreCoord> {
-    std::size_t operator()(RelativeCoreCoord const& o) const;
-};
-
-template <>
-struct hash<CoreRangeSet> {
-    std::size_t operator()(const CoreRangeSet& core_range_set) const;
+struct hash<tt::tt_metal::CoreRangeSet> {
+    std::size_t operator()(const tt::tt_metal::CoreRangeSet& core_range_set) const;
 };
 
 }  // namespace std
@@ -275,43 +297,33 @@ struct hash<CoreRangeSet> {
 namespace ttsl::json {
 
 template <>
-struct to_json_t<CoreCoord> {
-    nlohmann::json operator()(const CoreCoord& core_coord) noexcept;
+struct to_json_t<tt::tt_metal::CoreCoord> {
+    nlohmann::json operator()(const tt::tt_metal::CoreCoord& core_coord) noexcept;
 };
 
 template <>
-struct from_json_t<CoreCoord> {
-    CoreCoord operator()(const nlohmann::json& json) noexcept;
+struct from_json_t<tt::tt_metal::CoreCoord> {
+    tt::tt_metal::CoreCoord operator()(const nlohmann::json& json) noexcept;
 };
 
 template <>
-struct to_json_t<RelativeCoreCoord> {
-    nlohmann::json operator()(const RelativeCoreCoord& relative_core_coord) noexcept;
+struct to_json_t<tt::tt_metal::CoreRange> {
+    nlohmann::json operator()(const tt::tt_metal::CoreRange& core_range) noexcept;
 };
 
 template <>
-struct from_json_t<RelativeCoreCoord> {
-    RelativeCoreCoord operator()(const nlohmann::json& json) noexcept;
+struct from_json_t<tt::tt_metal::CoreRange> {
+    tt::tt_metal::CoreRange operator()(const nlohmann::json& json) noexcept;
 };
 
 template <>
-struct to_json_t<CoreRange> {
-    nlohmann::json operator()(const CoreRange& core_range) noexcept;
+struct to_json_t<tt::tt_metal::CoreRangeSet> {
+    nlohmann::json operator()(const tt::tt_metal::CoreRangeSet& core_range_set) noexcept;
 };
 
 template <>
-struct from_json_t<CoreRange> {
-    CoreRange operator()(const nlohmann::json& json) noexcept;
-};
-
-template <>
-struct to_json_t<CoreRangeSet> {
-    nlohmann::json operator()(const CoreRangeSet& core_range_set) noexcept;
-};
-
-template <>
-struct from_json_t<CoreRangeSet> {
-    CoreRangeSet operator()(const nlohmann::json& json) noexcept;
+struct from_json_t<tt::tt_metal::CoreRangeSet> {
+    tt::tt_metal::CoreRangeSet operator()(const nlohmann::json& json) noexcept;
 };
 
 }  // namespace ttsl::json

@@ -1,15 +1,16 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "dataflow_api.h"
-#include "tt_metal/api/tt-metalium/fabric_edm_packet_header.hpp"
+#include "api/dataflow/dataflow_api.h"
+#include "fabric/fabric_edm_packet_header.hpp"
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_worker_adapters.hpp"
 #include "tt_metal/fabric/hw/inc/noc_addr.h"
 #include "tt_metal/fabric/hw/inc/edm_fabric/fabric_stream_regs.hpp"
 #include "tt_metal/fabric/hw/inc/packet_header_pool.h"
+#include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
 
 struct unicast_mode {
     uint8_t distance;
@@ -37,11 +38,14 @@ void kernel_main() {
     constexpr bool write_scatter_mode = get_compile_time_arg_val(4) == 1;
     constexpr uint32_t num_pages_per_send = (write_scatter_mode ? 2 : 1);
 
-    DPRINT << "sws: args " << "\n\tnum_pages_to_send=" << total_pages_to_send << "\n\tpage_size="
-           << page_size
-           //    << "\n\tnum_buffers_per_channel=" << num_buffers_per_channel
-           << "\n\tdest_is_dram=" << (dest_is_dram ? "T" : "F") << "\n\tmcast_mode=" << (mcast_mode ? "T" : "F")
-           << "\n\twrite_scatter_mode=" << (write_scatter_mode ? "T" : "F") << "\n";
+    DPRINT(
+        "sws: args "
+        "\n\tnum_pages_to_send={}\n\tpage_size={}\n\tdest_is_dram={}\n\tmcast_mode={}\n\twrite_scatter_mode={}\n",
+        total_pages_to_send,
+        page_size,
+        dest_is_dram,
+        mcast_mode,
+        write_scatter_mode);
 
     size_t arg_idx = 0;
     size_t dest_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -67,8 +71,8 @@ void kernel_main() {
     const uint32_t receiver_noc_x = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t receiver_noc_y = get_arg_val<uint32_t>(arg_idx++);
 
-    const InterleavedAddrGen<dest_is_dram> dest_addr_gen = {
-        .bank_base_address = dest_addr, .page_size = page_size};
+    constexpr auto dst_args = TensorAccessorArgs<5>();
+    const auto dest_addr_gen = TensorAccessor(dst_args, dest_addr);
 
     sender.open<true>();
 
@@ -103,15 +107,15 @@ void kernel_main() {
         } else {
             if (write_scatter_mode && pages_to_send == 2) {
                 uint64_t dest_noc_address2 = get_noc_addr(p + 1, dest_addr_gen, 0, NORMALIZED_NOC_INDEX);
-                packet_header->to_chip_unicast(config.unicast.distance)
-                    ->to_noc_unicast_scatter_write(
-                        tt::tt_fabric::NocUnicastScatterCommandHeader{
-                            {dest_noc_address, dest_noc_address2}, (uint16_t)page_size},
-                        (pages_to_send * page_size));
+                fabric_set_unicast_route<false>((LowLatencyPacketHeader*)packet_header, config.unicast.distance);
+                packet_header->to_noc_unicast_scatter_write(
+                    tt::tt_fabric::NocUnicastScatterCommandHeader(
+                        {dest_noc_address, dest_noc_address2}, {static_cast<uint16_t>(page_size)}),
+                    (pages_to_send * page_size));
             } else {
-                packet_header->to_chip_unicast(config.unicast.distance)
-                    ->to_noc_unicast_write(
-                        tt::tt_fabric::NocUnicastCommandHeader{dest_noc_address}, (pages_to_send * page_size));
+                fabric_set_unicast_route<false>((LowLatencyPacketHeader*)packet_header, config.unicast.distance);
+                packet_header->to_noc_unicast_write(
+                    tt::tt_fabric::NocUnicastCommandHeader{dest_noc_address}, (pages_to_send * page_size));
             }
         }
 
@@ -129,12 +133,12 @@ void kernel_main() {
     uint64_t last_message_semaphore_noc0_addr =
         safe_get_noc_addr(receiver_noc_x, receiver_noc_y, (uint32_t)last_message_semaphore_address, 0);
     if constexpr (!mcast_mode) {
-        packet_header->to_chip_unicast(config.unicast.distance);
+        fabric_set_unicast_route<false>(packet_header, config.unicast.distance);
     } else {
-        packet_header->to_chip_unicast(config.mcast.distance + config.mcast.range - 1);
+        fabric_set_unicast_route<false>(packet_header, config.mcast.distance + config.mcast.range - 1);
     }
     packet_header->to_noc_unicast_atomic_inc(
-        tt::tt_fabric::NocUnicastAtomicIncCommandHeader(last_message_semaphore_noc0_addr, 1, 32));
+        tt::tt_fabric::NocUnicastAtomicIncCommandHeader(last_message_semaphore_noc0_addr, 1));
 
     sender.wait_for_empty_write_slot();
     sender.send_payload_flush_non_blocking_from_address((uint32_t)packet_header, sizeof(PACKET_HEADER_TYPE));

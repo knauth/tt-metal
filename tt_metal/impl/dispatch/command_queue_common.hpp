@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,7 +6,7 @@
 
 #include <stdint.h>
 
-#include <umd/device/types/cluster_descriptor_types.h>
+#include <umd/device/types/cluster_descriptor_types.hpp>
 #include "device.hpp"
 #include "sub_device_types.hpp"
 
@@ -25,7 +25,16 @@ enum class CommandQueueDeviceAddrType : uint8_t {
     DISPATCH_S_SYNC_SEM = 6,
     FABRIC_HEADER_RB = 7,
     FABRIC_SYNC_STATUS = 8,
-    UNRESERVED = 9,
+    DISPATCH_PROGRESS = 9,
+    // Real-time profiler control block (realtime_profiler_msgs::realtime_profiler_msg_t). Shared between the
+    // dispatch cores and the reserved RT-profiler tensix; allocated as a dispatch-core-local
+    // region rather than a per-core mailbox because no worker core touches it.
+    REALTIME_PROFILER_MSG = 10,
+    DISPATCH_TELEMETRY = 11,
+    DISPATCH_TELEMETRY_CONTROL = 12,
+    // Completion counters for worker-done signalling on Quasar. Not used on WH/BH.
+    WORKER_COMPLETION_SEMAPHORES = 13,
+    UNRESERVED = 14,
 };
 
 // likely only used in impl
@@ -55,23 +64,27 @@ uint16_t get_umd_channel(uint16_t channel);
 /// @param cq_id uint8_t ID the command queue
 /// @param cq_size uint32_t size of the command queue
 /// @return uint32_t absolute offset
-uint32_t get_absolute_cq_offset(uint16_t channel, uint8_t cq_id, uint32_t cq_size);
+uint32_t get_absolute_cq_offset(uint16_t channel, uint8_t cq_id, uint32_t cq_size, uint32_t base = 0);
 
 // mostly used in debug_tools
 template <bool addr_16B>
-uint32_t get_cq_issue_rd_ptr(chip_id_t chip_id, uint8_t cq_id, uint32_t cq_size);
+uint32_t get_cq_issue_rd_ptr(ChipId chip_id, uint8_t cq_id, uint32_t cq_size);
 
 template <bool addr_16B>
-uint32_t get_cq_issue_wr_ptr(chip_id_t chip_id, uint8_t cq_id, uint32_t cq_size);
+uint32_t get_cq_issue_wr_ptr(ChipId chip_id, uint8_t cq_id, uint32_t cq_size);
 
 // has usage in system_memory_manager.cpp
 template <bool addr_16B>
-uint32_t get_cq_completion_wr_ptr(chip_id_t chip_id, uint8_t cq_id, uint32_t cq_size);
+uint32_t get_cq_completion_wr_ptr(ChipId chip_id, uint8_t cq_id, uint32_t cq_size);
 
 template <bool addr_16B>
-uint32_t get_cq_completion_rd_ptr(chip_id_t chip_id, uint8_t cq_id, uint32_t cq_size);
+uint32_t get_cq_completion_rd_ptr(ChipId chip_id, uint8_t cq_id, uint32_t cq_size);
 
-// Return the expected number of workers to be in the finished state
-uint32_t calculate_expected_workers_to_finish(const tt::tt_metal::IDevice* device, const SubDeviceId& sub_device_id, tt::tt_metal::HalProgrammableCoreType core_type);
+uint32_t get_cq_dispatch_progress(ChipId chip_id, uint8_t cq_id);
+
+/// @brief Check if the command queue address type is shared across CQs co-located on the same dispatch core
+/// @param addr_type CommandQueueDeviceAddrType address type to check
+/// @return bool true if the address type is shared, false otherwise
+bool is_cq_shared(CommandQueueDeviceAddrType addr_type);
 
 }  // namespace tt::tt_metal

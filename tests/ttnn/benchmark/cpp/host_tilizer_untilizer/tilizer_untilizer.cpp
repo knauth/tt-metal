@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -15,7 +15,7 @@ namespace {
 constexpr PhysicalSize shape = {10240, 1024};
 
 const std::vector<float>& GetInputData() {
-    static tt::stl::Indestructible<std::vector<float>> input_data([]() {
+    static ttsl::Indestructible<std::vector<float>> input_data([]() {
         std::vector<float> input_data;
         input_data.resize(shape[0] * shape[1]);
         std::mt19937 gen(42);  // fixed seed for reproducibility
@@ -31,10 +31,10 @@ const std::vector<float>& GetInputData() {
 
 // Benchmark for LIN_ROW_MAJOR -> TILED_SWIZZLED
 void BM_ConvertLayout_RowMajorToTiledSwizzled(benchmark::State& state) {
-    auto& input_data = GetInputData();
-    for (auto _ : state) {
+    const auto& input_data = GetInputData();
+    for ([[maybe_unused]] auto _ : state) {
         auto out = convert_layout<float>(
-            tt::stl::make_const_span(input_data),
+            ttsl::make_const_span(input_data),
             shape,
             TensorLayoutType::LIN_ROW_MAJOR,
             TensorLayoutType::TILED_SWIZZLED);
@@ -45,10 +45,10 @@ void BM_ConvertLayout_RowMajorToTiledSwizzled(benchmark::State& state) {
 
 // Benchmark for LIN_ROW_MAJOR -> TILED_NFACES
 void BM_ConvertLayout_RowMajorToTiledNfaces(benchmark::State& state) {
-    auto& input_data = GetInputData();
-    for (auto _ : state) {
+    const auto& input_data = GetInputData();
+    for ([[maybe_unused]] auto _ : state) {
         auto out = convert_layout<float>(
-            tt::stl::make_const_span(input_data),
+            ttsl::make_const_span(input_data),
             shape,
             TensorLayoutType::LIN_ROW_MAJOR,
             TensorLayoutType::TILED_NFACES);
@@ -60,13 +60,13 @@ void BM_ConvertLayout_RowMajorToTiledNfaces(benchmark::State& state) {
 // Benchmark for TILED_SWIZZLED -> LIN_ROW_MAJOR
 void BM_ConvertLayout_TiledSwizzledToRowMajor(benchmark::State& state) {
     // Pre-convert input_data to TILED_SWIZZLED for a fair benchmark
-    auto& input_data = GetInputData();
+    const auto& input_data = GetInputData();
     static std::vector<float> tiled_data = convert_layout<float>(
-        tt::stl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_SWIZZLED);
+        ttsl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_SWIZZLED);
 
-    for (auto _ : state) {
+    for ([[maybe_unused]] auto _ : state) {
         auto out = convert_layout<float>(
-            tt::stl::make_const_span(tiled_data),
+            ttsl::make_const_span(tiled_data),
             shape,
             TensorLayoutType::TILED_SWIZZLED,
             TensorLayoutType::LIN_ROW_MAJOR);
@@ -78,13 +78,13 @@ void BM_ConvertLayout_TiledSwizzledToRowMajor(benchmark::State& state) {
 // Benchmark for TILED_SWIZZLED -> TILED_NFACES
 void BM_ConvertLayout_TiledSwizzledToTiledNFaces(benchmark::State& state) {
     // Pre-convert input_data to TILED_SWIZZLED
-    auto& input_data = GetInputData();
+    const auto& input_data = GetInputData();
     static std::vector<float> tiled_data = convert_layout<float>(
-        tt::stl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_SWIZZLED);
+        ttsl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_SWIZZLED);
 
-    for (auto _ : state) {
+    for ([[maybe_unused]] auto _ : state) {
         auto out = convert_layout<float>(
-            tt::stl::make_const_span(tiled_data),
+            ttsl::make_const_span(tiled_data),
             shape,
             TensorLayoutType::TILED_SWIZZLED,
             TensorLayoutType::TILED_NFACES);
@@ -96,13 +96,13 @@ void BM_ConvertLayout_TiledSwizzledToTiledNFaces(benchmark::State& state) {
 // Benchmark for TILED_NFACES -> LIN_ROW_MAJOR
 void BM_ConvertLayout_TiledNFacesToRowMajor(benchmark::State& state) {
     // Pre-convert input_data to TILED_NFACES
-    auto& input_data = GetInputData();
+    const auto& input_data = GetInputData();
     static std::vector<float> nfaces_data = convert_layout<float>(
-        tt::stl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_NFACES);
+        ttsl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_NFACES);
 
-    for (auto _ : state) {
+    for ([[maybe_unused]] auto _ : state) {
         auto out = convert_layout<float>(
-            tt::stl::make_const_span(nfaces_data),
+            ttsl::make_const_span(nfaces_data),
             shape,
             TensorLayoutType::TILED_NFACES,
             TensorLayoutType::LIN_ROW_MAJOR);
@@ -114,13 +114,13 @@ void BM_ConvertLayout_TiledNFacesToRowMajor(benchmark::State& state) {
 // Benchmark for TILED_NFACES -> TILED_SWIZZLED
 void BM_ConvertLayout_TiledNFacesToTiledSwizzled(benchmark::State& state) {
     // Pre-convert input_data to TILED_NFACES
-    auto& input_data = GetInputData();
+    const auto& input_data = GetInputData();
     static std::vector<float> nfaces_data = convert_layout<float>(
-        tt::stl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_NFACES);
+        ttsl::make_const_span(input_data), shape, TensorLayoutType::LIN_ROW_MAJOR, TensorLayoutType::TILED_NFACES);
 
-    for (auto _ : state) {
+    for ([[maybe_unused]] auto _ : state) {
         auto out = convert_layout<float>(
-            tt::stl::make_const_span(nfaces_data),
+            ttsl::make_const_span(nfaces_data),
             shape,
             TensorLayoutType::TILED_NFACES,
             TensorLayoutType::TILED_SWIZZLED);

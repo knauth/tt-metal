@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -22,7 +22,7 @@ from typing import Optional, Union
 
 import torch
 from torch import nn
-from models.utility_functions import (
+from models.common.utility_functions import (
     is_conv_supported_on_device,
     run_conv_on_device_wrapper,
 )

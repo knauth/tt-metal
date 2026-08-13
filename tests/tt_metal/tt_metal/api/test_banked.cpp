@@ -1,10 +1,10 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <chrono>
 #include <fmt/base.h>
-#include <stdint.h>
+#include <cstdint>
 #include <sys/types.h>
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -16,22 +16,21 @@
 #include <variant>
 #include <vector>
 
-#include <tt-metalium/assert.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/device.hpp>
 #include "device_fixture.hpp"
 #include "gtest/gtest.h"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/program.hpp>
 #include <tt_stl/span.hpp>
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include "tt_metal/test_utils/stimulus.hpp"
-#include <tt-metalium/utils.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
 
 using std::vector;
 using namespace tt::tt_metal;
@@ -39,13 +38,21 @@ using namespace tt::tt_metal;
 namespace basic_tests::buffer::banked {
 
 struct BankedConfig {
+    static constexpr size_t tile_size = 32 * 32;
+    static constexpr tt::DataFormat l1_data_format = tt::DataFormat::Float16_b;
+
     size_t num_tiles = 1;
-    size_t size_bytes = 1 * 2 * 32 * 32;
-    size_t page_size_bytes = 2 * 32 * 32;
+    size_t size_bytes = num_tiles * tt::datum_size(l1_data_format) * tile_size;
+    size_t page_size_bytes = tt::datum_size(l1_data_format) * tile_size;
     BufferType input_buffer_type = BufferType::L1;
     BufferType output_buffer_type = BufferType::L1;
     CoreCoord logical_core = CoreCoord(0, 0);
-    tt::DataFormat l1_data_format = tt::DataFormat::Float16_b;
+
+    void update_num_tiles(size_t tiles) {
+        this->num_tiles = tiles;
+        this->size_bytes = num_tiles * tt::datum_size(l1_data_format) * tile_size;
+        this->page_size_bytes = tt::datum_size(l1_data_format) * tile_size;
+    }
 };
 
 namespace local_test_functions {
@@ -54,17 +61,27 @@ namespace local_test_functions {
 /// @param device
 /// @param test_config - Configuration of the test -- see struct
 /// @return
-bool reader_cb_writer(IDevice* device, const BankedConfig& cfg, const bool banked_reader, const bool banked_writer) {
+bool reader_cb_writer(
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    const BankedConfig& cfg,
+    const bool banked_reader,
+    const bool banked_writer) {
     bool pass = true;
 
     const uint32_t cb_id = 0;
     ////////////////////////////////////////////////////////////////////////////
     //                      Application Setup
     ////////////////////////////////////////////////////////////////////////////
+    auto& cq = mesh_device->mesh_command_queue();
+    distributed::MeshWorkload workload;
+    auto zero_coord = distributed::MeshCoordinate(0, 0);
+    auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
     Program program = CreateProgram();
+    workload.add_program(device_range, std::move(program));
+    auto& program_ = workload.get_programs().at(device_range);
 
-    std::string reader_kernel_name = "";
-    std::string writer_kernel_name = "";
+    std::string reader_kernel_name;
+    std::string writer_kernel_name;
     size_t input_page_size_bytes = 0;
     size_t output_page_size_bytes = 0;
     std::vector<uint32_t> reader_runtime_args = {};
@@ -85,32 +102,32 @@ bool reader_cb_writer(IDevice* device, const BankedConfig& cfg, const bool banke
         output_page_size_bytes = cfg.size_bytes;
     }
 
-    tt::tt_metal::InterleavedBufferConfig in_config{
-        .device = device,
-        .size = cfg.size_bytes,
-        .page_size = input_page_size_bytes,
-        .buffer_type = cfg.input_buffer_type};
+    distributed::DeviceLocalBufferConfig in_config{
+        .page_size = input_page_size_bytes, .buffer_type = cfg.input_buffer_type, .bottom_up = false};
+    distributed::ReplicatedBufferConfig in_buffer_config{.size = cfg.size_bytes};
 
-    tt::tt_metal::InterleavedBufferConfig out_config{
-        .device = device,
-        .size = cfg.size_bytes,
-        .page_size = output_page_size_bytes,
-        .buffer_type = cfg.output_buffer_type};
+    distributed::DeviceLocalBufferConfig out_config{
+        .page_size = output_page_size_bytes, .buffer_type = cfg.output_buffer_type, .bottom_up = false};
+    distributed::ReplicatedBufferConfig out_buffer_config{.size = cfg.size_bytes};
 
-    auto input_buffer = CreateBuffer(in_config);
+    auto input_buffer = distributed::MeshBuffer::create(in_buffer_config, in_config, mesh_device.get());
 
-    auto output_buffer = CreateBuffer(out_config);
+    auto output_buffer = distributed::MeshBuffer::create(out_buffer_config, out_config, mesh_device.get());
 
     log_debug(tt::LogTest, "Input buffer: [address: {} B, size: {} B]", input_buffer->address(), input_buffer->size());
     log_debug(
         tt::LogTest, "Output buffer: [address: {} B, size: {} B]", output_buffer->address(), output_buffer->size());
 
-    TT_FATAL(cfg.num_tiles * cfg.page_size_bytes == cfg.size_bytes, "Error");
-    constexpr uint32_t num_pages_cb = 1;
+    TT_FATAL(
+        cfg.num_tiles * cfg.page_size_bytes == cfg.size_bytes,
+        "Configuration validation failed: num_tiles ({}) * page_size_bytes ({}) must equal size_bytes ({})",
+        cfg.num_tiles,
+        cfg.page_size_bytes,
+        cfg.size_bytes);
     CircularBufferConfig input_buffer_cb_config =
         CircularBufferConfig(cfg.page_size_bytes, {{cb_id, cfg.l1_data_format}})
             .set_page_size(cb_id, cfg.page_size_bytes);
-    auto input_buffer_cb = CreateCircularBuffer(program, cfg.logical_core, input_buffer_cb_config);
+    CreateCircularBuffer(program_, cfg.logical_core, input_buffer_cb_config);
 
     bool input_is_dram = cfg.input_buffer_type == BufferType::DRAM;
     bool output_is_dram = cfg.output_buffer_type == BufferType::DRAM;
@@ -119,23 +136,27 @@ bool reader_cb_writer(IDevice* device, const BankedConfig& cfg, const bool banke
     std::map<std::string, std::string> writer_defines = {
         {"INTERFACE_WITH_L1", std::to_string((uint32_t)(not output_is_dram))}};
 
+    std::vector<uint32_t> reader_compile_time_args = {cb_id, uint32_t(input_buffer->page_size())};
+    tt::tt_metal::TensorAccessorArgs(input_buffer).append_to(reader_compile_time_args);
     auto reader_kernel = CreateKernel(
-        program,
+        program_,
         reader_kernel_name,
         cfg.logical_core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
             .noc = NOC::NOC_0,
-            .compile_args = {cb_id, uint32_t(input_buffer->page_size()), (uint32_t)input_is_dram},
+            .compile_args = reader_compile_time_args,
             .defines = reader_defines});
+    std::vector<uint32_t> writer_compile_time_args = {cb_id, uint32_t(output_buffer->page_size())};
+    tt::tt_metal::TensorAccessorArgs(output_buffer).append_to(writer_compile_time_args);
     auto writer_kernel = CreateKernel(
-        program,
+        program_,
         writer_kernel_name,
         cfg.logical_core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
             .noc = NOC::NOC_1,
-            .compile_args = {cb_id, uint32_t(output_buffer->page_size()), (uint32_t)output_is_dram},
+            .compile_args = writer_compile_time_args,
             .defines = writer_defines});
 
     if (banked_reader) {
@@ -161,16 +182,16 @@ bool reader_cb_writer(IDevice* device, const BankedConfig& cfg, const bool banke
     ////////////////////////////////////////////////////////////////////////////
     auto input_packed =
         tt::test_utils::generate_uniform_random_vector<uint32_t>(0, 100, cfg.size_bytes / sizeof(uint32_t));
-    detail::WriteToBuffer(input_buffer, input_packed);
-    SetRuntimeArgs(program, reader_kernel, cfg.logical_core, reader_runtime_args);
-    SetRuntimeArgs(program, writer_kernel, cfg.logical_core, writer_runtime_args);
+    distributed::WriteShard(cq, input_buffer, input_packed, zero_coord, false);
+    SetRuntimeArgs(program_, reader_kernel, cfg.logical_core, reader_runtime_args);
+    SetRuntimeArgs(program_, writer_kernel, cfg.logical_core, writer_runtime_args);
 
-    detail::LaunchProgram(device, program);
+    distributed::EnqueueMeshWorkload(cq, workload, false);
     std::vector<uint32_t> reread_input_packed;
-    detail::ReadFromBuffer(input_buffer, reread_input_packed);
+    distributed::ReadShard(cq, reread_input_packed, input_buffer, zero_coord, false);
 
     std::vector<uint32_t> output_packed;
-    detail::ReadFromBuffer(output_buffer, output_packed);
+    distributed::ReadShard(cq, output_packed, output_buffer, zero_coord, false);
 
     pass &= (output_packed == input_packed);
 
@@ -181,7 +202,7 @@ bool reader_cb_writer(IDevice* device, const BankedConfig& cfg, const bool banke
 /// @param device
 /// @param test_config - Configuration of the test -- see struct
 /// @return
-bool reader_datacopy_writer(IDevice* device, const BankedConfig& cfg) {
+bool reader_datacopy_writer(const std::shared_ptr<distributed::MeshDevice>& mesh_device, const BankedConfig& cfg) {
     bool pass = true;
 
     const uint32_t input0_cb_index = 0;
@@ -189,61 +210,69 @@ bool reader_datacopy_writer(IDevice* device, const BankedConfig& cfg) {
     ////////////////////////////////////////////////////////////////////////////
     //                      Application Setup
     ////////////////////////////////////////////////////////////////////////////
+    auto& cq = mesh_device->mesh_command_queue();
+    distributed::MeshWorkload workload;
+    auto zero_coord = distributed::MeshCoordinate(0, 0);
+    auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
     Program program = CreateProgram();
+    workload.add_program(device_range, std::move(program));
+    auto& program_ = workload.get_programs().at(device_range);
 
-    tt::tt_metal::InterleavedBufferConfig in_config{
-        .device = device,
-        .size = cfg.size_bytes,
-        .page_size = cfg.page_size_bytes,
-        .buffer_type = cfg.input_buffer_type};
+    distributed::DeviceLocalBufferConfig in_config{
+        .page_size = cfg.page_size_bytes, .buffer_type = cfg.input_buffer_type, .bottom_up = false};
+    distributed::ReplicatedBufferConfig in_buffer_config{.size = cfg.size_bytes};
 
-    tt::tt_metal::InterleavedBufferConfig out_config{
-        .device = device,
-        .size = cfg.size_bytes,
-        .page_size = cfg.page_size_bytes,
-        .buffer_type = cfg.output_buffer_type};
+    distributed::DeviceLocalBufferConfig out_config{
+        .page_size = cfg.page_size_bytes, .buffer_type = cfg.output_buffer_type, .bottom_up = false};
+    distributed::ReplicatedBufferConfig out_buffer_config{.size = cfg.size_bytes};
 
-    auto input_buffer = CreateBuffer(in_config);
-    auto output_buffer = CreateBuffer(out_config);
+    auto input_buffer = distributed::MeshBuffer::create(in_buffer_config, in_config, mesh_device.get());
+    auto output_buffer = distributed::MeshBuffer::create(out_buffer_config, out_config, mesh_device.get());
 
-    TT_FATAL(cfg.num_tiles * cfg.page_size_bytes == cfg.size_bytes, "Error");
-    constexpr uint32_t num_pages_cb = 1;
+    TT_FATAL(
+        cfg.num_tiles * cfg.page_size_bytes == cfg.size_bytes,
+        "Configuration validation failed: num_tiles ({}) * page_size_bytes ({}) must equal size_bytes ({})",
+        cfg.num_tiles,
+        cfg.page_size_bytes,
+        cfg.size_bytes);
     CircularBufferConfig l1_input_cb_config =
         CircularBufferConfig(cfg.page_size_bytes, {{input0_cb_index, cfg.l1_data_format}})
             .set_page_size(input0_cb_index, cfg.page_size_bytes);
-    auto l1_input_cb = CreateCircularBuffer(program, cfg.logical_core, l1_input_cb_config);
+    CreateCircularBuffer(program_, cfg.logical_core, l1_input_cb_config);
 
     CircularBufferConfig l1_output_cb_config =
         CircularBufferConfig(cfg.page_size_bytes, {{output_cb_index, cfg.l1_data_format}})
             .set_page_size(output_cb_index, cfg.page_size_bytes);
-    auto l1_output_cb = CreateCircularBuffer(program, cfg.logical_core, l1_output_cb_config);
+    CreateCircularBuffer(program_, cfg.logical_core, l1_output_cb_config);
 
-    bool input_is_dram = cfg.input_buffer_type == BufferType::DRAM;
-    bool output_is_dram = cfg.output_buffer_type == BufferType::DRAM;
-
+    std::vector<uint32_t> reader_compile_time_args_dc = {input0_cb_index, uint32_t(input_buffer->page_size())};
+    tt::tt_metal::TensorAccessorArgs(input_buffer).append_to(reader_compile_time_args_dc);
     auto reader_kernel = CreateKernel(
-        program,
+        program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/banked_reader.cpp",
         cfg.logical_core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
             .noc = NOC::RISCV_1_default,
-            .compile_args = {input0_cb_index, uint32_t(input_buffer->page_size()), (uint32_t)input_is_dram}});
+            .compile_args = reader_compile_time_args_dc});
 
+    std::vector<uint32_t> writer_compile_time_args_dc = {output_cb_index, uint32_t(output_buffer->page_size())};
+    tt::tt_metal::TensorAccessorArgs(output_buffer).append_to(writer_compile_time_args_dc);
     auto writer_kernel = CreateKernel(
-        program,
+        program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/banked_writer.cpp",
         cfg.logical_core,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0,
             .noc = NOC::RISCV_0_default,
-            .compile_args = {output_cb_index, uint32_t(output_buffer->page_size()), (uint32_t)output_is_dram}});
+            .compile_args = writer_compile_time_args_dc});
 
     vector<uint32_t> compute_kernel_args = {
-        uint(cfg.num_tiles)  // per_core_tile_cnt
+        uint(cfg.num_tiles),  // per_core_tile_cnt
+        false                 // use_dfbs
     };
-    auto datacopy_kernel = CreateKernel(
-        program,
+    CreateKernel(
+        program_,
         "tests/tt_metal/tt_metal/test_kernels/compute/eltwise_copy.cpp",
         cfg.logical_core,
         ComputeConfig{.compile_args = compute_kernel_args});
@@ -252,16 +281,16 @@ bool reader_datacopy_writer(IDevice* device, const BankedConfig& cfg) {
     //                      Stimulus Generation
     ////////////////////////////////////////////////////////////////////////////
     std::vector<uint32_t> input_packed = tt::test_utils::generate_packed_uniform_random_vector<uint32_t, bfloat16>(
-        -1.0f, 1.0f, cfg.size_bytes / bfloat16::SIZEOF, std::chrono::system_clock::now().time_since_epoch().count());
+        -1.0f, 1.0f, cfg.size_bytes / sizeof(bfloat16), std::chrono::system_clock::now().time_since_epoch().count());
 
     ////////////////////////////////////////////////////////////////////////////
     //                      Compile and Execute Appli   cation
     ////////////////////////////////////////////////////////////////////////////
 
-    detail::WriteToBuffer(input_buffer, input_packed);
+    distributed::WriteShard(cq, input_buffer, input_packed, zero_coord, false);
 
     SetRuntimeArgs(
-        program,
+        program_,
         reader_kernel,
         cfg.logical_core,
         {
@@ -269,16 +298,16 @@ bool reader_datacopy_writer(IDevice* device, const BankedConfig& cfg) {
             (uint32_t)cfg.num_tiles,
         });
     SetRuntimeArgs(
-        program,
+        program_,
         writer_kernel,
         cfg.logical_core,
         {
             (uint32_t)output_buffer->address(),
             (uint32_t)cfg.num_tiles,
         });
-    detail::LaunchProgram(device, program);
+    distributed::EnqueueMeshWorkload(cq, workload, false);
     std::vector<uint32_t> dest_buffer_data;
-    detail::ReadFromBuffer(output_buffer, dest_buffer_data);
+    distributed::ReadShard(cq, dest_buffer_data, output_buffer, zero_coord, false);
     pass &= input_packed == dest_buffer_data;
 
     return pass;
@@ -286,45 +315,44 @@ bool reader_datacopy_writer(IDevice* device, const BankedConfig& cfg) {
 
 }  // end namespace local_test_functions
 
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedL1ReaderOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedL1ReaderOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, false));
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, false));
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        auto num_banks = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_banks % 2 == 0, "Error");
+        auto num_banks = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_banks % 2 == 0, "Number of banks ({}) must be even for this test", num_banks);
         size_t num_tiles = num_banks / 2;
         size_t tile_increment = num_tiles;
         uint32_t num_iterations = 3;
         uint32_t index = 0;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, false));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, false));
             num_tiles += tile_increment;
             index++;
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedDramReaderOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedDramReaderOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
         test_config.input_buffer_type = BufferType::DRAM;
         test_config.output_buffer_type = BufferType::DRAM;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, false));
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, false));
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        auto num_banks = devices_.at(id)->allocator()->get_num_banks(BufferType::DRAM);
+        auto num_banks = device->allocator()->get_num_banks(BufferType::DRAM);
         size_t num_tiles = num_banks / 2;
         size_t tile_increment = num_tiles;
         uint32_t num_iterations = 6;
@@ -332,54 +360,52 @@ TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderOnly) {
         test_config.input_buffer_type = BufferType::DRAM;
         test_config.output_buffer_type = BufferType::DRAM;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, false));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, false));
             num_tiles += tile_increment;
             index++;
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedL1WriterOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedL1WriterOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, false, true));
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, false, true));
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedL1WriterOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedL1WriterOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        auto num_banks = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_banks % 2 == 0, "Error");
+        auto num_banks = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_banks % 2 == 0, "Number of banks ({}) must be even for this test", num_banks);
         size_t num_tiles = num_banks / 2;
         size_t tile_increment = num_tiles;
         uint32_t num_iterations = 3;
         uint32_t index = 0;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, false, true));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, false, true));
             num_tiles += tile_increment;
             index++;
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedDramWriterOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedDramWriterOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
         test_config.input_buffer_type = BufferType::DRAM;
         test_config.output_buffer_type = BufferType::DRAM;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, false, true));
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, false, true));
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramWriterOnly) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedDramWriterOnly) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        auto num_banks = devices_.at(id)->allocator()->get_num_banks(BufferType::DRAM);
+        auto num_banks = device->allocator()->get_num_banks(BufferType::DRAM);
         size_t num_tiles = num_banks / 2;
         size_t tile_increment = num_tiles;
         uint32_t num_iterations = 6;
@@ -387,197 +413,188 @@ TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramWriterOnly) {
         test_config.input_buffer_type = BufferType::DRAM;
         test_config.output_buffer_type = BufferType::DRAM;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, false, true));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, false, true));
             num_tiles += tile_increment;
             index++;
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedL1ReaderAndWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedL1ReaderAndWriter) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderAndWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderAndWriter) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::L1);
         size_t tile_increment = num_tiles / 2;
         uint32_t num_iterations = 6;
         uint32_t index = 0;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
             num_tiles += tile_increment;
             index++;
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedDramReaderAndWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedDramReaderAndWriter) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
         test_config.input_buffer_type = BufferType::DRAM;
         test_config.output_buffer_type = BufferType::DRAM;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderAndWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderAndWriter) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_tiles % 2 == 0, "Error");
-        size_t tile_increment = num_tiles / 2;
-        uint32_t num_iterations = 6;
-        uint32_t index = 0;
-        test_config.input_buffer_type = BufferType::DRAM;
-        test_config.output_buffer_type = BufferType::DRAM;
-        while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
-            num_tiles += tile_increment;
-            index++;
-        }
-    }
-}
-
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedDramReaderAndL1Writer) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        BankedConfig test_config;
-        test_config.input_buffer_type = BufferType::DRAM;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
-    }
-}
-
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderAndL1Writer) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        BankedConfig test_config;
-        test_config.input_buffer_type = BufferType::DRAM;
-
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_tiles % 2 == 0, "Error");
-        size_t tile_increment = num_tiles / 2;
-        uint32_t num_iterations = 6;
-        uint32_t index = 0;
-        while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
-            num_tiles += tile_increment;
-            index++;
-        }
-    }
-}
-
-TEST_F(DeviceFixture, TensixTestSingleCoreSingleTileBankedL1ReaderAndDramWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        BankedConfig test_config;
-        test_config.output_buffer_type = BufferType::DRAM;
-        EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
-    }
-}
-
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderAndDramWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        BankedConfig test_config;
-        test_config.output_buffer_type = BufferType::DRAM;
-
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_tiles % 2 == 0, "Error");
-        size_t tile_increment = num_tiles / 2;
-        uint32_t num_iterations = 6;
-        uint32_t index = 0;
-        while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_cb_writer(this->devices_.at(id), test_config, true, true));
-            num_tiles += tile_increment;
-            index++;
-        }
-    }
-}
-
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderDataCopyL1Writer) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        BankedConfig test_config;
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_tiles % 2 == 0, "Error");
-        size_t tile_increment = num_tiles / 2;
-        uint32_t num_iterations = 6;
-        uint32_t index = 0;
-        test_config.logical_core = this->devices_.at(id)->allocator()->get_logical_core_from_bank_id(0);
-        while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(this->devices_.at(id), test_config));
-            num_tiles += tile_increment;
-            index++;
-        }
-    }
-}
-
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderDataCopyDramWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        BankedConfig test_config;
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::DRAM);
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_tiles % 2 == 0, "Number of tiles ({}) must be even for this test", num_tiles);
         size_t tile_increment = num_tiles / 2;
         uint32_t num_iterations = 6;
         uint32_t index = 0;
         test_config.input_buffer_type = BufferType::DRAM;
         test_config.output_buffer_type = BufferType::DRAM;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(this->devices_.at(id), test_config));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
             num_tiles += tile_increment;
             index++;
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderDataCopyDramWriter) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedDramReaderAndL1Writer) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_tiles % 2 == 0, "Error");
+        test_config.input_buffer_type = BufferType::DRAM;
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
+    }
+}
+
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderAndL1Writer) {
+    for (auto& device : this->devices_) {
+        BankedConfig test_config;
+        test_config.input_buffer_type = BufferType::DRAM;
+
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_tiles % 2 == 0, "Number of tiles ({}) must be even for this test", num_tiles);
         size_t tile_increment = num_tiles / 2;
         uint32_t num_iterations = 6;
         uint32_t index = 0;
-        test_config.logical_core = this->devices_.at(id)->allocator()->get_logical_core_from_bank_id(0);
+        while (index < num_iterations) {
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
+            num_tiles += tile_increment;
+            index++;
+        }
+    }
+}
+
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreSingleTileBankedL1ReaderAndDramWriter) {
+    for (auto& device : this->devices_) {
+        BankedConfig test_config;
+        test_config.output_buffer_type = BufferType::DRAM;
+        EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
+    }
+}
+
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderAndDramWriter) {
+    for (auto& device : this->devices_) {
+        BankedConfig test_config;
+        test_config.output_buffer_type = BufferType::DRAM;
+
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_tiles % 2 == 0, "Number of tiles ({}) must be even for this test", num_tiles);
+        size_t tile_increment = num_tiles / 2;
+        uint32_t num_iterations = 6;
+        uint32_t index = 0;
+        while (index < num_iterations) {
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_cb_writer(device, test_config, true, true));
+            num_tiles += tile_increment;
+            index++;
+        }
+    }
+}
+
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderDataCopyL1Writer) {
+    for (auto& device : this->devices_) {
+        BankedConfig test_config;
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_tiles % 2 == 0, "Number of tiles ({}) must be even for this test", num_tiles);
+        size_t tile_increment = num_tiles / 2;
+        uint32_t num_iterations = 6;
+        uint32_t index = 0;
+        test_config.logical_core = device->allocator()->get_logical_core_from_bank_id(0);
+        while (index < num_iterations) {
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(device, test_config));
+            num_tiles += tile_increment;
+            index++;
+        }
+    }
+}
+
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderDataCopyDramWriter) {
+    for (auto& device : this->devices_) {
+        BankedConfig test_config;
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::DRAM);
+        size_t tile_increment = num_tiles / 2;
+        uint32_t num_iterations = 6;
+        uint32_t index = 0;
+        test_config.input_buffer_type = BufferType::DRAM;
+        test_config.output_buffer_type = BufferType::DRAM;
+        while (index < num_iterations) {
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(device, test_config));
+            num_tiles += tile_increment;
+            index++;
+        }
+    }
+}
+
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedL1ReaderDataCopyDramWriter) {
+    for (auto& device : this->devices_) {
+        BankedConfig test_config;
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_tiles % 2 == 0, "Number of tiles ({}) must be even for this test", num_tiles);
+        size_t tile_increment = num_tiles / 2;
+        uint32_t num_iterations = 6;
+        uint32_t index = 0;
+        test_config.logical_core = device->allocator()->get_logical_core_from_bank_id(0);
         test_config.input_buffer_type = BufferType::L1;
         test_config.output_buffer_type = BufferType::DRAM;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(this->devices_.at(id), test_config));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(device, test_config));
             num_tiles += tile_increment;
             index++;
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderDataCopyL1Writer) {
-    for (unsigned int id = 0; id < num_devices_; id++) {
+TEST_F(MeshDeviceFixture, TensixTestSingleCoreMultiTileBankedDramReaderDataCopyL1Writer) {
+    for (auto& device : this->devices_) {
         BankedConfig test_config;
-        size_t num_tiles = devices_.at(id)->allocator()->get_num_banks(BufferType::L1);
-        TT_FATAL(num_tiles % 2 == 0, "Error");
+        size_t num_tiles = device->allocator()->get_num_banks(BufferType::L1);
+        TT_FATAL(num_tiles % 2 == 0, "Number of tiles ({}) must be even for this test", num_tiles);
         size_t tile_increment = num_tiles / 2;
         uint32_t num_iterations = 6;
         uint32_t index = 0;
         test_config.input_buffer_type = BufferType::DRAM;
         test_config.output_buffer_type = BufferType::L1;
         while (index < num_iterations) {
-            test_config.num_tiles = num_tiles;
-            test_config.size_bytes = test_config.num_tiles * 2 * 32 * 32;
-            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(this->devices_.at(id), test_config));
+            test_config.update_num_tiles(num_tiles);
+            EXPECT_TRUE(local_test_functions::reader_datacopy_writer(device, test_config));
             num_tiles += tile_increment;
             index++;
         }

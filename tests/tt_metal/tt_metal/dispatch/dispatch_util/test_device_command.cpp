@@ -1,10 +1,11 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
-#include <stdint.h>
-#include <stdlib.h>
+#include <array>
+#include <cstdint>
+#include <cstdlib>
 #include <tt-metalium/vector_aligned.hpp>
 #include <utility>
 #include <vector>
@@ -21,7 +22,7 @@ TEST(DeviceCommandTest, AddDispatchWait) {
     calculator.add_dispatch_wait();
 
     HostMemDeviceCommand command(calculator.write_offset_bytes());
-    command.add_dispatch_wait(0, 0, 0, 0);
+    command.add_dispatch_wait(0, 0, 0, 0, 0);
     EXPECT_EQ(command.size_bytes(), command.write_offset_bytes());
 }
 
@@ -30,7 +31,7 @@ TEST(DeviceCommandTest, AddDispatchWaitWithPrefetchStall) {
     calculator.add_dispatch_wait_with_prefetch_stall();
 
     HostMemDeviceCommand command(calculator.write_offset_bytes());
-    command.add_dispatch_wait_with_prefetch_stall(0, 0, 0, 0);
+    command.add_dispatch_wait_with_prefetch_stall(0, 0, 0, 0, 0);
     EXPECT_EQ(command.size_bytes(), command.write_offset_bytes());
 }
 
@@ -117,6 +118,20 @@ TEST(DeviceCommandTest, AddDispatchSetNumWorkerSems) {
     EXPECT_EQ(command.size_bytes(), command.write_offset_bytes());
 }
 
+TEST(DeviceCommandTest, AddDispatchSetSubDeviceWorkerCounts) {
+    constexpr uint32_t num_sub_devices = 3;
+    std::array<uint32_t, num_sub_devices> workers_per_sub_device = {4, 7, 2};
+
+    DeviceCommandCalculator calculator;
+    calculator.add_dispatch_set_sub_device_worker_counts(num_sub_devices);
+
+    HostMemDeviceCommand command(calculator.write_offset_bytes());
+    command.add_dispatch_set_sub_device_worker_counts(
+        ttsl::Span<const uint32_t>(workers_per_sub_device.data(), workers_per_sub_device.size()),
+        DispatcherSelect::DISPATCH_MASTER);
+    EXPECT_EQ(command.size_bytes(), command.write_offset_bytes());
+}
+
 TEST(DeviceCommandTest, AddDispatchSetGoSignalNocData) {
     DeviceCommandCalculator calculator;
     calculator.add_dispatch_set_go_signal_noc_data(5);
@@ -150,9 +165,11 @@ TEST(DeviceCommandTest, AddDispatchWritePaged) {
     {
         DeviceCommandCalculator calculator;
         calculator.add_dispatch_write_paged<false>(1, 5);
-
+        // Do PCIE alignment for out-of-line data
+        calculator.add_alignment();
         HostMemDeviceCommand command(calculator.write_offset_bytes());
         command.add_dispatch_write_paged<false>(false, 0, 0, 0, 1, 5);
+        command.align_write_offset();
         EXPECT_EQ(command.size_bytes(), command.write_offset_bytes());
     }
     {
@@ -234,7 +251,7 @@ TEST(DeviceCommandTest, AddDispatchWritePackedLarge) {
         std::vector<CQDispatchWritePackedLargeSubCmd> sub_cmds(1);
 
         uint8_t data[4] = {};
-        std::vector<tt::stl::Span<const uint8_t>> data_collection{{data, 4}};
+        std::vector<ttsl::Span<const uint8_t>> data_collection{{data, 4}};
         command.add_dispatch_write_packed_large(
             CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_TYPE_UNKNOWN, 0, 1, sub_cmds, data_collection, nullptr);
         EXPECT_EQ(command.size_bytes(), command.write_offset_bytes());
@@ -247,8 +264,8 @@ TYPED_TEST(WritePackedCommandTest, RandomAddDispatchWritePacked) {
         DeviceCommandCalculator calculator;
         uint32_t random_start = (rand() % 4) % 32;
         calculator.add_data(random_start);
-        uint32_t num_sub_cmds = rand() % 100 + 1;
-        uint32_t sub_cmd_sizeB = rand() % 2000 + 1;
+        uint32_t num_sub_cmds = (rand() % 100) + 1;
+        uint32_t sub_cmd_sizeB = (rand() % 2000) + 1;
         uint32_t max_prefetch_command_size = 16384;
         uint32_t packed_write_max_unicast_sub_cmds = 64;
 

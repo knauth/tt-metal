@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -12,6 +12,11 @@
 #include "autograd/tensor.hpp"
 #include "core/compute_kernel_config.hpp"
 #include "core/tt_tensor_utils.hpp"
+#include "ttnn/distributed/distributed_tensor.hpp"
+#include "ttnn/operations/data_movement/slice/slice.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/experimental/transformer/rotary_embedding_llama/rotary_embedding_llama.hpp"
+#include "ttnn/types.hpp"
 
 namespace ttml::ops {
 
@@ -22,7 +27,6 @@ void validate_rope_input_and_params(const autograd::TensorPtr& input, const Rota
     }
     auto input_shape = input->get_shape();
 
-    auto input_seq_len = input_shape[-2];
     auto input_head_dim = input_shape[-1];
 
     if (input_head_dim != params.head_dim) {
@@ -32,13 +36,6 @@ void validate_rope_input_and_params(const autograd::TensorPtr& input, const Rota
             params.head_dim));
     }
 
-    if (input_seq_len != params.sequence_length) {
-        throw std::runtime_error(fmt::format(
-            "RoPE input tensor's sequence length ({}) must match the sequence length in the params ({})",
-            input_seq_len,
-            params.sequence_length));
-    }
-
     auto trans_mat_shape = params.trans_mat.logical_shape();
     auto trig_param_shapes = std::array{
         params.cos_cache.logical_shape(),
@@ -46,14 +43,14 @@ void validate_rope_input_and_params(const autograd::TensorPtr& input, const Rota
         params.neg_cos_cache.logical_shape(),
         params.neg_sin_cache.logical_shape()};
 
-    auto expected_trig_shape = ttnn::Shape{1U, 1U, input_seq_len, input_head_dim};
+    auto expected_trig_shape = ttnn::Shape{1U, 1U, params.sequence_length, params.head_dim};
     if (!std::ranges::all_of(
             trig_param_shapes, [&expected_trig_shape](auto shape) { return shape == expected_trig_shape; })) {
         throw std::runtime_error(fmt::format(
             "All trigonometric rotary embedding parameters must have shape [1, 1, {}, {}], but got shapes: "
             "cos_cache: {}, sin_cache: {}, neg_cos_cache: {}, neg_sin_cache: {}",
-            input_seq_len,
-            input_head_dim,
+            params.sequence_length,
+            params.head_dim,
             params.cos_cache.logical_shape(),
             params.sin_cache.logical_shape(),
             params.neg_cos_cache.logical_shape(),
@@ -68,42 +65,52 @@ void validate_rope_input_and_params(const autograd::TensorPtr& input, const Rota
 }
 
 template <typename E>
-E apply_rope_scaling(const E& freqs, const RopeScalingParams& scaling_params) {
-    // Typical values for low_freq_factor and high_freq_factor are 1 and 4, respectively.
-    assert(scaling_params.low_freq_factor != scaling_params.high_freq_factor);
-    assert(scaling_params.low_freq_factor < scaling_params.high_freq_factor);
+E apply_rope_scaling(const E& freqs, const RopeScalingParams& p) {
+    using T = typename std::decay_t<E>::value_type;
 
-    // These wavelengths are used as thresholds to determine whether to scale the frequency.
-    // For example, if the low_freq_factor is 1, then every frequency after the
-    auto low_freq_wavelength = scaling_params.original_context_length / scaling_params.low_freq_factor;
-    auto high_freq_wavelength = scaling_params.original_context_length / scaling_params.high_freq_factor;
-    if (low_freq_wavelength == high_freq_wavelength) {
-        throw std::invalid_argument("RoPE scaling requires low and high frequency wavelengths to be different.");
+    // Typical: low=1, high=4, factor>=1
+    assert(p.low_freq_factor != p.high_freq_factor);
+    assert(p.low_freq_factor < p.high_freq_factor);
+    assert(p.scaling_factor > T(0));
+
+    // Period (wavelength) in tokens for each channel: 2π / ω
+    const E wavelengths = T(2) * T(M_PI) / freqs;
+
+    // Threshold wavelengths (tokens). Cast to T to avoid integer division.
+    const T low_wl = T(p.original_context_length) / T(p.low_freq_factor);    // e.g., N / 1 = N
+    const T high_wl = T(p.original_context_length) / T(p.high_freq_factor);  // e.g., N / 4
+
+    if (low_wl == high_wl) {
+        throw std::invalid_argument("RoPE scaling requires distinct low/high wavelengths.");
     }
 
-    auto wavelengths = 2 * std::numbers::pi / freqs;
+    // Unscaled (high-frequency / short-range) and fully-scaled (low-frequency / long-range)
+    const E high_freqs = freqs;
+    const E low_freqs = freqs / T(p.scaling_factor);
 
-    // for high frequencies, we're capturing short-range dependencies and needn't scale.
-    auto high_freqs = freqs;
-    // for low frequencies, we're capturing long-range dependencies and need to scale by the full scaling factor.
-    auto low_freqs = freqs / scaling_params.scaling_factor;
+    // Mid-band linear blend between fully-scaled and unscaled.
+    // Using cycles across the original context: c = original_ctx / period
+    // period == wavelengths, so c = N / wavelength.
+    E cycles = T(p.original_context_length) / wavelengths;  // dimensionless
+    E smooths = (cycles - T(p.low_freq_factor)) / (T(p.high_freq_factor) - T(p.low_freq_factor));
 
-    // for frequencies in between, we smoothly interpolate.
-    auto smooths = (scaling_params.original_context_length / wavelengths - scaling_params.low_freq_factor) /
-                   (scaling_params.high_freq_factor - scaling_params.low_freq_factor);
-    auto mid_freqs = (1.0F - smooths) * freqs / scaling_params.scaling_factor + smooths * freqs;
+    // (Optional) clamp for numerical safety
+    smooths = xt::clip(smooths, T(0), T(1));
 
-    // if we're between the low and high freqs, use the smoothly interpolated mid-freqs,
-    // otherwise use low_freqs for the low freq wavelengths and high_freqs otherwise.
-    return xt::where(
-        (wavelengths < low_freq_wavelength) && (wavelengths > high_freq_wavelength),
-        mid_freqs,
-        xt::where(wavelengths > low_freq_wavelength, low_freqs, high_freqs));
+    const E mid_freqs = (T(1) - smooths) * (freqs / T(p.scaling_factor)) + smooths * freqs;
+
+    // Masks
+    const auto in_mid = (wavelengths < low_wl) & (wavelengths > high_wl);
+    const auto is_low = (wavelengths > low_wl);  // very long periods → fully scaled
+    // else: high band (wavelengths <= high_wl) → unscaled
+
+    return xt::where(in_mid, mid_freqs, xt::where(is_low, low_freqs, high_freqs));
 }
 
 // trans_mat, sin_cache, cos_cache are all precomputed and stored somewhere in
 // the module hierarchy and passed to the operation.
-autograd::TensorPtr rope(const autograd::TensorPtr& input, const RotaryEmbeddingParams& params) {
+autograd::TensorPtr rope(
+    const autograd::TensorPtr& input, const RotaryEmbeddingParams& params, const uint32_t token_position) {
     validate_rope_input_and_params(input, params);
 
     auto input_logical_shape = input->get_value().logical_shape();
@@ -111,9 +118,8 @@ autograd::TensorPtr rope(const autograd::TensorPtr& input, const RotaryEmbedding
     auto num_heads = input_logical_shape[1];
     auto seq_len = input_logical_shape[2];
     auto head_dim = input_logical_shape[3];
-    auto device = &autograd::ctx().get_device();
 
-    auto squish_batch = [num_batch, num_heads, seq_len, head_dim](const ttnn::Tensor& input) {
+    auto squish_batch = [num_batch, num_heads](const ttnn::Tensor& input) {
         auto shape = input.logical_shape();
         auto seq_len = shape[2];
         auto head_dim = shape[3];
@@ -126,10 +132,30 @@ autograd::TensorPtr rope(const autograd::TensorPtr& input, const RotaryEmbedding
         return unbatched_input;
     };
 
+    // Slice cos/sin caches to the specific position if provided (for decode mode)
+    ttnn::Tensor cos_cache_to_use = params.cos_cache;
+    ttnn::Tensor sin_cache_to_use = params.sin_cache;
+    ttnn::Tensor neg_cos_cache_to_use = params.neg_cos_cache;
+    ttnn::Tensor neg_sin_cache_to_use = params.neg_sin_cache;
+
+    if (token_position > 0U) {
+        auto pos = token_position;
+        ttsl::SmallVector<uint32_t> start = {0, 0, pos, 0};
+        ttsl::SmallVector<uint32_t> end = {1, 1, pos + seq_len, head_dim};
+        ttsl::SmallVector<uint32_t> step = {1, 1, 1, 1};
+
+        cos_cache_to_use = ttnn::slice(params.cos_cache, start, end, step);
+        sin_cache_to_use = ttnn::slice(params.sin_cache, start, end, step);
+        neg_cos_cache_to_use = ttnn::slice(params.neg_cos_cache, start, end, step);
+        neg_sin_cache_to_use = ttnn::slice(params.neg_sin_cache, start, end, step);
+    }
+
+    // after setting is_decode_mode to and converting all required tensors' memory layout to SHARDED, receiving DRAM OOM
+    // errors
     auto out_tensor = ttnn::experimental::rotary_embedding_llama(
         squish_batch(input->get_value()),
-        params.cos_cache,
-        params.sin_cache,
+        cos_cache_to_use,
+        sin_cache_to_use,
         params.trans_mat,
         /*is_decode_mode=*/false,
         /*memory_config=*/std::nullopt,
@@ -141,58 +167,71 @@ autograd::TensorPtr rope(const autograd::TensorPtr& input, const RotaryEmbedding
     // caches. Note: we can just reuse trans_mat here since the data movement
     // should be the same on the backward pass (we use the same trick to speed
     // up the matmul, and the matrix used is specified by the cos/sin caches.)
-    autograd::GradFunction grad_fn = [squish_batch, unsquish_batch, input, params, out]() {
-        auto dL_dout = out->get_grad();
+    autograd::GradFunction grad_fn =
+        [squish_batch, unsquish_batch, input, params, out, neg_cos_cache_to_use, neg_sin_cache_to_use]() {
+            auto dL_dout = out->get_grad();
 
-        auto dL_dinput = ttnn::experimental::rotary_embedding_llama(
-            squish_batch(dL_dout),
-            params.neg_cos_cache,
-            params.neg_sin_cache,
-            params.trans_mat,
-            /*is_decode_mode=*/false,
-            /*memory_config=*/std::nullopt,
-            /*compute_kernel_config=*/core::ComputeKernelConfig::precise());
-        auto unsquished = unsquish_batch(dL_dinput);
-        input->add_grad(unsquished);
-    };
+            auto dL_dinput = ttnn::experimental::rotary_embedding_llama(
+                squish_batch(dL_dout),
+                neg_cos_cache_to_use,
+                neg_sin_cache_to_use,
+                params.trans_mat,
+                /*is_decode_mode=*/false,
+                /*memory_config=*/std::nullopt,
+                /*compute_kernel_config=*/core::ComputeKernelConfig::precise());
+            auto unsquished = unsquish_batch(dL_dinput);
+            input->add_grad(unsquished);
+        };
 
-    auto links = autograd::get_links(input);
-    out->set_node(autograd::ctx().add_backward_node(std::move(grad_fn), links));
+    out->set_node(autograd::add_backward_node(std::move(grad_fn), out, input));
 
     return out;
 }
 
 std::pair<ttnn::Tensor, ttnn::Tensor> gen_freqs(
-    uint32_t head_dim, uint32_t sequence_length, float theta, const RopeScalingParams& scaling_params) {
-    // compute freqs: 1.0 / (theta ** (2 * (i-1) / head_dim)) for i in [1, head_dim/2]
-    xt::xarray<uint32_t> expt_data = xt::arange(0, static_cast<int>(head_dim)) / 2;
-    xt::xarray<float> expt_xt = xt::cast<float>(expt_data);
+    uint32_t head_dim,
+    uint32_t sequence_length,
+    float theta,
+    const RopeScalingParams& p,
+    const ttnn::distributed::TensorToMesh* mesh_mapper) {
+    // pair indices: 0,0,1,1,2,2,... size=head_dim
+    xt::xarray<uint32_t> pair_idx_u = xt::arange<uint32_t>(head_dim) / 2u;  // integer divide
+    xt::xarray<float> pair_idx = xt::cast<float>(pair_idx_u);
 
-    expt_xt *= 2.0F / static_cast<float>(head_dim);
-    xt::xarray<float> theta_pow = xt::pow(theta, expt_xt);
+    // exponent = 2 * floor(i/2) / head_dim
+    pair_idx *= 2.0F / static_cast<float>(head_dim);
 
-    auto freqs = xt::ones_like(theta_pow) / theta_pow;
+    // inv_freq[i] = 1 / (theta ** exponent[i])
+    xt::xarray<float> inv_freq = 1.0f / xt::pow(theta, pair_idx);  // [D]
 
-    xt::xarray<float> seq_pos = xt::arange<float>(sequence_length);
-    xt::xarray<float> seq_pos_repeated_to_head = xt::repeat(seq_pos, head_dim, seq_pos.dimension() - 1U);
-    xt::xarray<float> scales = seq_pos_repeated_to_head.reshape({sequence_length, head_dim});
-
-    xt::xarray<float> scaled_freqs = scales * freqs;
-
-    if (scaling_params.scaling_factor != 0.0F) {
-        scaled_freqs = apply_rope_scaling(scaled_freqs, scaling_params);
+    // Apply NTK scaling to base frequencies (recommended)
+    if (p.scaling_factor != 1.0f) {
+        inv_freq = apply_rope_scaling(inv_freq, p);  // [D]
     }
 
-    // take the scaled freqs mod 2π to satisfy ttnn inputs constraints for sin/cos
-    auto pi = static_cast<float>(std::numbers::pi);
-    scaled_freqs = xt::fmod(scaled_freqs, 2.0F * pi);
-    scaled_freqs = scaled_freqs.reshape({1, 1, sequence_length, head_dim});
+    // positions column vector [L,1]
+    // positions column vector [L,1]
+    xt::xarray<float> pos = xt::arange<float>(static_cast<float>(sequence_length));
+    pos.reshape({sequence_length, 1u});  // member reshape
 
-    xt::xarray<float> sin_freqs = xt::sin(scaled_freqs);
-    xt::xarray<float> cos_freqs = xt::cos(scaled_freqs);
+    // θ = pos * inv_freq  -> broadcast to [L,D]
+    xt::xarray<float> theta_mat = pos * inv_freq;  // [L,D]
+
+    // keep in principal range
+    theta_mat = xt::fmod(theta_mat, 2.0F * std::numbers::pi_v<float>);
+
+    // expand to [1,1,L,D]
+    xt::xarray<float> theta_4d = theta_mat;                 // copy shape metadata from theta_mat
+    theta_4d.reshape({1u, 1u, sequence_length, head_dim});  // member reshape
+
+    // trig caches
+    xt::xarray<float> sin_freqs = xt::sin(theta_4d);
+    xt::xarray<float> cos_freqs = xt::cos(theta_4d);
 
     auto* device = &autograd::ctx().get_device();
-    return {core::from_xtensor(sin_freqs, device), core::from_xtensor(cos_freqs, device)};
+    return {
+        core::from_xtensor(sin_freqs, device, ttnn::Layout::TILE, mesh_mapper),
+        core::from_xtensor(cos_freqs, device, ttnn::Layout::TILE, mesh_mapper)};
 }
 
 ttnn::Tensor gen_trans_mat() {
@@ -220,7 +259,30 @@ RotaryEmbeddingParams build_rope_params(
     if (head_dim == 0U) {
         throw std::invalid_argument("RoPE head_dim must be non-zero.");
     }
-    auto [sin_freqs, cos_freqs] = gen_freqs(head_dim, sequence_length, theta, scaling_params);
+
+    // If ParallelismContext is initialized and CP is enabled, shard freqs across the CP axis.
+    std::shared_ptr<ttnn::distributed::TensorToMesh> mapper;
+    uint32_t local_seq_len = sequence_length;
+
+    if (autograd::ctx().is_parallelism_context_initialized()) {
+        auto& pctx = autograd::ctx().get_parallelism_context();
+        std::optional<uint32_t> cp_axis = pctx.get_cp_axis();
+        const uint32_t cp_size = pctx.get_cp_size();
+
+        if (cp_axis.has_value() && cp_size > 1) {
+            TT_FATAL(
+                sequence_length % cp_size == 0,
+                "sequence_length ({}) must be divisible by cp_size ({})",
+                sequence_length,
+                cp_size);
+            local_seq_len = sequence_length / cp_size;
+
+            auto* device = &autograd::ctx().get_device();
+            mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*device, /*dim=*/2, cp_axis.value());
+        }
+    }
+
+    auto [sin_freqs, cos_freqs] = gen_freqs(head_dim, sequence_length, theta, scaling_params, mapper.get());
     auto trans_mat = gen_trans_mat();
     return {
         .cos_cache = cos_freqs,
@@ -229,7 +291,7 @@ RotaryEmbeddingParams build_rope_params(
         .neg_sin_cache = ttnn::neg(sin_freqs),  // sin(-θ) = -sin(θ)
         .trans_mat = trans_mat,
 
-        .sequence_length = sequence_length,
+        .sequence_length = local_seq_len,
         .head_dim = head_dim,
 
         .rope_scaling_params = scaling_params,

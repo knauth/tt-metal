@@ -1,10 +1,12 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/circular_buffer.h"
 
 void kernel_main() {
     uint32_t arg_index = 0;
@@ -25,27 +27,26 @@ void kernel_main() {
 
     constexpr uint32_t onetile = 1;
 
-    constexpr bool dst_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr auto cb_id_dst = get_compile_time_arg_val(1);
-    const uint32_t dst_tile_bytes = get_tile_size(cb_id_dst);
-    const DataFormat dst_data_format = get_dataformat(cb_id_dst);
+    constexpr auto cb_id_dst = get_compile_time_arg_val(0);
+    constexpr auto dst_args = TensorAccessorArgs<1>();
+    const auto dst = TensorAccessor(dst_args, dst_addr);
 
-    const InterleavedAddrGenFast<dst_is_dram> dst = {
-        .bank_base_address = dst_addr, .page_size = dst_tile_bytes, .data_format = dst_data_format};
+    Noc noc;
+    CircularBuffer cb_dst(cb_id_dst);
+    const uint32_t dst_tile_bytes = cb_dst.get_tile_size();
 
     uint32_t HtWt = Ht * Wt;
     uint32_t num_tiles_written = 0;
     for (uint32_t n = start_n; n < N && num_tiles_written < num_tiles; ++n, start_c = 0) {
         for (uint32_t c = start_c; c < C && num_tiles_written < num_tiles; ++c, start_th = 0) {
             for (uint32_t th = start_th; th < Ht && num_tiles_written < num_tiles; ++th, start_tw = 0) {
-                cb_wait_front(cb_id_dst, onetile);
-                uint32_t l1_read_addr = get_read_ptr(cb_id_dst);
+                cb_dst.wait_front(onetile);
                 for (uint32_t tw = start_tw; tw < Wt && num_tiles_written < num_tiles; ++tw, ++num_tiles_written) {
                     // write a tile to dst, since the dst shape is full, the tile offset simply grows linearly
-                    noc_async_write_tile(start_tile_id + num_tiles_written, dst, l1_read_addr);
+                    noc.async_write(cb_dst, dst, dst_tile_bytes, {}, {.page_id = start_tile_id + num_tiles_written});
                 }
-                noc_async_write_barrier();
-                cb_pop_front(cb_id_dst, onetile);
+                noc.async_write_barrier();
+                cb_dst.pop_front(onetile);
             }
         }
     }

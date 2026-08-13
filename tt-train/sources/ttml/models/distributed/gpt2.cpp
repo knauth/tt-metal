@@ -1,11 +1,10 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "gpt2.hpp"
 
 #include "autograd/graph_utils.hpp"
-#include "autograd/module_base.hpp"
 #include "autograd/tensor.hpp"
 #include "core/scoped.hpp"
 #include "core/tt_tensor_utils.hpp"
@@ -14,6 +13,7 @@
 #include "modules/distributed/gpt_block.hpp"
 #include "modules/distributed/linear.hpp"
 #include "modules/gpt_block.hpp"
+#include "modules/module_base.hpp"
 #include "modules/positional_embeddings.hpp"
 #include "ops/binary_ops.hpp"
 #include "ops/unary_ops.hpp"
@@ -86,7 +86,7 @@ DistributedTransformer::DistributedTransformer(const TransformerConfig& config) 
     auto create_positional_embedding = [position_embedding_type,
                                         max_sequence_length,
                                         embedding_dim,
-                                        dropout_prob]() -> std::shared_ptr<autograd::ModuleBase> {
+                                        dropout_prob]() -> std::shared_ptr<modules::ModuleBase> {
         if (position_embedding_type == PositionalEmbeddingType::Trainable) {
             return std::make_shared<ttml::modules::TrainablePositionalEmbedding>(
                 ttml::modules::PositionalEmbeddingConfig{
@@ -109,8 +109,10 @@ DistributedTransformer::DistributedTransformer(const TransformerConfig& config) 
             embedding_dim, num_heads, dropout_prob, use_composite_layernorm));
     }
     ln_fc = std::make_shared<ttml::modules::LayerNormLayer>(embedding_dim, use_composite_layernorm);
+    // LM head keeps its output vocab-sharded ([B,1,S,V/tp_size] per device); pair it
+    // with ttml::ops::distributed::vocab_parallel_cross_entropy_loss.
     fc = std::make_shared<ttml::modules::distributed::ColumnParallelLinear>(
-        embedding_dim, vocab_size, /* bias */ false, /* gather_output */ true);
+        embedding_dim, vocab_size, /* bias */ false, /* gather_output */ false);
 
     create_name("transformer");
     register_module(tok_emb, "tok_emb");
@@ -129,7 +131,7 @@ DistributedTransformer::DistributedTransformer(const TransformerConfig& config) 
 }
 
 ttml::autograd::TensorPtr DistributedTransformer::operator()(
-    const ttml::autograd::TensorPtr& x, const ttml::autograd::TensorPtr& mask) {
+    const ttml::autograd::TensorPtr& x, const std::optional<ttml::autograd::TensorPtr>& mask) {
     auto tok_emb_out = (*tok_emb)(x);
     auto out = (*pos_emb)(tok_emb_out);
 

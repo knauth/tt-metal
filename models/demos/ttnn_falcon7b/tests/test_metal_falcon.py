@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,7 +11,6 @@ import ttnn
 from models.demos.ttnn_falcon7b.tt.common import create_custom_preprocessor, create_kv_cache
 from models.demos.ttnn_falcon7b.tt.falcon_causallm import TtFalconCausalLM
 from models.demos.ttnn_falcon7b.tt.model_config import get_model_config, get_tt_cache_path
-from models.utility_functions import is_e75
 
 
 def run_test_FalconCausalLM_end_to_end(
@@ -32,9 +31,13 @@ def run_test_FalconCausalLM_end_to_end(
 
     configuration = transformers.FalconConfig.from_pretrained(model_version)
     configuration.num_hidden_layers = num_layers
-    model = transformers.models.falcon.modeling_falcon.FalconForCausalLM.from_pretrained(
-        model_version, config=configuration
-    ).eval()
+    model = (
+        transformers.models.falcon.modeling_falcon.FalconForCausalLM.from_pretrained(
+            model_version, config=configuration
+        )
+        .eval()
+        .to(torch.float32)
+    )
 
     head_dim = configuration.hidden_size // configuration.num_attention_heads
     use_cache = True
@@ -205,9 +208,6 @@ def test_perf_bare_metal(
     model_config_str,
     model_location_generator,
 ):
-    if is_e75(device) and batch == 32:
-        pytest.skip("Falcon batch 32 is not supported on E75")
-
     ttnn.device.EnableMemoryReports()
 
     model_config = get_model_config(model_config_str)

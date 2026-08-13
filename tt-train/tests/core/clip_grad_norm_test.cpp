@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,12 +6,12 @@
 
 #include <gtest/gtest.h>
 
-#include <core/ttnn_all_includes.hpp>
 #include <xtensor/containers/xarray.hpp>
 #include <xtensor/views/xview.hpp>
 
 #include "autograd/auto_context.hpp"
 #include "autograd/tensor.hpp"
+#include "core/system_utils.hpp"
 #include "core/tt_tensor_utils.hpp"
 
 class ClipGradNormTest : public ::testing::Test {
@@ -34,6 +34,7 @@ TEST_F(ClipGradNormTest, ClipGradNorm_GENEROUS_TOLERANCE) {
     const uint32_t num_tensors = 3U;
     const uint32_t tensor_size = 4U;
     std::vector<autograd::TensorPtr> tensors;
+    tensors.reserve(num_tensors);
     std::vector<xt::xarray<float>> expected_grads = {
         {1.0F, 2.0F, 3.0F, 4.0F}, {-2.0F, -3.0F, -4.0F, 5.0F}, {0.5F, -1.5F, 2.5F, -3.5F}};
 
@@ -56,6 +57,7 @@ TEST_F(ClipGradNormTest, ClipGradNorm_GENEROUS_TOLERANCE) {
         auto tensor = autograd::create_tensor(core::zeros(ttnn::Shape({1U, 1U, 1U, tensor_size}), device));
         auto grad_tensor = core::from_xtensor(expected_grads[i], device);
         tensor->set_grad(grad_tensor);
+        tensor->set_requires_grad(true);
         tensors.push_back(tensor);
     }
 

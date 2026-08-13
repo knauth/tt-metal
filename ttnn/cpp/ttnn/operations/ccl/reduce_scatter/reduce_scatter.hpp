@@ -1,71 +1,30 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/decorators.hpp"
-
-#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
-
-#include "ttnn/operations/ccl/ccl_host_types.hpp"
+#include <tt-metalium/sub_device_types.hpp>
+#include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include "ttnn/types.hpp"
 
 namespace ttnn {
-namespace operations {
-namespace ccl {
 
-struct ExecuteReduceScatter {
-    static ttnn::Tensor invoke(
-        const Tensor& input_tensor,
-        int32_t dim,
-        uint32_t cluster_axis,
-        const MeshDevice& mesh_device,
-        ttnn::operations::reduction::ReduceType reduce_op = ttnn::operations::reduction::ReduceType::Sum,
-        uint32_t num_links = 1,
-        const std::optional<ttnn::MemoryConfig>& output_mem_config =
-            tt::tt_metal::operation::DEFAULT_OUTPUT_MEMORY_CONFIG,
-        ttnn::ccl::Topology topology = ttnn::ccl::Topology::Ring,
-        std::optional<size_t> user_defined_num_workers = std::nullopt,
-        std::optional<size_t> user_defined_num_buffers_per_channel = std::nullopt);
-
-    static std::vector<ttnn::Tensor> invoke(
-        const std::vector<ttnn::Tensor>& input_tensors,
-        int32_t dim,
-        uint32_t cluster_axis,
-        const MeshDevice& mesh_device,
-        ttnn::operations::reduction::ReduceType reduce_op = ttnn::operations::reduction::ReduceType::Sum,
-        uint32_t num_links = 1,
-        const std::optional<ttnn::MemoryConfig>& output_mem_config =
-            tt::tt_metal::operation::DEFAULT_OUTPUT_MEMORY_CONFIG,
-        ttnn::ccl::Topology topology = ttnn::ccl::Topology::Ring,
-        std::optional<size_t> user_defined_num_workers = std::nullopt,
-        std::optional<size_t> user_defined_num_buffers_per_channel = std::nullopt);
-
-    static ttnn::Tensor invoke(
-        const ttnn::Tensor& input_tensor,
-        int32_t dim,
-        ttnn::operations::reduction::ReduceType math_op,
-        uint32_t num_links = 1,
-        const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
-        ttnn::ccl::Topology topology = ttnn::ccl::Topology::Ring,
-        std::optional<size_t> num_workers = std::nullopt,
-        std::optional<size_t> num_buffers_per_channel = std::nullopt);
-
-    static std::vector<ttnn::Tensor> invoke(
-        const std::vector<ttnn::Tensor>& input_tensors,
-        int32_t dim,
-        ttnn::operations::reduction::ReduceType math_op,
-        uint32_t num_links = 1,
-        const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
-        ttnn::ccl::Topology topology = ttnn::ccl::Topology::Ring,
-        std::optional<size_t> num_workers = std::nullopt,
-        std::optional<size_t> num_buffers_per_channel = std::nullopt);
-};
-
-}  // namespace ccl
-}  // namespace operations
-
-constexpr auto reduce_scatter =
-    ttnn::register_operation<"ttnn::reduce_scatter", ttnn::operations::ccl::ExecuteReduceScatter>();
+ttnn::Tensor reduce_scatter(
+    const ttnn::Tensor& input_tensor,
+    int32_t dim,
+    std::optional<uint32_t> cluster_axis = std::nullopt,
+    const std::optional<tt::tt_metal::SubDeviceId>& subdevice_id = std::nullopt,
+    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
+    const std::optional<ttnn::MemoryConfig>& intermediate_memory_config = std::nullopt,
+    const std::optional<ttnn::Tensor>& optional_output_tensor = std::nullopt,
+    std::optional<uint32_t> num_links = std::nullopt,
+    std::optional<tt::tt_fabric::Topology> topology = std::nullopt,
+    std::optional<uint32_t> chunks_per_sync = std::nullopt,
+    std::optional<uint32_t> num_workers_per_link = std::nullopt,
+    std::optional<uint32_t> num_buffers_per_channel = std::nullopt,
+    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
+    bool use_l1_small_for_semaphores = false);
 
 }  // namespace ttnn

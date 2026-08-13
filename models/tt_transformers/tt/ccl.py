@@ -1,8 +1,33 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import ttnn
+from models.common.modules.tt_ccl import get_num_links as get_common_num_links
+
+
+def get_num_links(mesh_device, cluster_axis=None):
+    """
+    Get the number of available Ethernet links for CCL operations.
+
+    This function queries the fabric control plane to determine the maximum number
+    of usable links for collective communication operations.
+
+    Args:
+        mesh_device: The mesh device to query.
+        cluster_axis: Optional cluster axis to query links for.
+            - 0: Query links along the vertical axis (North-South direction).
+            - 1: Query links along the horizontal axis (East-West direction).
+            - None: Query links across all axes and return the minimum.
+
+    Returns:
+        int: The number of available links
+
+    Example:
+        >>> num_links = get_num_links(mesh_device)
+        >>> num_links_axis0 = get_num_links(mesh_device, cluster_axis=0)
+    """
+    return get_common_num_links(mesh_device, cluster_axis)
 
 
 class TT_CCL:
@@ -48,20 +73,37 @@ class TT_CCL:
                     [ttnn.create_global_semaphore(self.mesh_device, self.sub_device_crs, 0) for _ in range(3)]
                 )
 
+    def get_num_links(self, cluster_axis=None):
+        """
+        Get the number of available Ethernet links for CCL operations on this mesh device.
+
+        Args:
+            cluster_axis: Optional cluster axis to query links for.
+                - 0: Query links along the vertical axis (North-South direction).
+                - 1: Query links along the horizontal axis (East-West direction).
+                - None: Query links across all axes and return the minimum.
+
+        Returns:
+            int: The number of available links (minimum 1).
+        """
+        return get_num_links(self.mesh_device, cluster_axis)
+
+    # Index 2 stores the no-axis semaphore pool; cluster_axis=0 is a valid axis
+    # and must not be folded into that bucket.
     def get_and_cycle_barrier_semaphore_handle(self, cluster_axis=None):
-        semaphore_index = 2 if not cluster_axis else cluster_axis
+        semaphore_index = 2 if cluster_axis is None else cluster_axis
         current_idx = self.barrier_semaphore_idx[semaphore_index]
         self.barrier_semaphore_idx[semaphore_index] = (current_idx + 1) % 2
         return self.barrier_semaphore_handles[semaphore_index][current_idx]
 
     def get_and_cycle_ag_semaphore_handles(self, cluster_axis=None):
-        semaphore_index = 2 if not cluster_axis else cluster_axis
+        semaphore_index = 2 if cluster_axis is None else cluster_axis
         current_idx = self.ag_semaphores_idx[semaphore_index]
         self.ag_semaphores_idx[semaphore_index] = (current_idx + 1) % 2
         return self.ag_semaphore_handles[semaphore_index][current_idx]
 
     def get_and_cycle_rs_semaphore_handles(self, cluster_axis=None):
-        semaphore_index = 2 if not cluster_axis else cluster_axis
+        semaphore_index = 2 if cluster_axis is None else cluster_axis
         current_idx = self.rs_semaphores_idx[semaphore_index]
         self.rs_semaphores_idx[semaphore_index] = (current_idx + 1) % 2
         return self.rs_semaphore_handles[semaphore_index][current_idx]
@@ -73,17 +115,48 @@ def tt_all_reduce(
     tt_ccl,
     cluster_axis=0,
     dim=0,
-    num_reduce_scatter_links=1,
-    num_all_gather_links=2,
+    num_reduce_scatter_links=None,
+    num_all_gather_links=None,
     topology=ttnn.Topology.Linear,
     memory_config=None,
+    rs_memory_config=ttnn.DRAM_MEMORY_CONFIG,
     sharded=False,
     dtype=ttnn.bfloat16,
     use_composite=False,
+    chunks_per_sync=10,
+    num_workers_per_link=2,
+    subdevice_id=None,
 ):
-    # N150
-    if list(mesh_device.shape) == [1, 1] or (cluster_axis == 1 and 1 in list(mesh_device.shape)):
+    """
+    Perform an all-reduce operation across devices in a mesh.
+
+    Args:
+        input_tensor: The input tensor to reduce.
+        mesh_device: The mesh device to perform the operation on.
+        tt_ccl: The TT_CCL instance for semaphore management.
+        cluster_axis: The cluster axis for the reduction (default: 0).
+        dim: The dimension to reduce along (default: 0).
+        num_reduce_scatter_links: Number of links for reduce_scatter. If None, uses max available.
+        num_all_gather_links: Number of links for all_gather. If None, uses max available.
+        topology: The topology to use (default: ttnn.Topology.Linear).
+        memory_config: Memory configuration for the output.
+        sharded: Whether to use sharded memory config.
+        dtype: Data type for CCL operations.
+        use_composite: Whether to use composite reduce_scatter + all_gather.
+
+    Returns:
+        The reduced tensor.
+    """
+    # Skip CCL if single device or only 1 device on the target axis
+    mesh_shape = list(mesh_device.shape)
+    if mesh_shape == [1, 1] or (cluster_axis == 1 and 1 in list(mesh_device.shape)):
         return input_tensor
+
+    # Auto-detect num_links if not provided
+    if num_reduce_scatter_links is None:
+        num_reduce_scatter_links = tt_ccl.get_num_links(cluster_axis)
+    if num_all_gather_links is None:
+        num_all_gather_links = tt_ccl.get_num_links(cluster_axis)
 
     # Ensure dim 0 and 1 are 1
     original_shape = input_tensor.shape
@@ -107,11 +180,12 @@ def tt_all_reduce(
             barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(),
             num_links=num_reduce_scatter_links,
             memory_config=memory_config,
-            intermediate_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            intermediate_memory_config=rs_memory_config,
             topology=topology,
-            chunks_per_sync=10,
-            num_workers_per_link=2,
+            chunks_per_sync=chunks_per_sync,
+            num_workers_per_link=num_workers_per_link,
             num_buffers_per_channel=2,
+            subdevice_id=subdevice_id,
         )
         input_tensor.deallocate(True)
         return reduced
@@ -141,6 +215,7 @@ def tt_all_reduce(
             chunks_per_sync=10,
             num_workers_per_link=2,
             num_buffers_per_channel=2,
+            subdevice_id=subdevice_id,
         )
 
         if sharded:
@@ -172,6 +247,7 @@ def tt_all_reduce(
             chunks_per_sync=10,
             num_workers_per_link=2,
             num_buffers_per_channel=2,
+            subdevice_id=subdevice_id,
         )
 
         reduced_tensor = ttnn.experimental.all_gather_async(
@@ -187,6 +263,7 @@ def tt_all_reduce(
             chunks_per_sync=10,
             num_workers_per_link=2,
             num_buffers_per_channel=2,
+            subdevice_id=subdevice_id,
         )
 
     # Reshape the reduced tensor to the original shape
@@ -201,15 +278,39 @@ def tt_all_gather(
     tt_ccl,
     cluster_axis,
     dim,
-    num_links=2,
+    num_links=None,
     memory_config=None,
     sharded=False,
     topology=ttnn.Topology.Linear,
     dtype=ttnn.bfloat16,
+    subdevice_id=None,
 ):
-    # N150
-    if list(mesh_device.shape) == (1, 1) or (cluster_axis == 1 and 1 in list(mesh_device.shape)):
+    """
+    Perform an all-gather operation across devices in a mesh.
+
+    Args:
+        input_tensor: The input tensor to gather.
+        mesh_device: The mesh device to perform the operation on.
+        tt_ccl: The TT_CCL instance for semaphore management.
+        cluster_axis: The cluster axis for the gather operation.
+        dim: The dimension to gather along.
+        num_links: Number of links to use. If None, uses max available.
+        memory_config: Memory configuration for the output.
+        sharded: Whether to use sharded memory config.
+        topology: The topology to use (default: ttnn.Topology.Linear).
+        dtype: Data type for CCL operations.
+
+    Returns:
+        The gathered tensor.
+    """
+    # Skip CCL if single device or only 1 device on the target axis
+    mesh_shape = list(mesh_device.shape)
+    if mesh_shape == [1, 1] or (cluster_axis == 1 and 1 in list(mesh_device.shape)):
         return input_tensor
+
+    # Auto-detect num_links if not provided
+    if num_links is None:
+        num_links = tt_ccl.get_num_links(cluster_axis)
 
     # Ensure the input tensor is in the correct memory configuration
     if not sharded:
@@ -234,6 +335,7 @@ def tt_all_gather(
             chunks_per_sync=10,
             num_workers_per_link=2,
             num_buffers_per_channel=2,
+            subdevice_id=subdevice_id,
         )
     else:
         gathered = ttnn.experimental.all_gather_async(
@@ -249,12 +351,32 @@ def tt_all_gather(
             chunks_per_sync=10,
             num_workers_per_link=2,
             num_buffers_per_channel=2,
+            subdevice_id=subdevice_id,
         )
     input_tensor.deallocate(True)
     return gathered
 
 
-def tt_distributed_rmsnorm(inp, epsilon, gamma, mesh_device, tt_ccl, compute_kernel_config):
+def tt_distributed_rmsnorm(inp, epsilon, gamma, mesh_device, tt_ccl, compute_kernel_config, num_links=None):
+    """
+    Perform distributed RMS normalization across devices.
+
+    Args:
+        inp: Input tensor.
+        epsilon: Small value for numerical stability.
+        gamma: Scale parameter.
+        mesh_device: The mesh device.
+        tt_ccl: The TT_CCL instance for semaphore management.
+        compute_kernel_config: Compute kernel configuration.
+        num_links: Number of links to use. If None, uses max available for cluster_axis=1.
+
+    Returns:
+        The normalized tensor.
+    """
+    # Auto-detect num_links if not provided
+    if num_links is None:
+        num_links = tt_ccl.get_num_links(cluster_axis=1)
+
     # Run distributed rmsnorm part 1
     tt_stats = ttnn.rms_norm_pre_all_gather(inp, compute_kernel_config=compute_kernel_config, dtype=ttnn.bfloat16)
     padded_shape = (1, 1, inp.shape[-2], 32)
@@ -265,7 +387,7 @@ def tt_distributed_rmsnorm(inp, epsilon, gamma, mesh_device, tt_ccl, compute_ker
         tt_ccl=tt_ccl,
         dim=3,
         cluster_axis=1,
-        num_links=1,
+        num_links=num_links,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
     )
 
@@ -283,21 +405,50 @@ def tt_distributed_rmsnorm(inp, epsilon, gamma, mesh_device, tt_ccl, compute_ker
 
 
 def tt_sharded_distributed_rmsnorm(
-    inp, epsilon, gamma, mesh_device, tt_ccl, ln_sharded_input_memcfg, ln_sharded_progcfg, ln_sharded_stats_memcfg
+    inp,
+    epsilon,
+    gamma,
+    mesh_device,
+    tt_ccl,
+    ln_sharded_input_memcfg,
+    ln_sharded_progcfg,
+    ln_sharded_stats_memcfg,
+    num_links=None,
 ):
+    """
+    Perform sharded distributed RMS normalization across devices.
+
+    Args:
+        inp: Input tensor.
+        epsilon: Small value for numerical stability.
+        gamma: Scale parameter.
+        mesh_device: The mesh device.
+        tt_ccl: The TT_CCL instance for semaphore management.
+        ln_sharded_input_memcfg: Memory config for sharded input.
+        ln_sharded_progcfg: Program config for sharded layernorm.
+        ln_sharded_stats_memcfg: Memory config for sharded stats.
+        num_links: Number of links to use. If None, uses max available for cluster_axis=1.
+
+    Returns:
+        The normalized tensor.
+    """
+    # Auto-detect num_links if not provided
+    cluster_axis = 1
+    if num_links is None:
+        num_links = tt_ccl.get_num_links(cluster_axis)
+
     inp = ttnn.to_memory_config(inp, memory_config=ln_sharded_input_memcfg)
 
     # Run distributed rmsnorm part 1
     tt_stats = ttnn.rms_norm_pre_all_gather(inp, program_config=ln_sharded_progcfg)
 
     # All gather stats
-    cluster_axis = 1
     tt_stats = ttnn.experimental.all_gather_async(
         tt_stats,
         persistent_output_buffer=None,
         dim=3,
         multi_device_global_semaphore=tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
-        num_links=1,
+        num_links=num_links,
         cluster_axis=cluster_axis,
         topology=ttnn.Topology.Linear,
         memory_config=ln_sharded_stats_memcfg,
@@ -318,43 +469,3 @@ def tt_sharded_distributed_rmsnorm(
     tt_stats.deallocate(True)
 
     return tt_out
-
-
-# TODO: #26351
-# Fabric AG currently doesn't support gathering on a padded dim 3
-# This functionality is in development, and when ready should replace this workaround
-def ag_on_padded_dim_3(inp, tt_ccl, cluster_axis, num_links, topology):
-    if inp.shape[3] % 32 != 0:
-        input_dtype = inp.dtype
-        if input_dtype == ttnn.bfloat8_b:
-            inp = ttnn.typecast(inp, ttnn.bfloat16)
-        inp = ttnn.to_layout(inp, layout=ttnn.ROW_MAJOR_LAYOUT)
-        all_broadcast_output_tensors = ttnn.experimental.all_broadcast_async(
-            inp,
-            multi_device_global_semaphore=tt_ccl.get_and_cycle_ag_semaphore_handles()[0],
-            num_links=num_links,
-            memory_config=inp.memory_config(),
-            topology=ttnn.Topology.Linear,
-            barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(),
-        )
-        all_gather_output_tensor = ttnn.concat(all_broadcast_output_tensors, dim=3)
-        [ttnn.deallocate(all_broadcast_output_tensor) for all_broadcast_output_tensor in all_broadcast_output_tensors]
-        all_gather_output_tensor = ttnn.to_layout(all_gather_output_tensor, ttnn.TILE_LAYOUT)
-        if input_dtype == ttnn.bfloat8_b:
-            all_gather_output_tensor = ttnn.typecast(all_gather_output_tensor, ttnn.bfloat8_b)
-        return all_gather_output_tensor
-    else:
-        return ttnn.experimental.all_gather_async(
-            inp,
-            persistent_output_buffer=None,
-            dim=3,
-            multi_device_global_semaphore=tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
-            num_links=num_links,
-            memory_config=inp.memory_config(),
-            cluster_axis=cluster_axis,
-            topology=topology,
-            barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
-            chunks_per_sync=10,
-            num_workers_per_link=2,
-            num_buffers_per_channel=2,
-        )

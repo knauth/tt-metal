@@ -1,8 +1,11 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
     // out tensor args
@@ -24,16 +27,16 @@ void kernel_main() {
     uint32_t MtNt = get_arg_val<uint32_t>(11);  // if 0
     uint32_t batch = get_arg_val<uint32_t>(12);
 
-    constexpr bool out_is_dram = get_compile_time_arg_val(0) == 1;
-
-    constexpr uint32_t cb_id_out0 = 16;
+    constexpr uint32_t dfb_id_out0 = get_named_compile_time_arg_val("cb_out");
 
     // single-tile
-    const uint32_t single_tile_size_bytes = get_tile_size(cb_id_out0);
-    const DataFormat data_format = get_dataformat(cb_id_out0);
+    const uint32_t single_tile_size_bytes = get_tile_size(dfb_id_out0);
 
-    const InterleavedAddrGenFast<out_is_dram> s = {
-        .bank_base_address = out_tensor_addr, .page_size = single_tile_size_bytes, .data_format = data_format};
+    constexpr auto out_args = TensorAccessorArgs<0>();
+    const auto s = TensorAccessor(out_args, out_tensor_addr);
+
+    Noc noc;
+    DataflowBuffer dfb_out(dfb_id_out0);
 
     bool one_time_profile = true;
     for (uint32_t b = 0; b < batch; b++) {
@@ -43,22 +46,27 @@ void kernel_main() {
             for (uint32_t sbw = 0; sbw < out_num_subblocks_w; sbw++) {
                 uint32_t out_tensor_sb_row_start_tile_id = out_tensor_sbw_start_tile_id;
 
-                cb_wait_front(cb_id_out0, out_subblock_tile_count);
-                uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
+                dfb_out.wait_front(out_subblock_tile_count);
+                uint32_t out_read_offset = 0;
 
                 for (uint32_t h = 0; h < out_subblock_h; h++) {
                     uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
                     for (uint32_t w = 0; w < out_subblock_w; w++) {
-                        noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
-                        l1_read_addr += single_tile_size_bytes;
+                        noc.async_write(
+                            dfb_out,
+                            s,
+                            single_tile_size_bytes,
+                            {.offset_bytes = out_read_offset},
+                            {.page_id = out_tensor_tile_id});
+                        out_read_offset += single_tile_size_bytes;
 
                         out_tensor_tile_id += out_tensor_stride_w;
                     }
                     out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                 }
 
-                noc_async_write_barrier();
-                cb_pop_front(cb_id_out0, out_subblock_tile_count);
+                noc.async_write_barrier();
+                dfb_out.pop_front(out_subblock_tile_count);
                 out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
             }
             out_tensor_sbh_start_tile_id += out_tensor_next_subblock_stride_h;

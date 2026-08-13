@@ -1,10 +1,12 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
 #include <yaml-cpp/yaml.h>
+
+#include <optional>
 
 #include "models/gpt2.hpp"
 #include "modules/distributed/gpt_block.hpp"
@@ -21,20 +23,20 @@ using models::gpt2::RunnerType;
 using models::gpt2::TransformerConfig;
 using models::gpt2::WeightTyingType;
 
-class DistributedTransformer : public ttml::autograd::ModuleBase {
+class DistributedTransformer : public BaseTransformer {
 private:
     RunnerType runner_type = RunnerType::Default;
-    std::shared_ptr<ttml::autograd::ModuleBase> tok_emb;
-    std::shared_ptr<ttml::autograd::ModuleBase> pos_emb;
-    std::vector<std::shared_ptr<ttml::autograd::ModuleBase>> blocks;
-    std::shared_ptr<ttml::autograd::ModuleBase> ln_fc;
-    std::shared_ptr<ttml::autograd::ModuleBase> fc;
+    std::shared_ptr<ttml::modules::ModuleBase> tok_emb;
+    std::shared_ptr<ttml::modules::ModuleBase> pos_emb;
+    std::vector<std::shared_ptr<ttml::modules::distributed::DistributedGPTBlock>> blocks;
+    std::shared_ptr<ttml::modules::ModuleBase> ln_fc;
+    std::shared_ptr<ttml::modules::ModuleBase> fc;
 
 public:
     explicit DistributedTransformer(const TransformerConfig& config);
-
+    virtual ~DistributedTransformer() = default;
     ttml::autograd::TensorPtr operator()(
-        const ttml::autograd::TensorPtr& x, const ttml::autograd::TensorPtr& mask) override;
+        const ttml::autograd::TensorPtr& x, const std::optional<ttml::autograd::TensorPtr>& mask) override;
 };
 
 [[nodiscard]] std::shared_ptr<DistributedTransformer> create(const TransformerConfig& config);

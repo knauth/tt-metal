@@ -1,12 +1,12 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <array>
 #include <cstdint>
-#include "dataflow_api.h"
-#include "debug/dprint.h"
-#include "ttnn/deprecated/tt_dnn/op_library/ccl/edm/erisc_async_datamover.hpp"
+#include "api/dataflow/dataflow_api.h"
+#include "api/debug/dprint.h"
+#include "ttnn/operations/ccl/kernels/edm/erisc_async_datamover.hpp"
 
 #define DONT_STRIDE_IN_ETH_BUFFER 0
 
@@ -17,14 +17,14 @@
  * */
 
 // Initiate DRAM write -> advances  write pointer
-template <bool dest_is_dram>
+template <typename Accessor>
 void write_chunk_legacy(
     const uint32_t eth_l1_buffer_address_base,
     const uint32_t num_pages,
     const uint32_t num_pages_per_l1_buffer,
     const uint32_t page_size,
     uint32_t& page_index,
-    const InterleavedAddrGen<dest_is_dram>& dest_address_generator) {
+    const Accessor& dest_address_generator) {
     uint32_t local_eth_l1_curr_src_addr = eth_l1_buffer_address_base;
     uint32_t end_page_index = std::min(page_index + num_pages_per_l1_buffer, num_pages);
     for (; page_index < end_page_index; ++page_index) {
@@ -38,7 +38,7 @@ void write_chunk_legacy(
     }
 }
 
-template <uint32_t MAX_NUM_CHANNELS, bool dest_is_dram>
+template <uint32_t MAX_NUM_CHANNELS, typename Accessor>
 bool eth_initiate_noc_write_sequence(
     std::array<uint32_t, MAX_NUM_CHANNELS>& transaction_channel_receiver_buffer_addresses,
     erisc::datamover::QueueIndexPointer<uint8_t>& noc_writer_buffer_wrptr,
@@ -50,7 +50,7 @@ bool eth_initiate_noc_write_sequence(
     const uint32_t num_pages_per_l1_buffer,
     const uint32_t page_size,
     uint32_t& page_index,
-    const InterleavedAddrGen<dest_is_dram>& dest_address_generator) {
+    const Accessor& dest_address_generator) {
     bool did_something = false;
     bool noc_write_is_in_progress = erisc::datamover::deprecated::receiver_is_noc_write_in_progress(
         noc_writer_buffer_wrptr, noc_writer_buffer_ackptr);
@@ -60,9 +60,9 @@ bool eth_initiate_noc_write_sequence(
         if (next_payload_received) {
             // Can initialize a new write if data is at this buffer location (eth num_bytes != 0)
             // and the receiver ackptr != next write pointer
-            // // DPRINT << "rx: accepting payload, sending receive ack on channel " <<
-            // (uint32_t)noc_writer_buffer_wrptr << "\n";
-            write_chunk_legacy<dest_is_dram>(
+            // // DPRINT("rx: accepting payload, sending receive ack on channel {}\n",
+            // (uint32_t)noc_writer_buffer_wrptr);
+            write_chunk_legacy(
                 transaction_channel_receiver_buffer_addresses[noc_writer_buffer_wrptr.index()],
                 num_pages,
                 num_pages_per_l1_buffer,
@@ -96,8 +96,8 @@ void kernel_main() {
     const std::uint32_t num_pages = get_arg_val<uint32_t>(5);
     erisc::datamover::eth_setup_handshake(remote_eth_l1_dst_addr, false);
 
-    const InterleavedAddrGen<dest_is_dram> dest_address_generator = {
-        .bank_base_address = dest_addr, .page_size = page_size};
+    constexpr auto dst_args = TensorAccessorArgs<5>();
+    const auto dest_address_generator = TensorAccessor(dst_args, dest_addr);
 
     erisc::datamover::QueueIndexPointer<uint8_t> noc_writer_buffer_ackptr(MAX_NUM_CHANNELS);
     erisc::datamover::QueueIndexPointer<uint8_t> noc_writer_buffer_wrptr(MAX_NUM_CHANNELS);
@@ -137,7 +137,7 @@ void kernel_main() {
             num_receives_acked = received ? num_receives_acked + 1 : num_receives_acked;
             did_something = received || did_something;
 
-            did_something = eth_initiate_noc_write_sequence<MAX_NUM_CHANNELS, dest_is_dram>(
+            did_something = eth_initiate_noc_write_sequence<MAX_NUM_CHANNELS>(
                                 transaction_channel_local_buffer_addresses,
                                 noc_writer_buffer_wrptr,
                                 noc_writer_buffer_ackptr,
@@ -170,34 +170,39 @@ void kernel_main() {
                     num_context_switches++;
                     if (num_context_switches > max_num_context_switches) {
                         if (!printed_hang) {
-                            DPRINT << "rx: HANG\n";
-                            DPRINT << "rx: HANG num_eth_sends_acked " << (uint32_t)num_eth_sends_acked << "\n";
-                            DPRINT << "rx: HANG total_num_message_sends " << (uint32_t)total_num_message_sends << "\n";
+                            DPRINT("rx: HANG\n");
+                            DPRINT("rx: HANG num_eth_sends_acked {}\n", (uint32_t)num_eth_sends_acked);
+                            DPRINT("rx: HANG total_num_message_sends {}\n", (uint32_t)total_num_message_sends);
                             for (uint32_t i = 0; i < MAX_NUM_CHANNELS; i++) {
-                                DPRINT << "rx: HANG channel [" << i << "] bytes_sent "
-                                       << erisc_info->channels[0].bytes_sent << "\n";
-                                DPRINT << "rx: HANG channel [" << i << "] bytes_receiver_ack "
-                                       << erisc_info->channels[0].receiver_ack << "\n";
-                                DPRINT << "rx: HANG eth_is_receiver_channel_send_acked (" << i << ") "
-                                       << (eth_is_receiver_channel_send_acked(i) ? "true" : "false") << "\n";
-                                DPRINT << "rx: HANG eth_is_receiver_channel_send_done(" << i << ") "
-                                       << (eth_is_receiver_channel_send_done(i) ? "true" : "false") << "\n";
+                                DPRINT("rx: HANG channel [{}] bytes_sent {}\n", i, erisc_info->channels[0].bytes_sent);
+                                DPRINT(
+                                    "rx: HANG channel [{}] bytes_receiver_ack {}\n",
+                                    i,
+                                    erisc_info->channels[0].receiver_ack);
+                                DPRINT(
+                                    "rx: HANG eth_is_receiver_channel_send_acked ({}) {}\n",
+                                    i,
+                                    eth_is_receiver_channel_send_acked(i));
+                                DPRINT(
+                                    "rx: HANG eth_is_receiver_channel_send_done({}) {}\n",
+                                    i,
+                                    eth_is_receiver_channel_send_done(i));
                             }
-                            DPRINT << "rx: HANG noc_writer_buffer_ackptr " << (uint32_t)noc_writer_buffer_ackptr.index()
-                                   << "\n";
-                            DPRINT << "rx: HANG (raw) noc_writer_buffer_ackptr "
-                                   << (uint32_t)noc_writer_buffer_ackptr.raw_index() << "\n";
-                            DPRINT << "rx: HANG noc_writer_buffer_wrptr " << (uint32_t)noc_writer_buffer_wrptr.index()
-                                   << "\n";
-                            DPRINT << "rx: HANG (raw) noc_writer_buffer_wrptr "
-                                   << (uint32_t)noc_writer_buffer_wrptr.raw_index() << "\n";
-                            DPRINT << "rx: HANG eth_receiver_rdptr " << (uint32_t)eth_receiver_rdptr.index() << "\n";
-                            DPRINT << "rx: HANG (raw) eth_receiver_rdptr " << (uint32_t)eth_receiver_rdptr.raw_index()
-                                   << "\n";
-                            DPRINT << "rx: HANG eth_receiver_ackptr " << (uint32_t)eth_receiver_ackptr.index() << "\n";
-                            DPRINT << "rx: HANG (raw) eth_receiver_ackptr " << (uint32_t)eth_receiver_ackptr.raw_index()
-                                   << "\n";
-                            DPRINT << "rx: HANG num_receives_acked " << (uint32_t)num_receives_acked << "\n";
+                            DPRINT(
+                                "rx: HANG noc_writer_buffer_ackptr {}\n", (uint32_t)noc_writer_buffer_ackptr.index());
+                            DPRINT(
+                                "rx: HANG (raw) noc_writer_buffer_ackptr {}\n",
+                                (uint32_t)noc_writer_buffer_ackptr.raw_index());
+                            DPRINT("rx: HANG noc_writer_buffer_wrptr {}\n", (uint32_t)noc_writer_buffer_wrptr.index());
+                            DPRINT(
+                                "rx: HANG (raw) noc_writer_buffer_wrptr {}\n",
+                                (uint32_t)noc_writer_buffer_wrptr.raw_index());
+                            DPRINT("rx: HANG eth_receiver_rdptr {}\n", (uint32_t)eth_receiver_rdptr.index());
+                            DPRINT("rx: HANG (raw) eth_receiver_rdptr {}\n", (uint32_t)eth_receiver_rdptr.raw_index());
+                            DPRINT("rx: HANG eth_receiver_ackptr {}\n", (uint32_t)eth_receiver_ackptr.index());
+                            DPRINT(
+                                "rx: HANG (raw) eth_receiver_ackptr {}\n", (uint32_t)eth_receiver_ackptr.raw_index());
+                            DPRINT("rx: HANG num_receives_acked {}\n", (uint32_t)num_receives_acked);
                             printed_hang = true;
                             num_context_switches = 0;
                         }
@@ -213,29 +218,26 @@ void kernel_main() {
         while (!ncrisc_noc_nonposted_writes_sent(noc_index));
         while (!ncrisc_noc_nonposted_writes_flushed(noc_index));
 
-        DPRINT << "rx: DONE\n";
-        DPRINT << "rx: DONE eth_sends_completed " << (uint32_t)num_eth_sends_acked << "\n";
-        DPRINT << "rx: DONE total_num_message_sends " << (uint32_t)total_num_message_sends << "\n";
+        DPRINT("rx: DONE\n");
+        DPRINT("rx: DONE eth_sends_completed {}\n", (uint32_t)num_eth_sends_acked);
+        DPRINT("rx: DONE total_num_message_sends {}\n", (uint32_t)total_num_message_sends);
 
-        DPRINT << "rx: DONE num_eth_sends_acked " << (uint32_t)num_eth_sends_acked << "\n";
-        DPRINT << "rx: DONE total_num_message_sends " << (uint32_t)total_num_message_sends << "\n";
+        DPRINT("rx: DONE num_eth_sends_acked {}\n", (uint32_t)num_eth_sends_acked);
+        DPRINT("rx: DONE total_num_message_sends {}\n", (uint32_t)total_num_message_sends);
         for (uint32_t i = 0; i < MAX_NUM_CHANNELS; i++) {
-            DPRINT << "rx: DONE channel [" << i << "] bytes_sent " << erisc_info->channels[0].bytes_sent << "\n";
-            DPRINT << "rx: DONE channel [" << i << "] bytes_receiver_ack " << erisc_info->channels[0].receiver_ack
-                   << "\n";
-            DPRINT << "rx: DONE eth_is_receiver_channel_send_acked (" << i << ") "
-                   << (eth_is_receiver_channel_send_acked(i) ? "true" : "false") << "\n";
-            DPRINT << "rx: DONE eth_is_receiver_channel_send_done(" << i << ") "
-                   << (eth_is_receiver_channel_send_done(i) ? "true" : "false") << "\n";
+            DPRINT("rx: DONE channel [{}] bytes_sent {}\n", i, erisc_info->channels[0].bytes_sent);
+            DPRINT("rx: DONE channel [{}] bytes_receiver_ack {}\n", i, erisc_info->channels[0].receiver_ack);
+            DPRINT("rx: DONE eth_is_receiver_channel_send_acked ({}) {}\n", i, eth_is_receiver_channel_send_acked(i));
+            DPRINT("rx: DONE eth_is_receiver_channel_send_done({}) {}\n", i, eth_is_receiver_channel_send_done(i));
         }
-        DPRINT << "rx: DONE noc_writer_buffer_ackptr " << (uint32_t)noc_writer_buffer_ackptr.index() << "\n";
-        DPRINT << "rx: DONE (raw) noc_writer_buffer_ackptr " << (uint32_t)noc_writer_buffer_ackptr.raw_index() << "\n";
-        DPRINT << "rx: DONE noc_writer_buffer_wrptr " << (uint32_t)noc_writer_buffer_wrptr.index() << "\n";
-        DPRINT << "rx: DONE (raw) noc_writer_buffer_wrptr " << (uint32_t)noc_writer_buffer_wrptr.raw_index() << "\n";
-        DPRINT << "rx: DONE eth_receiver_rdptr " << (uint32_t)eth_receiver_rdptr.index() << "\n";
-        DPRINT << "rx: DONE (raw) eth_receiver_rdptr " << (uint32_t)eth_receiver_rdptr.raw_index() << "\n";
-        DPRINT << "rx: DONE eth_receiver_ackptr " << (uint32_t)eth_receiver_ackptr.index() << "\n";
-        DPRINT << "rx: DONE (raw) eth_receiver_ackptr " << (uint32_t)eth_receiver_ackptr.raw_index() << "\n";
-        DPRINT << "rx: DONE num_receives_acked " << (uint32_t)num_receives_acked << "\n";
+        DPRINT("rx: DONE noc_writer_buffer_ackptr {}\n", (uint32_t)noc_writer_buffer_ackptr.index());
+        DPRINT("rx: DONE (raw) noc_writer_buffer_ackptr {}\n", (uint32_t)noc_writer_buffer_ackptr.raw_index());
+        DPRINT("rx: DONE noc_writer_buffer_wrptr {}\n", (uint32_t)noc_writer_buffer_wrptr.index());
+        DPRINT("rx: DONE (raw) noc_writer_buffer_wrptr {}\n", (uint32_t)noc_writer_buffer_wrptr.raw_index());
+        DPRINT("rx: DONE eth_receiver_rdptr {}\n", (uint32_t)eth_receiver_rdptr.index());
+        DPRINT("rx: DONE (raw) eth_receiver_rdptr {}\n", (uint32_t)eth_receiver_rdptr.raw_index());
+        DPRINT("rx: DONE eth_receiver_ackptr {}\n", (uint32_t)eth_receiver_ackptr.index());
+        DPRINT("rx: DONE (raw) eth_receiver_ackptr {}\n", (uint32_t)eth_receiver_ackptr.raw_index());
+        DPRINT("rx: DONE num_receives_acked {}\n", (uint32_t)num_receives_acked);
     }
 }

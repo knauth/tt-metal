@@ -1,26 +1,21 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
 import torch
 from loguru import logger
-from transformers import BertForQuestionAnswering, BertTokenizer, pipeline
+from transformers import BertForQuestionAnswering, BertTokenizer
 
 import ttnn
+from models.common.utility_functions import comp_allclose, comp_pcc, profiler
 from models.demos.metal_BERT_large_11.tt.bert_model import TtBertBatchDram
 from models.demos.metal_BERT_large_11.tt.model_config import (
     get_model_config,
     get_tt_cache_path,
     skip_unsupported_config,
 )
-from models.utility_functions import (
-    comp_allclose,
-    comp_pcc,
-    disable_persistent_kernel_cache,
-    enable_persistent_kernel_cache,
-    profiler,
-)
+from models.demos.utils.qa_pipeline_compat import QuestionAnsweringPipeline
 
 
 def run_bert_question_and_answering_inference(
@@ -42,7 +37,7 @@ def run_bert_question_and_answering_inference(
     model_name = str(model_location_generator(model_version, model_subdir="Bert"))
     tokenizer_name = str(model_location_generator(model_version, model_subdir="Bert"))
 
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
     hugging_face_reference_model.eval()
     tt_bert_model = TtBertBatchDram(
         hugging_face_reference_model.config,
@@ -60,8 +55,9 @@ def run_bert_question_and_answering_inference(
             "Johann Joachim Winckelmann was a German art historian and archaeologist. He was a pioneering Hellenist who first articulated the difference between Greek, Greco-Roman and Roman art. The prophet and founding hero of modern archaeology, Winckelmann was one of the founders of scientific archaeology and first applied the categories of style on a large, systematic basis to the history of art."
         ]
         question = batch * ["What discipline did Winkelmann create?"]
-        bert_input = tokenizer.batch_encode_plus(
-            zip(question, context),
+        bert_input = tokenizer(
+            text=question,
+            text_pair=context,
             max_length=seq_len,
             padding="max_length",
             truncation=True,
@@ -69,8 +65,7 @@ def run_bert_question_and_answering_inference(
             return_token_type_ids=token_type_ids,
             return_tensors="pt",
         )
-        nlp = pipeline(
-            "question-answering",
+        nlp = QuestionAnsweringPipeline(
             model=hugging_face_reference_model,
             tokenizer=tokenizer,
         )
@@ -140,7 +135,6 @@ def run_bert_question_and_answering_inference(
     ttnn.synchronize_device(device)
     print(f"Enable profiler and enable binary and compile cache")
     profiler.enable()
-    enable_persistent_kernel_cache()
 
     # NOTE: Passing in pytorch tensor here instead of ll buda tensor
     # since we don't yet have embedding support on device
@@ -293,7 +287,6 @@ def test_bert_batch_dram(
     # Performance is reported only for PERF_CNT number of runs.
     PERF_CNT = 1
     assert PERF_CNT == 1, "Bert does not support internal perf count no more."
-    disable_persistent_kernel_cache()
 
     run_bert_question_and_answering_inference(
         model_version,
@@ -372,8 +365,6 @@ def test_bert_batch_dram_with_program_cache(
     # Then it will enable cache and run BERT-Large PERF_CNT number of times.
     # Performance is reported only for PERF_CNT number of runs.
     PERF_CNT = 1
-
-    disable_persistent_kernel_cache()
 
     run_bert_question_and_answering_inference(
         model_version,

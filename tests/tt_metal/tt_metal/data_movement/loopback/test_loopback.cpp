@@ -1,18 +1,28 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "multi_device_fixture.hpp"
 #include "device_fixture.hpp"
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/mesh_coord.hpp>
+#include <tt-metalium/experimental/metal2_host_api/program.hpp>
+#include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+#include <tt-metalium/experimental/metal2_host_api/kernel_spec.hpp>
+#include <tt-metalium/experimental/metal2_host_api/semaphore_spec.hpp>
+#include <tt-metalium/experimental/metal2_host_api/node_coord.hpp>
+#include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
 #include "tt_metal/test_utils/comparison.hpp"
 #include "tt_metal/test_utils/stimulus.hpp"
 #include "tt_metal/test_utils/print_helpers.hpp"
 #include "dm_common.hpp"
+#include <distributed/mesh_device_impl.hpp>
 
 namespace tt::tt_metal {
 
 using namespace std;
 using namespace tt;
-using namespace tt::test_utils;
+using namespace test_utils;
 
 namespace unit_tests::dm::core_loopback {
 
@@ -21,7 +31,7 @@ constexpr uint32_t START_ID = 16;
 // Test config, i.e. test parameters
 struct LoopbackConfig {
     uint32_t test_id = 0;
-    CoreCoord master_core_coord = CoreCoord();
+    CoreCoord master_core_coord = {0, 0};
     uint32_t num_of_transactions = 0;
     uint32_t transaction_size_pages = 0;
     uint32_t page_size_bytes = 0;
@@ -37,120 +47,169 @@ struct LoopbackConfig {
 /// @brief Does L1 Sender Core --> L1 Receiver Cores
 /// @param device
 /// @param test_config - Configuration of the test -- see struct
+/// @param fixture - DispatchFixture pointer for dispatch-aware operations
 /// @return
-bool run_dm(IDevice* device, const LoopbackConfig& test_config) {
-    // Program
-    Program program = CreateProgram();
+bool run_dm(const shared_ptr<distributed::MeshDevice>& mesh_device, const LoopbackConfig& test_config) {
+    IDevice* device = mesh_device->impl().get_device(0);
 
-    // Sharded L1 buffers
+    // Buffer Parameters
     const uint32_t transaction_size_bytes = test_config.transaction_size_pages * test_config.page_size_bytes;
 
+    // (Logical) Core coordinates and ranges
     CoreRangeSet master_core_set({CoreRange(test_config.master_core_coord)});
     CoreRangeSet subordinate_core_set({CoreRange(test_config.master_core_coord)});
 
-    auto master_shard_parameters = ShardSpecBuffer(
-        master_core_set,
-        {1, transaction_size_bytes / 2},
-        ShardOrientation::ROW_MAJOR,
-        {1, test_config.page_size_bytes / 2},
-        {1, test_config.transaction_size_pages});
-    auto master_l1_buffer = CreateBuffer(ShardedBufferConfig{
-        .device = device,
-        .size = transaction_size_bytes,
-        .page_size = test_config.page_size_bytes,
-        .buffer_type = BufferType::L1,
-        .buffer_layout = TensorMemoryLayout::WIDTH_SHARDED,
-        .shard_parameters = std::move(master_shard_parameters),
-    });
-    uint32_t master_l1_byte_address = master_l1_buffer->address();
+    // Obtain L1 Address for Storing Data
+    L1AddressInfo master_l1_info = unit_tests::dm::get_l1_address_and_size(mesh_device, test_config.master_core_coord);
 
-    auto subordinate_shard_parameters = ShardSpecBuffer(
-        subordinate_core_set,
-        {1, transaction_size_bytes / 2},
-        ShardOrientation::ROW_MAJOR,
-        {1, test_config.page_size_bytes / 2},
-        {1, test_config.transaction_size_pages});
-    auto subordinate_l1_buffer = CreateBuffer(ShardedBufferConfig{
-        .device = device,
-        .size = transaction_size_bytes,
-        .page_size = test_config.page_size_bytes,
-        .buffer_type = BufferType::L1,
-        .buffer_layout = TensorMemoryLayout::WIDTH_SHARDED,
-        .shard_parameters = std::move(subordinate_shard_parameters),
-    });
-    uint32_t subordinate_l1_byte_address = subordinate_l1_buffer->address();
+    // Check if the L1 size is sufficient for the test configuration
+    if (master_l1_info.size < transaction_size_bytes * 2) {
+        log_error(LogTest, "Insufficient L1 size for the test configuration");
+        return false;
+    }
 
-    // Compile-time arguments for kernels
-    vector<uint32_t> sender_compile_args = {
-        (uint32_t)master_l1_byte_address,
-        (uint32_t)subordinate_l1_byte_address,
-        (uint32_t)test_config.num_of_transactions,
-        (uint32_t)test_config.transaction_size_pages,
-        (uint32_t)test_config.page_size_bytes,
-        (uint32_t)test_config.test_id};
+    // Assign a "safe" L1 local address for the master core
+    uint32_t master_l1_byte_address = master_l1_info.base_address;
+    uint32_t subordinate_l1_byte_address =
+        master_l1_info.base_address + transaction_size_bytes;  // Offset for subordinate data
 
-    // Kernels
-    auto sender_kernel = CreateKernel(
-        program,
-        "tests/tt_metal/tt_metal/data_movement/loopback/kernels/sender.cpp",
-        master_core_set,
-        DataMovementConfig{
+    CoreCoord worker = device->worker_core_from_logical_core(test_config.master_core_coord);
+
+    using namespace tt::tt_metal::experimental;
+
+    KernelSpec::CompileTimeArgs cta_bindings = {
+        {"src_addr", (uint32_t)master_l1_byte_address},
+        {"dst_addr", (uint32_t)subordinate_l1_byte_address},
+        {"page_size", (uint32_t)test_config.page_size_bytes},
+        {"test_id", (uint32_t)test_config.test_id}};
+
+    SemaphoreSpec sender_sem{
+        .unique_id = SemaphoreSpecName{"sender_sem"},
+        .target_nodes = test_config.master_core_coord,
+    };
+
+    DataMovementHardwareConfig sender_hw_config;
+    if (device->arch() == tt::ARCH::QUASAR) {
+        sender_hw_config = DataMovementGen2Config{};
+    } else {
+        sender_hw_config = DataMovementGen1Config{
             .processor = DataMovementProcessor::RISCV_0,
             .noc = test_config.noc_id,
-            .compile_args = sender_compile_args});
+        };
+    }
+    KernelSpec sender_spec{
+        .unique_id = KernelSpecName{"sender"},
+        .source = "tests/tt_metal/tt_metal/data_movement/loopback/kernels/sender_2_0.cpp",
+        .num_threads = 1,
+        .semaphore_bindings = {KernelSpec::SemaphoreBinding{
+            .semaphore_spec_name = sender_sem.unique_id, .accessor_name = "sem_name"}},
+        .compile_time_args = cta_bindings,
+        .runtime_arg_schema =
+            {
+                .runtime_arg_names = {"num_of_transactions", "transaction_num_pages", "dest_x", "dest_y"},
+            },
+        .hw_config = sender_hw_config,
+    };
 
-    // Semaphores
-    CoreRangeSet sem_core_set = subordinate_core_set.merge<CoreRangeSet>(master_core_set);
-    const uint32_t sem_id = CreateSemaphore(program, sem_core_set, 0);
+    ProgramSpec spec{
+        .name = "loopback_test",
+        .kernels = {sender_spec},
+        .semaphores = {sender_sem},
+        .work_units = {WorkUnitSpec{
+            .name = "work_unit",
+            .kernels = {sender_spec.unique_id},
+            .target_nodes = master_core_set,
+        }},
+    };
 
-    // Runtime Arguments
-    CoreCoord worker = device->worker_core_from_logical_core(test_config.master_core_coord);
-    std::vector<uint32_t> master_run_args = {sem_id, worker.x, worker.y};
-    SetRuntimeArgs(program, sender_kernel, master_core_set, master_run_args);
+    Program program = MakeProgramFromSpec(*mesh_device, spec);
+
+    ProgramRunArgs run_params;
+    ProgramRunArgs::KernelRunArgs sender_run_params{.kernel = sender_spec.unique_id};
+    AddRuntimeArgsForNode(
+        sender_run_params.runtime_arg_values,
+        test_config.master_core_coord,
+        {
+            {"num_of_transactions", (uint32_t)test_config.num_of_transactions},
+            {"transaction_num_pages", (uint32_t)test_config.transaction_size_pages},
+            {"dest_x", (uint32_t)worker.x},
+            {"dest_y", (uint32_t)worker.y},
+        });
+    run_params.kernel_run_args.push_back(sender_run_params);
+    SetProgramRunArgs(program, run_params);
 
     // Assign unique id
-    log_info(tt::LogTest, "Running Test ID: {}, Run ID: {}", test_config.test_id, unit_tests::dm::runtime_host_id);
+    log_info(LogTest, "Running Test ID: {}, Run ID: {}", test_config.test_id, unit_tests::dm::runtime_host_id);
     program.set_runtime_id(unit_tests::dm::runtime_host_id++);
 
     // Input
     vector<uint32_t> packed_input = generate_packed_uniform_random_vector<uint32_t, bfloat16>(
         -100.0f,
         100.0f,
-        transaction_size_bytes / bfloat16::SIZEOF,
+        transaction_size_bytes / sizeof(bfloat16),
         chrono::system_clock::now().time_since_epoch().count());
 
     // Golden output
     // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
     vector<uint32_t> packed_golden = packed_input;
 
-    // Launch program and record outputs
-    detail::WriteToBuffer(master_l1_buffer, packed_input);
+    // Write Input to Master L1
+    detail::WriteToDeviceL1(device, test_config.master_core_coord, master_l1_byte_address, packed_input);
     MetalContext::instance().get_cluster().l1_barrier(device->id());
-    detail::LaunchProgram(device, program);
 
+    // Launch program and record outputs
+    auto mesh_workload = distributed::MeshWorkload();
+    vector<uint32_t> coord_data = {0, 0};
+    auto target_devices = distributed::MeshCoordinateRange(distributed::MeshCoordinate(coord_data));
+    mesh_workload.add_program(target_devices, std::move(program));
+
+    auto& cq = mesh_device->mesh_command_queue();
+    distributed::EnqueueMeshWorkload(cq, mesh_workload, false);
+    Finish(cq);
+
+    // Record Output from Subordinate L1 (same core, different address)
     vector<uint32_t> packed_output;
-    detail::ReadFromBuffer(subordinate_l1_buffer, packed_output);
+    detail::ReadFromDeviceL1(
+        device, test_config.master_core_coord, subordinate_l1_byte_address, transaction_size_bytes, packed_output);
+
     // Results comparison
-    bool pcc = is_close_packed_vectors<bfloat16, uint32_t>(
-        packed_output, packed_golden, [&](const bfloat16& a, const bfloat16& b) { return is_close(a, b); });
-    if (!pcc) {
-        log_error(tt::LogTest, "PCC Check failed");
-        log_info(tt::LogTest, "Golden vector");
+    bool is_equal = (packed_output == packed_golden);
+    if (!is_equal) {
+        log_error(LogTest, "Equality Check failed");
+        log_info(LogTest, "Golden vector");
         print_vector<uint32_t>(packed_golden);
-        log_info(tt::LogTest, "Output vector");
+        log_info(LogTest, "Output vector");
         print_vector<uint32_t>(packed_output);
     }
-    return pcc;
+    return is_equal;
 }
 }  // namespace unit_tests::dm::core_loopback
 
 /* ========== Test case for loopback data movement; ========== */
-TEST_F(DeviceFixture, TensixDataMovementLoopbackPacketSizes) {
+TEST_F(GenericMeshDeviceFixture, TensixDataMovementLoopbackPacketSizes) {
+    auto mesh_device = get_mesh_device();
+    auto arch_ = mesh_device->impl().get_device(0)->arch();
+
+    if (arch_ == ARCH::QUASAR) {
+        // Single run to validate the Quasar code path within emulator 3-min timeout
+        unit_tests::dm::core_loopback::LoopbackConfig test_config = {
+            .test_id = unit_tests::dm::core_loopback::START_ID + 0,
+            .master_core_coord = {0, 0},
+            .num_of_transactions = 4,
+            .transaction_size_pages = 4,
+            .page_size_bytes = 64,  // Quasar flit size
+            .l1_data_format = DataFormat::Float16_b,
+            .noc_id = NOC::NOC_0,
+        };
+        EXPECT_TRUE(run_dm(mesh_device, test_config));
+        return;
+    }
+
     // Parameters
     uint32_t max_transactions = 256;
     uint32_t max_transaction_size_pages =
-        arch_ == tt::ARCH::BLACKHOLE ? 1024 : 2048;                     // Max total transaction size == 64 KB
-    uint32_t page_size_bytes = arch_ == tt::ARCH::BLACKHOLE ? 64 : 32;  // =Flit size: 32 bytes for WH, 64 for BH
+        arch_ == ARCH::BLACKHOLE ? 1024 : 2048;                     // Max total transaction size == 64 KB
+    uint32_t page_size_bytes = arch_ == ARCH::BLACKHOLE ? 64 : 32;  // =Flit size: 32 bytes for WH, 64 for BH
     CoreCoord master_core_coord = {0, 0};
     NOC noc_id = NOC::NOC_0;
 
@@ -169,20 +228,22 @@ TEST_F(DeviceFixture, TensixDataMovementLoopbackPacketSizes) {
             };
 
             // Run
-            for (unsigned int id = 0; id < num_devices_; id++) {
-                EXPECT_TRUE(run_dm(devices_.at(id), test_config));
-            }
+            EXPECT_TRUE(run_dm(mesh_device, test_config));
         }
     }
 }
 
-TEST_F(DeviceFixture, TensixDataMovementLoopbackDirectedIdeal) {
+TEST_F(GenericMeshDeviceFixture, TensixDataMovementLoopbackDirectedIdeal) {
+    auto mesh_device = get_mesh_device();
+    auto arch_ = mesh_device->impl().get_device(0)->arch();
+
     uint32_t test_id = 55;
 
     auto [page_size_bytes, max_transmittable_bytes, max_transmittable_pages] =
-        tt::tt_metal::unit_tests::dm::compute_physical_constraints(arch_, devices_.at(0));
+        tt::tt_metal::unit_tests::dm::compute_physical_constraints(mesh_device);
 
-    uint32_t num_of_transactions = 128;
+    // Use reduced params for Quasar emulator to fit within 3-min timeout
+    uint32_t num_of_transactions = arch_ == ARCH::QUASAR ? 4 : 128;
     uint32_t transaction_size_pages =
         max_transmittable_pages / (num_of_transactions * 2);  // Since we need to fit 2 buffers, we divide by 2
 
@@ -199,9 +260,77 @@ TEST_F(DeviceFixture, TensixDataMovementLoopbackDirectedIdeal) {
         .noc_id = noc_id};
 
     // Run
-    for (unsigned int id = 0; id < num_devices_; id++) {
-        EXPECT_TRUE(run_dm(devices_.at(id), test_config));
+    EXPECT_TRUE(run_dm(mesh_device, test_config));
+}
+
+/* ========== Metal 2.0 variants ========== */
+TEST_F(GenericMeshDeviceFixture, TensixDataMovementLoopbackPacketSizes_2_0) {
+    auto mesh_device = get_mesh_device();
+    auto arch_ = mesh_device->impl().get_device(0)->arch();
+
+    if (arch_ == ARCH::QUASAR) {
+        // Single small config on Quasar emulator to fit within 3-min timeout while still
+        // exercising the Metal 2.0 host path (MakeProgramFromSpec + named RTAs + SemaphoreSpec).
+        unit_tests::dm::core_loopback::LoopbackConfig test_config = {
+            .test_id = 44,
+            .master_core_coord = {0, 0},
+            .num_of_transactions = 4,
+            .transaction_size_pages = 4,
+            .page_size_bytes = 64,
+            .l1_data_format = DataFormat::Float16_b,
+            .noc_id = NOC::NOC_0,
+        };
+        EXPECT_TRUE(unit_tests::dm::core_loopback::run_dm(mesh_device, test_config));
+        return;
     }
+
+    // WH/BH full sweep (mirrors legacy LoopbackPacketSizes parameter space).
+    uint32_t max_transactions = 256;
+    uint32_t max_transaction_size_pages = arch_ == ARCH::BLACKHOLE ? 1024 : 2048;
+    uint32_t page_size_bytes = arch_ == ARCH::BLACKHOLE ? 64 : 32;
+    CoreCoord master_core_coord = {0, 0};
+    NOC noc_id = NOC::NOC_0;
+
+    for (uint32_t num_of_transactions = 1; num_of_transactions <= max_transactions; num_of_transactions *= 4) {
+        for (uint32_t transaction_size_pages = 1; transaction_size_pages <= max_transaction_size_pages;
+             transaction_size_pages *= 2) {
+            unit_tests::dm::core_loopback::LoopbackConfig test_config = {
+                .test_id = 44,
+                .master_core_coord = master_core_coord,
+                .num_of_transactions = num_of_transactions,
+                .transaction_size_pages = transaction_size_pages,
+                .page_size_bytes = page_size_bytes,
+                .l1_data_format = DataFormat::Float16_b,
+                .noc_id = noc_id,
+            };
+            EXPECT_TRUE(unit_tests::dm::core_loopback::run_dm(mesh_device, test_config));
+        }
+    }
+}
+
+TEST_F(GenericMeshDeviceFixture, TensixDataMovementLoopbackDirectedIdeal_2_0) {
+    auto mesh_device = get_mesh_device();
+    auto arch_ = mesh_device->impl().get_device(0)->arch();
+
+    uint32_t test_id = 45;
+
+    auto [page_size_bytes, max_transmittable_bytes, max_transmittable_pages] =
+        tt::tt_metal::unit_tests::dm::compute_physical_constraints(mesh_device);
+
+    uint32_t num_of_transactions = arch_ == ARCH::QUASAR ? 4 : 128;
+    uint32_t transaction_size_pages = max_transmittable_pages / (num_of_transactions * 2);
+
+    unit_tests::dm::core_loopback::LoopbackConfig test_config = {
+        .test_id = test_id,
+        .master_core_coord = {0, 0},
+        .num_of_transactions = num_of_transactions,
+        .transaction_size_pages = transaction_size_pages,
+        .page_size_bytes = page_size_bytes,
+        .l1_data_format = DataFormat::Float16_b,
+        .noc_id = NOC::NOC_0,
+    };
+
+    EXPECT_TRUE(unit_tests::dm::core_loopback::run_dm(mesh_device, test_config));
 }
 
 }  // namespace tt::tt_metal

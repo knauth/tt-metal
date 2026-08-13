@@ -1,13 +1,15 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include <stdint.h>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-#include "assert.hpp"
+#include <tt_stl/assert.hpp>
 #include "hal_types.hpp"
 #include "impl/context/metal_context.hpp"
 #include "tt_align.hpp"
@@ -30,7 +32,12 @@ public:
         this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
     void add_prefetch_relay_linear() {
-        this->cmd_write_offsetB += sizeof(CQPrefetchCmd);
+        this->cmd_write_offsetB += sizeof(CQPrefetchCmdLarge);
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+    }
+
+    void add_prefetch_relay_linear_h() {
+        this->cmd_write_offsetB += sizeof(CQPrefetchCmdLarge);
         this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
 
@@ -39,12 +46,20 @@ public:
         this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
 
-    void add_data(uint32_t cmd_write_offset_incrementB) { this->cmd_write_offsetB += cmd_write_offset_incrementB; }
+    template <bool pcie_aligned = true>
+    void add_data(uint32_t cmd_write_offset_incrementB) {
+        this->cmd_write_offsetB += cmd_write_offset_incrementB;
+        if constexpr (not pcie_aligned) {
+            this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+        }
+    }
+
+    void add_alignment() { this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment); }
 
     template <bool flush_prefetch = true, bool inline_data = false>
     void add_dispatch_write_linear(uint32_t data_sizeB) {
         this->add_prefetch_relay_inline();
-        this->cmd_write_offsetB += sizeof(CQDispatchCmd);
+        this->cmd_write_offsetB += sizeof(CQDispatchCmdLarge);
 
         if constexpr (flush_prefetch) {
             if constexpr (inline_data) {
@@ -55,6 +70,23 @@ public:
             }
         } else {
             // Need to make sure next command that flushes prefetch is written to correctly aligned location
+            this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+        }
+    }
+
+    // Calculator sizing for CQ_DISPATCH_CMD_WRITE_LINEAR_H (dispatch_h linear write)
+    // Mirrors add_dispatch_write_linear for sizing/alignment purposes.
+    template <bool flush_prefetch = true, bool inline_data = false>
+    void add_dispatch_write_linear_h(uint32_t data_sizeB) {
+        this->add_prefetch_relay_inline();
+        this->cmd_write_offsetB += sizeof(CQDispatchCmdLarge);
+
+        if constexpr (flush_prefetch) {
+            if constexpr (inline_data) {
+                this->add_data(data_sizeB);
+                this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+            }
+        } else {
             this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
         }
     }
@@ -89,6 +121,18 @@ public:
         this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
 
+    void add_dispatch_rt_profiler_flush() {
+        this->add_prefetch_relay_inline();
+        this->cmd_write_offsetB += sizeof(CQDispatchCmd);
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+    }
+
+    void add_dispatch_set_sub_device_worker_counts(uint32_t num_sub_devices) {
+        this->add_prefetch_relay_inline();
+        this->cmd_write_offsetB += sizeof(CQDispatchCmd) + num_sub_devices * sizeof(uint32_t);
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+    }
+
     void add_dispatch_set_go_signal_noc_data(uint32_t num_words) {
         this->add_prefetch_relay_inline();
         this->cmd_write_offsetB += sizeof(CQDispatchCmd) + num_words * sizeof(uint32_t);
@@ -107,14 +151,27 @@ public:
         this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
 
+    void add_prefetch_terminate() { this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment); }
+
     template <bool inline_data = false>
     void add_dispatch_write_paged(uint32_t page_size, uint32_t pages) {
-        uint32_t data_sizeB = page_size * pages;
         this->add_prefetch_relay_inline();
         this->cmd_write_offsetB += sizeof(CQDispatchCmd);
         if constexpr (inline_data) {
-            this->add_data(tt::align(data_sizeB, this->pcie_alignment));
+            uint32_t data_sizeB = page_size * pages;
+            this->add_data(data_sizeB);
+            this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
         }
+    }
+
+    // Variant that allows specifying a different inline data size than pages * page_size
+    // Always accounts for inline data (no template parameter needed)
+    void add_dispatch_write_paged_with_custom_inline_size(
+        uint32_t /*page_size*/, uint32_t /*pages*/, uint32_t inline_data_sizeB) {
+        this->add_prefetch_relay_inline();
+        this->cmd_write_offsetB += sizeof(CQDispatchCmd);
+        this->add_data(inline_data_sizeB);
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
 
     void add_prefetch_relay_paged() {
@@ -137,12 +194,34 @@ public:
         this->cmd_write_offsetB += increment_sizeB;
     }
 
+    void add_prefetch_relay_linear_packed(uint16_t num_sub_cmds) {
+        static_assert(sizeof(CQPrefetchRelayLinearPackedSubCmd) % sizeof(uint32_t) == 0);
+
+        uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQPrefetchRelayLinearPackedSubCmd);
+        uint32_t increment_sizeB = tt::align(sub_cmds_sizeB + sizeof(CQPrefetchCmd), this->pcie_alignment);
+        this->cmd_write_offsetB += increment_sizeB;
+    }
+
+    void add_prefetch_relay_linear_packed_h(uint16_t num_sub_cmds) {
+        static_assert(sizeof(CQPrefetchRelayLinearPackedSubCmd) % sizeof(uint32_t) == 0);
+
+        uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQPrefetchRelayLinearPackedSubCmd);
+        uint32_t increment_sizeB = tt::align(sub_cmds_sizeB + sizeof(CQPrefetchCmd), this->pcie_alignment);
+        this->cmd_write_offsetB += increment_sizeB;
+    }
+
     void add_prefetch_set_ringbuffer_offset() {
         this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment);
     }
 
     void add_prefetch_paged_to_ringbuffer() {
         this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment);
+    }
+
+    void add_prefetch_exec_buf() { this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment); }
+
+    void add_prefetch_exec_buf_end() {
+        this->cmd_write_offsetB += tt::align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd), this->pcie_alignment);
     }
 
     template <typename PackedSubCmd>
@@ -152,12 +231,12 @@ public:
         uint32_t packed_write_max_unicast_sub_cmds,
         const bool no_stride = false) {
         static_assert(
-            std::is_same<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>::value or
-            std::is_same<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>::value);
+            std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd> or
+            std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>);
 
         uint32_t packed_write_max_multicast_sub_cmds =
             get_packed_write_max_multicast_sub_cmds(packed_write_max_unicast_sub_cmds);
-        uint32_t max_num_packed_sub_cmds = std::is_same<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>::value
+        uint32_t max_num_packed_sub_cmds = std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>
                                                ? packed_write_max_unicast_sub_cmds
                                                : packed_write_max_multicast_sub_cmds;
         TT_FATAL(
@@ -199,6 +278,21 @@ public:
         this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
 
+    void add_dispatch_write_packed_large_unicast(uint16_t num_sub_cmds) {
+        TT_ASSERT(
+            num_sub_cmds <= CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_UNICAST_MAX_SUB_CMDS,
+            "Cannot fit {} sub cmds in one CQDispatchWritePackedLargeUnicastCmd",
+            num_sub_cmds);
+        static_assert(sizeof(CQDispatchWritePackedLargeUnicastSubCmd) % sizeof(uint32_t) == 0);
+        uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQDispatchWritePackedLargeUnicastSubCmd);
+        uint32_t payload_size = tt::align(sizeof(CQDispatchCmd) + sub_cmds_sizeB, this->l1_alignment);
+        this->add_prefetch_relay_inline();
+        uint32_t payload_dst_size =
+            tt::align(sizeof(CQPrefetchCmd) + payload_size, this->pcie_alignment) - sizeof(CQPrefetchCmd);
+        this->cmd_write_offsetB += payload_dst_size;
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+    }
+
     void add_dispatch_write_packed_large(uint16_t num_sub_cmds, uint32_t payload_sizeB) {
         TT_ASSERT(
             num_sub_cmds <= CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_MAX_SUB_CMDS,
@@ -206,6 +300,20 @@ public:
             num_sub_cmds);
         static_assert(sizeof(CQDispatchWritePackedLargeSubCmd) % sizeof(uint32_t) == 0);
         uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQDispatchWritePackedLargeSubCmd);
+        uint32_t payload_size = tt::align(sizeof(CQDispatchCmd) + sub_cmds_sizeB, this->l1_alignment);
+        this->add_prefetch_relay_inline();
+        this->cmd_write_offsetB += payload_size;
+        this->cmd_write_offsetB += tt::align(payload_sizeB, this->l1_alignment);
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+    }
+
+    void add_dispatch_write_packed_large_unicast(uint16_t num_sub_cmds, uint32_t payload_sizeB) {
+        TT_ASSERT(
+            num_sub_cmds <= CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_UNICAST_MAX_SUB_CMDS,
+            "Cannot fit {} sub cmds in one CQDispatchWritePackedLargeUnicastCmd",
+            num_sub_cmds);
+        static_assert(sizeof(CQDispatchWritePackedLargeUnicastSubCmd) % sizeof(uint32_t) == 0);
+        uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQDispatchWritePackedLargeUnicastSubCmd);
         uint32_t payload_size = tt::align(sizeof(CQDispatchCmd) + sub_cmds_sizeB, this->l1_alignment);
         this->add_prefetch_relay_inline();
         this->cmd_write_offsetB += payload_size;
@@ -232,6 +340,9 @@ public:
 
     // Clear calculator state
     void clear() { this->cmd_write_offsetB = 0; }
+
+    // Update state
+    void update_write_offset_bytes(uint32_t update_valueB) { this->cmd_write_offsetB += update_valueB; }
 
 private:
     void add_prefetch_relay_inline() { this->cmd_write_offsetB += sizeof(CQPrefetchCmd); }

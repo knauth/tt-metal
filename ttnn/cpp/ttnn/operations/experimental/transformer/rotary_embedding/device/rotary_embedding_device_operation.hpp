@@ -1,39 +1,54 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include <functional>
+#include "ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_device_operation_types.hpp"
+#include "ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_program_factory.hpp"
+#include "ttnn/types.hpp"
 
-#include "ttnn/tensor/tensor.hpp"
-#include "ttnn/run_operation.hpp"
-#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+namespace ttnn::experimental::prim {
 
-#include "ttnn/decorators.hpp"
+struct RotaryEmbeddingDeviceOperation {
+    using operation_attributes_t = RotaryEmbeddingParams;
+    using tensor_args_t = RotaryEmbeddingInputs;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
+    using tensor_return_value_t = Tensor;
+    using program_factory_t = std::variant<RotaryEmbeddingProgramFactory>;
 
-namespace tt {
-namespace tt_metal {
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
 
-enum class RotaryEmbeddingOpParallelizationStrategy { MULTI_CORE };
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
 
-struct RotaryEmbedding {
-    const uint32_t seq_len;
-    std::optional<uint32_t> token_idx;
-    const MemoryConfig output_mem_config;
-    const ttnn::DeviceComputeKernelConfig compute_kernel_config;
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t& args, const tensor_args_t&);
 
-    RotaryEmbeddingOpParallelizationStrategy get_parallelization_strategy(
-        const std::vector<Tensor>& input_tensors) const;
+    static ttsl::hash::hash_t compute_program_hash(const operation_attributes_t&, const tensor_args_t&);
 
-    void validate(const std::vector<Tensor>& input_tensors) const;
-    std::vector<ttnn::TensorSpec> compute_output_specs(const std::vector<Tensor>& input_tensors) const;
-
-    tt::tt_metal::operation::ProgramWithCallbacks create_program(
-        const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
-
-    operation::Hash compute_program_hash(const std::vector<Tensor>& input_tensors) const;
+    // Decode mode (token_idx set) derives cos_sin_start_id / cos_sin_offset from token_idx and bakes
+    // them into static reader/writer runtime args, while token_idx is deliberately excluded from
+    // compute_program_hash so successive decode positions cache-hit the same program.  Those two
+    // scalars must therefore be re-applied on every cache hit -- otherwise the cached program keeps
+    // the first token's offsets and every later token reads the wrong cos/sin rows.  Declaring this
+    // hook also supersedes resolve_bindings, so it owns buffer-address re-application (runtime args and
+    // sharded CBs) too.  It patches those slots in place; it never rebuilds the descriptor.
+    static void override_runtime_arguments(
+        tt::tt_metal::Program& program,
+        const operation_attributes_t& operation_attributes,
+        const tensor_args_t& tensor_args,
+        tensor_return_value_t& output,
+        const std::optional<ttnn::MeshCoordinate>& mesh_dispatch_coordinate = std::nullopt);
 };
 
-}  // namespace tt_metal
-}  // namespace tt
+}  // namespace ttnn::experimental::prim
+
+namespace ttnn::prim {
+Tensor rotary_embedding(
+    const Tensor& input,
+    const Tensor& cos,
+    const Tensor& sin,
+    uint32_t seq_len,
+    std::optional<uint32_t> token_idx,
+    const tt::tt_metal::MemoryConfig& output_mem_config,
+    ttnn::DeviceComputeKernelConfig compute_kernel_config);
+}  // namespace ttnn::prim

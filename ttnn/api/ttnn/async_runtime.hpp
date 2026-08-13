@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,7 +6,7 @@
 
 #include <optional>
 #include "ttnn/tensor/types.hpp"
-#include "ttnn/run_operation.hpp"
+#include "ttnn/operation.hpp"
 #include "types.hpp"
 
 namespace ttnn {
@@ -25,16 +25,12 @@ void read_buffer(
     size_t src_offset = 0,
     bool blocking = true);
 
-void queue_synchronize(tt::tt_metal::CommandQueue& cq);
 void queue_synchronize(tt::tt_metal::distributed::MeshCommandQueue& cq);
 
-void event_synchronize(const std::shared_ptr<tt::tt_metal::Event>& event);
 void event_synchronize(const tt::tt_metal::distributed::MeshEvent& event);
 
-void wait_for_event(tt::tt_metal::CommandQueue& cq, const std::shared_ptr<tt::tt_metal::Event>& event);
 void wait_for_event(tt::tt_metal::distributed::MeshCommandQueue& cq, const tt::tt_metal::distributed::MeshEvent& event);
 
-void record_event(tt::tt_metal::CommandQueue& cq, const std::shared_ptr<tt::tt_metal::Event>& event);
 // Record an event for device to device synchronization. This event should be passed to `wait_for_event`.
 tt::tt_metal::distributed::MeshEvent record_event(tt::tt_metal::distributed::MeshCommandQueue& cq);
 // Record an event for device to host synchronization. This event should be passed to `event_synchronize`.

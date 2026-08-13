@@ -1,11 +1,11 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import List
 
 import ttnn
-from models.utility_functions import nearest_y
+from models.common.utility_functions import nearest_y
 
 
 # this function takes activations that are assumed to be non-padded and weights that are assumed to be padded

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,8 +8,8 @@ from typing import Optional, Tuple
 import torch
 
 import ttnn
+from models.common.utility_functions import nearest_32
 from models.demos.t3000.falcon40b.tt.model_utils import determine_tensor_deallocation, falcon_prefill_matmul
-from models.utility_functions import nearest_32
 from ttnn import ReplicateTensorToMesh, ShardTensorToMesh
 
 

@@ -1,39 +1,24 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "rmsnorm_bw_device_operation.hpp"
 
-#include "rmsnorm_bw_program_factory.hpp"
-
 #include <enchantum/enchantum.hpp>
 
+#include "rmsnorm_bw_program_factory.hpp"
+#include "ttnn/device_operation.hpp"
+
 namespace ttml::metal::ops::rmsnorm_bw::device {
-
-RMSNormBackwardDeviceOperation::program_factory_t RMSNormBackwardDeviceOperation::select_program_factory(
-    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
-    return RMSNormBackwardProgramFactory{};
-}
-
-void RMSNormBackwardDeviceOperation::validate_on_program_cache_hit(
-    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
-    validate_on_program_cache_miss(args, tensor_args);
-}
 
 void RMSNormBackwardDeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
     auto check_tensor = [](const ttnn::Tensor& tensor, const std::string& name) {
         TT_FATAL(
-            tensor.device()->arch() == tt::ARCH::WORMHOLE_B0,
-            "RMSNormBackward operation is only supported on Wormhole. Device arch: {}. Tensor name {}",
-            enchantum::to_string(tensor.device()->arch()),
-            name);
-
-        TT_FATAL(
-            tensor.storage_type() == tt::tt_metal::StorageType::DEVICE,
+            tensor.storage_type() == ttnn::StorageType::DEVICE,
             "RMSNormBackward operation requires {} to be on Device. Input storage type: {}",
             name,
-            static_cast<int>(tensor.storage_type()));
+            enchantum::to_string(tensor.storage_type()));
 
         TT_FATAL(
             tensor.buffer() != nullptr,
@@ -44,20 +29,20 @@ void RMSNormBackwardDeviceOperation::validate_on_program_cache_miss(
             tensor.layout() == tt::tt_metal::Layout::TILE,
             "RMSNormBackward operation requires tensor to be in Tile layout. {} tensor layout: {}",
             name,
-            static_cast<int>(tensor.layout()));
+            enchantum::to_string(tensor.layout()));
 
         TT_FATAL(
             tensor.dtype() == tt::tt_metal::DataType::BFLOAT16,
             "RMSNormBackward operation requires tensor to be of BFLOAT16 data type. {} tensor data type: {}",
             name,
-            static_cast<int>(tensor.dtype()));
+            enchantum::to_string(tensor.dtype()));
 
         TT_FATAL(
-            tensor.memory_config().memory_layout() == ttnn::TensorMemoryLayout::INTERLEAVED,
+            tensor.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
             "RMSNormBackward operation requires Interleaved memory layout. {} "
             "memory layout: `{}`",
             name,
-            static_cast<int>(tensor.memory_config().memory_layout()));
+            enchantum::to_string(tensor.memory_config().memory_layout()));
     };
 
     const auto& input_tensor = tensor_args.input;
@@ -117,13 +102,13 @@ tensor_return_value_t RMSNormBackwardDeviceOperation::create_output_tensors(
     if (tensor_args.preallocated_da.has_value()) {
         output_tensors.push_back(tensor_args.preallocated_da.value());
     } else {
-        output_tensors.push_back(create_device_tensor(output_specs[0], tensor_args.input.device()));
+        output_tensors.push_back(ttnn::create_device_tensor(output_specs[0], tensor_args.input.device()));
     }
 
     if (tensor_args.preallocated_dgamma_components.has_value()) {
         output_tensors.push_back(tensor_args.preallocated_dgamma_components.value());
     } else {
-        output_tensors.push_back(create_device_tensor(output_specs[1], tensor_args.gamma.device()));
+        output_tensors.push_back(ttnn::create_device_tensor(output_specs[1], tensor_args.gamma.device()));
     }
 
     return output_tensors;
@@ -133,15 +118,17 @@ ttsl::hash::hash_t RMSNormBackwardDeviceOperation::compute_program_hash(
     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
     const auto& input_tensor = tensor_args.input;
     const auto& input_logical_shape = input_tensor.logical_shape();
-    auto program_factory = select_program_factory(args, tensor_args);
     tt::tt_metal::operation::Hash hash = tt::tt_metal::operation::hash_operation<RMSNormBackwardDeviceOperation>(
-        args, program_factory.index(), input_tensor.dtype(), input_logical_shape);
+        args, input_tensor.dtype(), input_logical_shape);
 
     return hash;
 }
 
-std::tuple<RMSNormBackwardDeviceOperation::operation_attributes_t, RMSNormBackwardDeviceOperation::tensor_args_t>
-RMSNormBackwardDeviceOperation::invoke(
+}  // namespace ttml::metal::ops::rmsnorm_bw::device
+
+namespace ttnn::prim {
+
+ttml::metal::ops::rmsnorm_bw::device::RMSNormBackwardDeviceOperation::tensor_return_value_t ttml_rmsnorm_bw(
     const ttnn::Tensor& input_tensor,
     const ttnn::Tensor& gamma_tensor,
     const ttnn::Tensor& rms_tensor,
@@ -149,18 +136,19 @@ RMSNormBackwardDeviceOperation::invoke(
     float epsilon,
     const std::optional<ttnn::Tensor>& preallocated_da,
     const std::optional<ttnn::Tensor>& preallocated_dgamma_components) {
-    return {
-        operation_attributes_t{
-            .epsilon = epsilon,
-        },
-        tensor_args_t{
-            .input = input_tensor,
-            .gamma = gamma_tensor,
-            .rms = rms_tensor,
-            .dL_dout = dL_dout_tensor,
-            .preallocated_da = preallocated_da,
-            .preallocated_dgamma_components = preallocated_dgamma_components,
-        }};
+    using OperationType = ttml::metal::ops::rmsnorm_bw::device::RMSNormBackwardDeviceOperation;
+
+    auto operation_attributes = OperationType::operation_attributes_t{.epsilon = epsilon};
+    auto tensor_args = OperationType::tensor_args_t{
+        .input = input_tensor,
+        .gamma = gamma_tensor,
+        .rms = rms_tensor,
+        .dL_dout = dL_dout_tensor,
+        .preallocated_da = preallocated_da,
+        .preallocated_dgamma_components = preallocated_dgamma_components,
+    };
+
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
 
-}  // namespace ttml::metal::ops::rmsnorm_bw::device
+}  // namespace ttnn::prim

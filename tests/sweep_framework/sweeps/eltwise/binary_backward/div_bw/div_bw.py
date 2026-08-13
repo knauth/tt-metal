@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -12,7 +12,7 @@ from tests.sweep_framework.sweep_utils.utils import gen_shapes, sanitize_shape_r
 from tests.tt_eager.python_api_testing.sweep_tests.generation_funcs import gen_func_with_cast_tt
 
 from tests.ttnn.utils_for_testing import check_with_pcc, start_measuring_time, stop_measuring_time
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 
 # Override the default timeout in seconds for hang detection.
 TIMEOUT = 30
@@ -29,7 +29,7 @@ parameters = {
         "input_shape": gen_shapes([1, 1, 1, 1], [6, 12, 256, 256], [1, 1, 1, 1], 8)
         + gen_shapes([1, 1, 1], [12, 256, 256], [1, 1, 1], 8)
         + gen_shapes([1, 1], [256, 256], [1, 1], 8),
-        "round_mode": [None, "floor", "trunc"],
+        "rounding_mode": [None, "floor", "trunc"],
         "grad_dtype": [ttnn.bfloat8_b],
         "input_a_dtype": [ttnn.bfloat16],
         "input_b_dtype": [ttnn.bfloat16],
@@ -43,7 +43,7 @@ parameters = {
         "input_shape": gen_shapes([1, 1, 1, 1], [6, 12, 256, 256], [1, 1, 1, 1], 4)
         + gen_shapes([1, 1, 1], [12, 256, 256], [1, 1, 1], 4)
         + gen_shapes([1, 1], [256, 256], [1, 1], 4),
-        "round_mode": [None, "floor", "trunc"],
+        "rounding_mode": [None, "floor", "trunc"],
         "grad_dtype": [ttnn.bfloat16, ttnn.bfloat8_b],
         "input_a_dtype": [ttnn.bfloat16, ttnn.bfloat8_b],
         "input_b_dtype": [ttnn.bfloat16, ttnn.bfloat8_b],
@@ -74,7 +74,7 @@ def invalidate_vector(test_vector) -> Tuple[bool, Optional[str]]:
 # If you defined a mesh_device_fixture above, the object you yielded will be passed into this function as 'device'. Otherwise, it will be the default ttnn device opened by the infra.
 def run(
     input_shape,
-    round_mode,
+    rounding_mode,
     grad_dtype,
     input_a_dtype,
     input_b_dtype,
@@ -111,7 +111,10 @@ def run(
 
     golden_function = ttnn.get_golden_function(ttnn.div_bw)
     torch_output_tensors = golden_function(
-        torch_grad_tensor, torch_input_tensor_a, torch_input_tensor_b, round_mode if round_mode != "None" else None
+        torch_grad_tensor,
+        torch_input_tensor_a,
+        torch_input_tensor_b,
+        rounding_mode if rounding_mode != "None" else None,
     )
 
     grad_tensor = ttnn.from_torch(
@@ -140,7 +143,7 @@ def run(
 
     start_time = start_measuring_time()
     output_tensors = ttnn.div_bw(
-        grad_tensor, input_tensor_a, input_tensor_b, round_mode=round_mode, memory_config=output_memory_config
+        grad_tensor, input_tensor_a, input_tensor_b, rounding_mode=rounding_mode, memory_config=output_memory_config
     )
 
     passed = []

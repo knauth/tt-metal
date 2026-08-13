@@ -1,11 +1,13 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "dataflow_api.h"
-#include "ttnn/deprecated/tt_dnn/kernels/dataflow/moreh_common.hpp"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
     const auto input_addr = get_arg_val<uint32_t>(0);
@@ -13,27 +15,18 @@ void kernel_main() {
     const auto num_output_tiles = get_arg_val<uint32_t>(2);
     const auto input_tile_offset = get_arg_val<uint32_t>(3);
     const auto start_id = get_arg_val<uint32_t>(4);
-    const auto input_is_dram = get_compile_time_arg_val(0) == 1;
-    const auto HtWt = get_arg_val<uint32_t>(6);
-    const auto CHtWt = get_arg_val<uint32_t>(7);
-    const auto dim = get_compile_time_arg_val(1);
+    const auto HtWt = get_arg_val<uint32_t>(5);
+    const auto CHtWt = get_arg_val<uint32_t>(6);
+    const auto dim = get_compile_time_arg_val(0);
+    constexpr auto dram_input_addrg_args = TensorAccessorArgs<1>();
 
     constexpr uint32_t onetile = 1;
-    constexpr uint32_t cb_id_in0 = tt::CBIndex::c_0;
-    constexpr uint32_t cb_id_in1 = tt::CBIndex::c_1;
 
-    union {
-        float f;
-        uint32_t u;
-    } scaler;
-    scaler.f = 1.0f;
-    fill_cb_with_value(cb_id_in1, scaler.u);
+    Noc noc;
+    DataflowBuffer dfb_in0(tt::CBIndex::c_0);
 
-    uint32_t l1_write_addr_in0;
-    uint32_t input_tile_bytes = get_tile_size(cb_id_in0);
-    const auto input_data_format = get_dataformat(cb_id_in0);
-    const InterleavedAddrGenFast<input_is_dram> dram_input_addrg = {
-        .bank_base_address = input_addr, .page_size = input_tile_bytes, .data_format = input_data_format};
+    uint32_t input_tile_bytes = get_tile_size(dfb_in0.get_id());
+    const auto dram_input_addrg = TensorAccessor(dram_input_addrg_args, input_addr);
 
     uint32_t read_tile_id_temp = (dim == 0) ? (start_id) : (start_id / HtWt * CHtWt) + (start_id % HtWt);
     uint32_t start_tile_id = start_id / HtWt * CHtWt;
@@ -44,11 +37,10 @@ void kernel_main() {
             read_tile_id = i;
         }
         for (uint32_t j = 0; j < num_input_tiles; ++j) {
-            cb_reserve_back(cb_id_in0, onetile);
-            l1_write_addr_in0 = get_write_ptr(cb_id_in0);
-            noc_async_read_tile(read_tile_id, dram_input_addrg, l1_write_addr_in0);
-            noc_async_read_barrier();
-            cb_push_back(cb_id_in0, onetile);
+            dfb_in0.reserve_back(onetile);
+            noc.async_read(dram_input_addrg, dfb_in0, input_tile_bytes, {.page_id = read_tile_id}, {.offset_bytes = 0});
+            noc.async_read_barrier();
+            dfb_in0.push_back(onetile);
             read_tile_id += input_tile_offset;
         }
         if constexpr (dim != 0) {

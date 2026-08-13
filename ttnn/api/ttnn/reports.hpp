@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -43,6 +43,7 @@ struct BufferInfo {
     uint32_t address;
     uint32_t max_size_per_bank;
     tt::tt_metal::BufferType buffer_type;
+    tt::tt_metal::TensorMemoryLayout buffer_layout;
 };
 
 std::vector<BufferInfo> get_buffers(const std::vector<tt::tt_metal::distributed::MeshDevice*>& devices);

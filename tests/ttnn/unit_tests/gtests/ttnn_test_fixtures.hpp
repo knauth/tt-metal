@@ -1,10 +1,9 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include <math.h>
 #include <algorithm>
 #include <functional>
 #include <random>
@@ -19,10 +18,12 @@
 #include "ttnn/device.hpp"
 #include "ttnn/types.hpp"
 #include "ttnn/tensor/tensor.hpp"
-#include "ttnn/tensor/tensor_impl.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
 #include "hostdevcommon/common_values.hpp"
+#include "common/tt_backend_api_types.hpp"
 
 using namespace tt::tt_metal;  // For test
+using ttnn::Tensor;
 
 namespace ttnn {
 class TTNNFixtureBase : public ::testing::Test {
@@ -34,20 +35,16 @@ protected:
 
 public:
     bool check_dispatch_mode() {
-        auto slow_dispatch = getenv("TT_METAL_SLOW_DISPATCH_MODE");
-        if (slow_dispatch) {
-            return false;
-        }
-        return true;
+        auto* slow_dispatch = getenv("TT_METAL_SLOW_DISPATCH_MODE");
+        return slow_dispatch == nullptr;
     }
 
-    TTNNFixtureBase() : TTNNFixtureBase(DEFAULT_TRACE_REGION_SIZE, DEFAULT_L1_SMALL_SIZE) { }
+    TTNNFixtureBase() : TTNNFixtureBase(DEFAULT_TRACE_REGION_SIZE, DEFAULT_L1_SMALL_SIZE) {}
 
     TTNNFixtureBase(int trace_region_size, int l1_small_size) :
-        trace_region_size_(trace_region_size), l1_small_size_(l1_small_size) {
+        trace_region_size_(trace_region_size), l1_small_size_(l1_small_size), num_devices_(GetNumAvailableDevices()) {
         std::srand(0);
         arch_ = tt::get_arch_from_string(tt::test_utils::get_umd_arch_name());
-        num_devices_ = GetNumAvailableDevices();
     }
 };
 
@@ -61,13 +58,58 @@ protected:
         device_ = device_holder_.get();
     }
 
-    void TearDown() override { device_->close(); }
+    void TearDown() override {
+        if (device_holder_) {
+            device_holder_->close();
+            device_holder_.reset();
+        }
+        device_ = nullptr;
+    }
 
-    TTNNFixtureWithDevice() : TTNNFixtureBase() {}
+    TTNNFixtureWithDevice() = default;
 
     TTNNFixtureWithDevice(int trace_region_size, int l1_small_size) :
         TTNNFixtureBase(trace_region_size, l1_small_size) {}
 };
+
+// CRTP-based fixture that shares the device across all tests in a parameterized test suite.
+// Each derived class gets its own static device instance, providing isolation between suites
+// while avoiding repeated device init/teardown within a suite.
+//
+// Usage:
+//   class MyTests : public TTNNFixtureWithSuiteDevice<MyTests>,
+//                   public ::testing::WithParamInterface<MyParams> {};
+//
+template <typename Derived>
+class TTNNFixtureWithSuiteDevice : public TTNNFixtureBase {
+    friend Derived;
+
+    TTNNFixtureWithSuiteDevice() = default;
+
+protected:
+    static tt::tt_metal::distributed::MeshDevice* device_;
+    static std::shared_ptr<tt::tt_metal::distributed::MeshDevice> device_holder_;
+
+public:
+    static void SetUpTestSuite() {
+        device_holder_ = ttnn::open_mesh_device(/*device_id=*/0, DEFAULT_L1_SMALL_SIZE, DEFAULT_TRACE_REGION_SIZE);
+        device_ = device_holder_.get();
+    }
+
+    static void TearDownTestSuite() {
+        if (device_holder_) {
+            device_holder_->close();
+            device_holder_.reset();
+            device_ = nullptr;
+        }
+    }
+};
+
+template <typename Derived>
+tt::tt_metal::distributed::MeshDevice* TTNNFixtureWithSuiteDevice<Derived>::device_ = nullptr;
+
+template <typename Derived>
+std::shared_ptr<tt::tt_metal::distributed::MeshDevice> TTNNFixtureWithSuiteDevice<Derived>::device_holder_ = nullptr;
 
 class MultiCommandQueueSingleDeviceFixture : public TTNNFixtureBase {
 protected:
@@ -89,12 +131,18 @@ protected:
         device_ = device_holder_.get();
     }
 
-    void TearDown() override { device_->close(); }
+    void TearDown() override {
+        if (device_holder_) {
+            device_holder_->close();
+            device_holder_.reset();
+        }
+        device_ = nullptr;
+    }
 };
 
 class MultiCommandQueueT3KFixture : public TTNNFixtureBase {
 protected:
-    std::map<chip_id_t, std::shared_ptr<tt::tt_metal::distributed::MeshDevice>> devs;
+    std::map<tt::ChipId, std::shared_ptr<tt::tt_metal::distributed::MeshDevice>> devs;
 
     void SetUp() override {
         if (!check_dispatch_mode()) {

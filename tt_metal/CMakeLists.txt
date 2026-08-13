@@ -1,8 +1,6 @@
-if(ENABLE_COVERAGE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    message(STATUS "Enabling code coverage flags for all tt_metal targets")
-    add_compile_options(--coverage)
-    add_link_options(--coverage)
-endif()
+add_compile_options("$<$<CXX_COMPILER_ID:Clang>:-Wunused-parameter>")
+
+include(sources.cmake)
 
 add_library(tt_metal)
 add_library(TT::Metalium ALIAS tt_metal)
@@ -30,19 +28,15 @@ add_custom_target(
     COMMENT "Generating all FlatBuffer headers"
 )
 
-# Globbing non-build files is acceptable for now because devs don't generate packages.
-file(GLOB_RECURSE api api/*)
 target_sources(
     tt_metal
     PUBLIC
         FILE_SET api
         TYPE HEADERS
-        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/api ${CMAKE_CURRENT_BINARY_DIR}/api
-        FILES ${api}
+        BASE_DIRS api ${CMAKE_CURRENT_BINARY_DIR}/api
+        FILES ${TT_METAL_PUBLIC_API}
     PRIVATE
-        tt_metal.cpp
-        graph/graph_tracking.cpp
-        hal.cpp
+        ${TT_METAL_SOURCES}
         ${API_GENERATED_HEADERS}
 )
 set_source_files_properties(
@@ -64,11 +58,17 @@ set_target_properties(
 )
 
 file(GLOB_RECURSE COMPUTE_KERNEL_API include/*)
-file(GLOB_RECURSE FABRIC_HW_INC fabric/hw/inc/*)
+file(
+    GLOB_RECURSE FABRIC_HW_INC
+    fabric/hw/inc/*.hpp
+    fabric/hw/inc/*.h
+)
 file(
     GLOB_RECURSE TT_LLK_HEADERS
-    third_party/tt_llk/tt_llk_wormhole_b0/**/*.h
-    third_party/tt_llk/tt_llk_blackhole/**/*.h
+    tt-llk/common/*.h
+    tt-llk/tt_llk_wormhole_b0/**/*.h
+    tt-llk/tt_llk_blackhole/**/*.h
+    tt-llk/tt_llk_quasar/**/*.h
 )
 
 target_sources(
@@ -76,68 +76,34 @@ target_sources(
     INTERFACE
         FILE_SET jit_api
         TYPE HEADERS
-        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
-        FILES
-            api/tt-metalium/buffer_types.hpp
-            api/tt-metalium/circular_buffer_constants.h
-            api/tt-metalium/constants.hpp
-            api/tt-metalium/fabric_edm_packet_header.hpp
-            api/tt-metalium/fabric_edm_types.hpp
-            api/tt-metalium/edm_fabric_counters.hpp
-            core_descriptors/blackhole_140_arch.yaml
-            core_descriptors/wormhole_b0_80_arch.yaml
-            core_descriptors/wormhole_b0_80_arch_eth_dispatch.yaml
-            fabric/mesh_graph_descriptors/n150_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/n300_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/p100_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/p150_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/p150_x2_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/p150_x4_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/p150_x8_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/single_galaxy_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/t3k_mesh_graph_descriptor.yaml
-            fabric/mesh_graph_descriptors/tg_mesh_graph_descriptor.yaml
-            ${FABRIC_HW_INC}
-            impl/dispatch/kernels/cq_commands.hpp
-            impl/dispatch/kernels/cq_common.hpp
-            impl/dispatch/kernels/cq_relay.hpp
-            impl/dispatch/kernels/cq_helpers.hpp
-            ${COMPUTE_KERNEL_API}
-            soc_descriptors/blackhole_140_arch.yaml
-            soc_descriptors/wormhole_b0_80_arch.yaml
-            tools/profiler/kernel_profiler.hpp
-            tools/profiler/fabric_event_profiler.hpp
-            # Kernel sources
-            impl/dispatch/kernels/cq_dispatch.cpp
-            impl/dispatch/kernels/cq_dispatch_subordinate.cpp
-            impl/dispatch/kernels/cq_prefetch.cpp
-            fabric/impl/kernels/edm_fabric/fabric_erisc_datamover.cpp
-            fabric/impl/kernels/tt_fabric_mux.cpp
-            kernels/compute/blank.cpp
-            kernels/compute/eltwise_binary.cpp
-            kernels/compute/eltwise_sfpu.cpp
-            kernels/dataflow/blank.cpp
-            kernels/dataflow/reader_binary_diff_lengths.cpp
-            kernels/dataflow/reader_unary.cpp
-            kernels/dataflow/writer_unary.cpp
-            kernels/dataflow/writer_unary_1.cpp
-            jit_build/genfiles.cpp
-            jit_build/genfiles.hpp
-            ${TT_LLK_HEADERS}
+        FILES ${JITAPI_FILES} ${FABRIC_HW_INC} ${COMPUTE_KERNEL_API} ${TT_LLK_HEADERS}
 )
+
+include(CheckFunctionExists)
+
+check_function_exists(
+    backtrace
+    HAVE_BACKTRACE
+)
+
+if(NOT HAVE_BACKTRACE)
+    find_library(EXECINFO_LIB execinfo)
+else()
+    set(EXECINFO_LIB "")
+endif()
 
 target_link_libraries(
     tt_metal
     PUBLIC
-        umd::device
+        umd::tt-umd
         enchantum::enchantum
         fmt::fmt-header-only
         TracyClient
         nlohmann_json::nlohmann_json
         TT::Metalium::HostDevCommon
-        Reflect::Reflect
         TT::STL
         tt-logger::tt-logger
+        ${EXECINFO_LIB}
     PRIVATE
         Metalium::Metal::Impl
         metal_common_libs
@@ -147,11 +113,14 @@ target_link_libraries(
         detail
         distributed
         fabric
+        tt_metal_noc_estimator
         FlatBuffers::FlatBuffers
         TT::Metalium::Logging
+        TT::ScaleoutTools
+        Reflect::Reflect
 )
 
-target_precompile_headers(tt_metal REUSE_FROM TT::CommonPCH)
+tt_reuse_precompile_headers(tt_metal TT::CommonPCH)
 
 target_include_directories(
     tt_metal
@@ -162,6 +131,14 @@ target_include_directories(
         api/tt-metalium # FIXME: Re-home the tests and remove this
 )
 target_compile_options(tt_metal PUBLIC -Wno-int-to-pointer-cast)
+
+if(TT_METAL_USE_EMULE)
+    target_compile_definitions(tt_metal PRIVATE TT_METAL_USE_EMULE=1)
+    # PRIVATE: only libtt_metal.so itself needs -rdynamic (to export TLS symbols
+    # for dlopen'd JIT kernels). No need to propagate to all consumers.
+    target_link_options(tt_metal PRIVATE -rdynamic)
+endif()
+
 add_dependencies(tt_metal hw_toolchain)
 
 set_target_properties(
@@ -196,6 +173,8 @@ add_subdirectory(impl)
 add_subdirectory(detail)
 add_subdirectory(distributed)
 add_subdirectory(fabric)
+add_subdirectory(impl/experimental/udm)
+add_subdirectory(impl/experimental/noc_estimator)
 if(TT_METAL_BUILD_TESTS)
     add_subdirectory(test)
 endif()
@@ -232,7 +211,6 @@ if(TT_INSTALL)
             reflect
             enchantum
             TracyClient
-            small_vector
             tt-logger
         EXPORT Metalium
         FILE_SET

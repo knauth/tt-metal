@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -10,7 +10,7 @@ import pandas as pd
 from pathlib import Path
 from loguru import logger
 
-from tt_metal.tools.profiler.process_device_log import import_device_profile_log
+from tracy.process_device_log import import_device_profile_log
 
 parser = argparse.ArgumentParser(description="Timing analysis.")
 parser.add_argument("--input-file", type=str, help="Input file with profiler logs")

@@ -1,11 +1,20 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ttnn/run_operation.hpp"
+#pragma once
 
-namespace ttnn::operations::data_movement::detail {
+#include "ttnn/device_operation.hpp"
+#include "ttnn/metal_v2_artifacts.hpp"
+#include "ttnn/operations/data_movement/split/device/split_device_operation_types.hpp"
 
-tt::tt_metal::operation::ProgramWithCallbacks split_last_dim_two_chunks_tiled(
-    const Tensor& input_tensor, std::vector<Tensor>& output_tensors, const tt::tt_metal::MemoryConfig& mem_config);
-}
+namespace ttnn::prim {
+
+struct SplitProgramFactory {
+    static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
+        const SplitParams& operation_attributes,
+        const SplitInputs& tensor_args,
+        std::vector<Tensor>& tensor_return_value);
+};
+
+}  // namespace ttnn::prim

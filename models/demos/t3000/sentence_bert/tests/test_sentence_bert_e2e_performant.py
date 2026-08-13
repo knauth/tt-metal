@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,8 +8,8 @@ import pytest
 from loguru import logger
 
 import ttnn
+from models.common.utility_functions import run_for_wormhole_b0
 from models.demos.sentence_bert.runner.performant_runner import SentenceBERTPerformantRunner
-from models.utility_functions import run_for_wormhole_b0
 
 
 @run_for_wormhole_b0()

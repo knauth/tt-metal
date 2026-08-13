@@ -1,10 +1,10 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import torch.nn as nn
 
-from models.utility_functions import tt_to_torch_tensor, torch_to_tt_tensor_rm
+from models.common.utility_functions import tt_to_torch_tensor, torch_to_tt_tensor_rm
 from models.experimental.trocr.tt.trocr_configuration import TtTrOCRConfig
 import ttnn
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import torch
@@ -15,10 +15,9 @@ from models.demos.wormhole.bert_tiny.tt.bert_tiny import (
 )
 from ttnn.model_preprocessing import preprocess_model_parameters
 from tests.ttnn.utils_for_testing import assert_with_pcc
-from models.utility_functions import skip_for_grayskull, is_wormhole_b0
+from models.common.utility_functions import is_wormhole_b0
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
 def test_bert_attention_inference(
     model_location_generator,
@@ -26,7 +25,7 @@ def test_bert_attention_inference(
     reset_seeds,
 ):
     model_name = str(model_location_generator("mrm8488/bert-tiny-finetuned-squadv2", model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
 
     encoder_idx = 0
     pytorch_attention_model = hugging_face_reference_model.bert.encoder.layer[encoder_idx].attention
@@ -75,7 +74,6 @@ def test_bert_attention_inference(
     assert_with_pcc(pytorch_out, tt_output, 0.99)
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
 def test_bert_intermediate_inference(
     model_location_generator,
@@ -83,7 +81,7 @@ def test_bert_intermediate_inference(
     reset_seeds,
 ):
     model_name = str(model_location_generator("mrm8488/bert-tiny-finetuned-squadv2", model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
 
     encoder_idx = 0
     pytorch_intermediate_model = hugging_face_reference_model.bert.encoder.layer[encoder_idx].intermediate
@@ -121,7 +119,6 @@ def test_bert_intermediate_inference(
     assert_with_pcc(pytorch_out.squeeze(1), tt_output, 0.99)
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
 def test_bert_output_inference(
     model_location_generator,
@@ -129,7 +126,7 @@ def test_bert_output_inference(
     reset_seeds,
 ):
     model_name = str(model_location_generator("mrm8488/bert-tiny-finetuned-squadv2", model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
 
     encoder_idx = 0
     config = hugging_face_reference_model.config
@@ -178,7 +175,6 @@ def test_bert_output_inference(
     assert_with_pcc(pytorch_out.squeeze(1), tt_output, 0.99)
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True)
 def test_bert_layer_inference(
     model_location_generator,
@@ -186,7 +182,7 @@ def test_bert_layer_inference(
     reset_seeds,
 ):
     model_name = str(model_location_generator("mrm8488/bert-tiny-finetuned-squadv2", model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
 
     encoder_idx = 0
     config = hugging_face_reference_model.config
@@ -227,7 +223,6 @@ def test_bert_layer_inference(
     assert_with_pcc(pytorch_out.squeeze(1), tt_output, 0.99)
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("model_name", ["mrm8488/bert-tiny-finetuned-squadv2"])
 @pytest.mark.parametrize("sequence_size", [128])
 @pytest.mark.parametrize("num_hidden_layers", [1])

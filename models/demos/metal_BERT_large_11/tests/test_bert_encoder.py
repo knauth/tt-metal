@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,9 +9,9 @@ from transformers import BertForQuestionAnswering
 from tt_lib.utils import pad_activation
 
 import ttnn
+from models.common.utility_functions import comp_allclose, comp_pcc
 from models.demos.metal_BERT_large_11.tt.bert_encoder import TtBertEncoder
 from models.demos.metal_BERT_large_11.tt.model_config import get_model_config, get_tt_cache_path
-from models.utility_functions import comp_allclose, comp_pcc
 
 
 class PytorchBertEncoder(torch.nn.Module):
@@ -28,7 +28,7 @@ def run_bert_encoder_inference(
 ):
     model_name = str(model_location_generator(model_version, model_subdir="Bert"))
 
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
     config = hugging_face_reference_model.config
 
     tt_bert_encoder_model = TtBertEncoder(

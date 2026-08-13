@@ -1,22 +1,20 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
+
+from pathlib import Path
 
 import pytest
 import torch
 from loguru import logger
 
 import ttnn
-from models.demos.t3000.falcon40b.reference.hf_modeling_falcon import FalconForCausalLM
+from models.common.utility_functions import profiler
+from models.demos.t3000.falcon40b.tests.test_utils import load_falcon_reference_model
 from models.demos.t3000.falcon40b.tt.falcon_causallm import TtFalconCausalLM
 from models.demos.t3000.falcon40b.tt.falcon_common import PytorchFalconCausalLM
 from models.demos.t3000.falcon40b.tt.model_config import get_model_config
-from models.utility_functions import (
-    disable_persistent_kernel_cache,
-    enable_persistent_kernel_cache,
-    profiler,
-    skip_for_grayskull,
-)
+from models.tt_transformers.tt.common import get_hf_tt_cache_path
 from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import comp_and_get_pcc, comp_pcc
 from ttnn import ConcatMeshToTensor
 
@@ -37,16 +35,11 @@ def run_test_FalconCausalLM_end_to_end(
     model_config,
     num_loops,
     tt_cache_path,
-    model_location_generator,
 ):
     profiler.clear()
-    model_name = model_location_generator(model_version, model_subdir="Falcon")
 
     profiler.start("hugging_face_model_setup")
-    hugging_face_reference_model = FalconForCausalLM.from_pretrained(
-        model_name, low_cpu_mem_usage=True, num_hidden_layers=num_layers
-    )
-    hugging_face_reference_model.eval()
+    hugging_face_reference_model = load_falcon_reference_model(model_version, num_hidden_layers=num_layers)
     configuration = hugging_face_reference_model.config
     state_dict = hugging_face_reference_model.state_dict()
     pytorch_FalconCausalLM = PytorchFalconCausalLM(hugging_face_reference_model, num_layers)
@@ -244,7 +237,6 @@ def run_test_FalconCausalLM_end_to_end(
     # Second run for perf ----------------------------------------------------------------
     logger.info(f"Enable profiler and enable binary and compile cache")
     profiler.enable()
-    enable_persistent_kernel_cache()
 
     if llm_mode == "prefill":
         model_inputs = torch.split(model_input, 1)
@@ -379,7 +371,6 @@ def run_test_FalconCausalLM_end_to_end(
         assert does_pass
 
 
-@skip_for_grayskull("Requires eth connected devices to run")
 @pytest.mark.parametrize("num_devices", (8,), ids=["8chips"])
 @pytest.mark.parametrize(
     "llm_mode, batch, seq_len, kv_cache_len",
@@ -431,6 +422,7 @@ def run_test_FalconCausalLM_end_to_end(
     ),
 )
 @pytest.mark.parametrize("device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_1D}], indirect=True)
+@pytest.mark.parametrize("mesh_device", [(1, 8)], indirect=True)
 def test_FalconCausalLM_end_to_end_with_program_cache(
     num_devices,
     model_version,
@@ -442,9 +434,7 @@ def test_FalconCausalLM_end_to_end_with_program_cache(
     request,
     data_type,
     memcfg,
-    model_location_generator,
-    get_tt_cache_path,
-    t3k_mesh_device,
+    mesh_device,
 ):
     model_config_str = f"{data_type}-{memcfg}"
     if llm_mode == "prefill" and memcfg != "DRAM" or num_devices != 8:
@@ -504,18 +494,14 @@ def test_FalconCausalLM_end_to_end_with_program_cache(
 
     input_shape = [batch, seq_len]
     model_config = get_model_config(model_config_str, llm_mode, input_shape, num_devices)
-    compute_grid_size = t3k_mesh_device.compute_with_storage_grid_size()
+    compute_grid_size = mesh_device.compute_with_storage_grid_size()
     if compute_grid_size.x < model_config["MAX_GRID_SIZE"][0] or compute_grid_size.y < model_config["MAX_GRID_SIZE"][1]:
         pytest.skip(f"Requires grid size of at least {model_config['MAX_GRID_SIZE']} to run")
 
-    tt_cache_path = get_tt_cache_path(
-        model_version, model_subdir="Falcon", default_dir=model_config["DEFAULT_CACHE_PATH"]
-    )
-
-    disable_persistent_kernel_cache()
+    tt_cache_path = Path(get_hf_tt_cache_path(model_version))
 
     run_test_FalconCausalLM_end_to_end(
-        t3k_mesh_device,
+        mesh_device,
         model_version,
         llm_mode,
         batch,
@@ -529,5 +515,4 @@ def test_FalconCausalLM_end_to_end_with_program_cache(
         model_config,
         1,
         tt_cache_path,
-        model_location_generator,
     )

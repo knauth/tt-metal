@@ -1,8 +1,9 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import ttnn
 from models.common.lightweightmodule import LightweightModule
+from models.tt_transformers.tt.common import Mode
 
 TILE = 32
 SHARD_HEIGHT = TILE  # Current ttnn.rms_norm implementation requires shard height to be a single tile
@@ -52,6 +53,7 @@ class RMSNorm(LightweightModule):
         output_mem_config=None,
         ccl_topology=ttnn.Topology.Ring,
         tt_ccl=None,
+        fp32_dest_acc_en=True,
     ):
         super().__init__()
         self.device = device
@@ -76,8 +78,6 @@ class RMSNorm(LightweightModule):
         if add_unit_offset:
             torch_weight = torch_weight + 1.0
 
-        cache_name = None if weight_cache_path is None else weight_cache_path / weight_name
-
         # Compatibility with models that don't use mesh devices (e.g. single-chip Mistral-7b)
         is_mesh_device = device.__class__.__name__ == "MeshDevice"
 
@@ -87,7 +87,7 @@ class RMSNorm(LightweightModule):
             dtype=weight_dtype,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             memory_config=weight_memory_config,
-            cache_file_name=cache_name,
+            cache_file_name=None if weight_cache_path is None else weight_cache_path / weight_name,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh_device else None,
         )
 
@@ -98,10 +98,14 @@ class RMSNorm(LightweightModule):
                 dtype=weight_dtype,
                 layout=ttnn.ROW_MAJOR_LAYOUT,
                 memory_config=weight_memory_config,
-                cache_file_name=cache_name,
-                mesh_mapper=ttnn.ShardTensor2dMesh(device, dims=(None, 2), mesh_shape=list(device.shape))
-                if is_mesh_device
-                else None,
+                cache_file_name=(
+                    None if weight_cache_path is None else weight_cache_path / (weight_name + "_distributed")
+                ),
+                mesh_mapper=(
+                    ttnn.ShardTensor2dMesh(device, dims=(None, 2), mesh_shape=list(device.shape))
+                    if is_mesh_device
+                    else None
+                ),
             )
 
         self.sharded_output_config = sharded_output_config
@@ -111,16 +115,36 @@ class RMSNorm(LightweightModule):
         self.compute_kernel_config_hifi2 = ttnn.WormholeComputeKernelConfig(
             math_fidelity=ttnn.MathFidelity.HiFi2,
             math_approx_mode=False,
-            fp32_dest_acc_en=True,
+            fp32_dest_acc_en=fp32_dest_acc_en,
             packer_l1_acc=True,
         )
 
-    def forward(self, x: ttnn.Tensor, mode, in_sharded=False, out_sharded=False) -> ttnn.Tensor:
+    def forward(
+        self,
+        x: ttnn.Tensor,
+        mode: Mode | str,
+        in_sharded=False,
+        out_sharded=False,
+        norm_config=None,
+    ) -> ttnn.Tensor:
+        if isinstance(mode, str):
+            try:
+                mode = Mode(mode)
+            except ValueError:
+                raise ValueError(f"Invalid mode: {mode}")
+        elif not isinstance(mode, Mode):
+            raise ValueError(f"Invalid mode: {mode}")
+
+        sharded_program_config = norm_config.get("sharded_program_config") if norm_config else None
+        sharded_output_config = norm_config.get("sharded_output_config") if norm_config else None
+        output_mem_config = norm_config.get("output_mem_config") if norm_config else None
+        # Optional L1 placement for the distributed 3-op outputs (pre/gather/post); None -> DRAM default.
+        distributed_out_mc = norm_config.get("distributed_output_mem_config") if norm_config else None
+
         # If input is sharded do sharded RMSNorm and optionally return sharded output
-        program_config = self.sharded_program_config if in_sharded else None
-        memory_config = self.sharded_output_config if out_sharded else None
+        program_config = sharded_program_config if in_sharded else None
+        memory_config = sharded_output_config if out_sharded else None
         distributed = self.is_distributed and self.is_distributed(mode)
-        norm = self._distributed_rmsnorm if distributed else ttnn.rms_norm
         weight = self.weight_distributed if distributed else self.weight
 
         if in_sharded:
@@ -128,51 +152,66 @@ class RMSNorm(LightweightModule):
         else:
             assert not out_sharded, "Non-sharded version of RMSNorm cannot output a sharded tensor"
 
-        x = norm(
-            x,
-            epsilon=self.eps,
-            weight=weight,
-            program_config=program_config,
-            memory_config=memory_config,
-            compute_kernel_config=self.compute_kernel_config_hifi2,
-        )
+        if distributed:
+            x = self._distributed_rmsnorm(
+                x,
+                epsilon=self.eps,
+                weight=weight,
+                compute_kernel_config=self.compute_kernel_config_hifi2,
+                output_memory_config=distributed_out_mc,
+            )
+        else:
+            x = ttnn.rms_norm(
+                x,
+                epsilon=self.eps,
+                weight=weight,
+                program_config=program_config,
+                memory_config=memory_config,
+                compute_kernel_config=self.compute_kernel_config_hifi2,
+            )
 
         if in_sharded and not out_sharded:
             return ttnn.sharded_to_interleaved(x)
         else:
+            if output_mem_config is not None:
+                x = ttnn.to_memory_config(x, output_mem_config)
             return x
 
     def _distributed_rmsnorm(
-        self, inp, epsilon=None, weight=None, program_config=None, memory_config=None, compute_kernel_config=None
+        self,
+        inp,
+        epsilon=None,
+        weight=None,
+        program_config=None,
+        memory_config=None,
+        compute_kernel_config=None,
+        output_memory_config=None,
     ):
         assert program_config is None, "Distributed RMSNorm does not support sharded inputs"
         assert memory_config is None, "Distributed RMSNorm does not support sharded outputs"
+        assert self.tt_ccl is not None, "Distributed RMSNorm requires tt_ccl"
+
+        # Interleaved output placement for the 3 ops; default DRAM (matches the prior hardcoded behavior).
+        mc = output_memory_config if output_memory_config is not None else ttnn.DRAM_MEMORY_CONFIG
 
         # Run distributed rmsnorm part 1
-        tt_stats = ttnn.rms_norm_pre_all_gather(inp, compute_kernel_config=compute_kernel_config, dtype=ttnn.bfloat16)
+        tt_stats = ttnn.rms_norm_pre_all_gather(
+            inp, compute_kernel_config=compute_kernel_config, dtype=ttnn.bfloat16, memory_config=mc
+        )
         # AllGather stats
-        if self.tt_ccl:
-            tt_stats = ttnn.experimental.all_gather_async(
-                tt_stats,
-                persistent_output_buffer=None,
-                dim=3,
-                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
-                num_links=1,
-                topology=self.ccl_topology,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
-                chunks_per_sync=10,
-                num_workers_per_link=2,
-                num_buffers_per_channel=2,
-            )
-        else:
-            tt_stats = ttnn.all_gather(
-                tt_stats,
-                dim=3,
-                num_links=1,
-                topology=self.ccl_topology,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            )
+        tt_stats = ttnn.experimental.all_gather_async(
+            tt_stats,
+            persistent_output_buffer=None,
+            dim=3,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+            num_links=1,
+            topology=self.ccl_topology,
+            memory_config=mc,
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+            chunks_per_sync=10,
+            num_workers_per_link=2,
+            num_buffers_per_channel=2,
+        )
         # Run distributed rmsnorm part 2
         tt_out = ttnn.rms_norm_post_all_gather(
             inp,
@@ -180,6 +219,7 @@ class RMSNorm(LightweightModule):
             epsilon=epsilon,
             weight=weight,
             compute_kernel_config=compute_kernel_config,
+            memory_config=mc,
         )
         tt_stats.deallocate(True)
 

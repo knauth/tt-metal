@@ -1,19 +1,15 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "debug/dprint.h"  // required in all kernels using DPRINT
-#include "compute_kernel_api.h"
+#include "api/debug/dprint.h"  // required in all kernels using DPRINT
+#include "api/compute/compute_kernel_api.h"
 
-namespace NAMESPACE {
-
-void MAIN {
+void kernel_main() {
     // Nothing to compute. Print respond message.
     // Make sure to export TT_METAL_DPRINT_CORES=0,0 before runtime.
 
-    DPRINT_MATH(DPRINT << "Hello, I am the MATH core running the compute kernel" << ENDL());
-    DPRINT_UNPACK(DPRINT << "Hello, I am the UNPACK core running the compute kernel" << ENDL());
-    DPRINT_PACK(DPRINT << "Hello, I am the PACK core running the compute kernel" << ENDL());
+    DPRINT_MATH("Hello, I am the MATH core running the compute kernel.\n");
+    DPRINT_UNPACK("Hello, I am the UNPACK core running the compute kernel.\n");
+    DPRINT_PACK("Hello, I am the PACK core running the compute kernel.\n");
 }
-
-}  // namespace NAMESPACE

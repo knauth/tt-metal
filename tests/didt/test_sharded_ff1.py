@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,7 +8,7 @@ import pytest
 
 import ttnn
 from tests.didt.test_ff1_matmul import test_ff1_matmul, test_specific_chip_ff1_matmul
-from models.utility_functions import skip_for_blackhole, is_blackhole
+from models.common.utility_functions import skip_for_blackhole, is_blackhole
 
 MATH_FIDELITY = ttnn.MathFidelity.HiFi2
 GELU = True

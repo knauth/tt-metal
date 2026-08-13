@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -15,6 +15,8 @@
 #include "tt-metalium/buffer.hpp"
 #include "tt-metalium/buffer_types.hpp"
 #include "tt-metalium/constants.hpp"
+#include <tt-metalium/distributed.hpp>
+#include <tt_stl/fmt.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -36,24 +38,35 @@ struct DistributionConfig {
     uint32_t num_cores_x;
 };
 
-std::shared_ptr<Buffer> MakeShardedL1BufferBFP16(
-    IDevice* device, size_t size, const DistributionConfig& config, const ShardSpecBuffer& shard_config) {
-    return CreateBuffer(ShardedBufferConfig{
-        .device = device,
-        .size = size,
+std::shared_ptr<distributed::MeshBuffer> MakeShardedL1MeshBufferBFP16(
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
+    size_t size,
+    const DistributionConfig& config,
+    const ShardSpecBuffer& shard_config) {
+    BufferShardingArgs sharding_args = BufferShardingArgs(shard_config, config.layout);
+    distributed::DeviceLocalBufferConfig local_config{
         .page_size = tt::constants::TILE_HW * sizeof(bfloat16),
-        .buffer_layout = config.layout,
-        .shard_parameters = shard_config});
+        .buffer_type = BufferType::L1,
+        .sharding_args = sharding_args,
+    };
+    distributed::ReplicatedBufferConfig buffer_config{
+        .size = size,
+    };
+    return distributed::MeshBuffer::create(buffer_config, local_config, mesh_device.get());
 }
 
 CBHandle MakeCircularBufferBFP16(
-    Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles, const std::shared_ptr<Buffer>& l1_buf) {
+    Program& program,
+    const CoreSpec& core,
+    tt::CBIndex cb,
+    uint32_t n_tiles,
+    const std::shared_ptr<distributed::MeshBuffer>& l1_buf) {
     constexpr uint32_t tile_size = sizeof(bfloat16) * tt::constants::TILE_HW;
     CircularBufferConfig cb_config = CircularBufferConfig(n_tiles * tile_size, {{cb, tt::DataFormat::Float16_b}})
                                          .set_page_size(cb, tile_size)
                                          // IMPORTANT: assign L1 buffer address to circular buffer directly so that
                                          // no extra allocation and data copy
-                                         .set_globally_allocated_address(*l1_buf);
+                                         .set_globally_allocated_address(*(l1_buf->get_backing_buffer()));
     return CreateCircularBuffer(program, core, cb_config);
 }
 
@@ -84,14 +97,14 @@ int main(int argc, char** argv) {
     // need for NoC bandwidth. This example demonstrates how to set up sharded L1 buffers and perform vector addition
     // across them.
     //
-    // Sharding is quite percise and requires exact division of the data across the cores. The example tries to
+    // Sharding is quite precise and requires exact division of the data across the cores. The example tries to
     // distribute 64 (4x4) tiles across 4 cores. But in different sharding modes:
     // * height: Shard the tensors across the height dimension
     // * width: Shard the tensors across the width dimension
     // * block: Shard the tensors across both height and width dimensions
     //
     // In different modes, the data is distributed differently across the cores in different patterns. Each core:
-    // * hight: Uses 4 cores in the y direction. Each core gets 1 rows of 4 tiles each.
+    // * height: Uses 4 cores in the y direction. Each core gets 1 rows of 4 tiles each.
     // * width: Uses 4 cores in the x direction. Each core gets 1 column of 4 tiles each.
     // * block: Uses a 2x2 grid of cores. Each core gets 2 rows and 2 columns of tiles, effectively sharding the tensor
     // into blocks.
@@ -128,7 +141,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    IDevice* device = CreateDevice(device_id);
+    std::shared_ptr<distributed::MeshDevice> mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
+    distributed::MeshWorkload workload;
+    distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
     Program program = CreateProgram();
 
     const auto& config = test_configs.at(sharding_type);
@@ -170,9 +185,9 @@ int main(int argc, char** argv) {
 
     // Create the input and output buffers that lives on L1(SRAM)
     size_t size_bytes = n_tiles_y * n_tiles_x * tt::constants::TILE_HW * sizeof(bfloat16);
-    auto a = MakeShardedL1BufferBFP16(device, size_bytes, config, spec);
-    auto b = MakeShardedL1BufferBFP16(device, size_bytes, config, spec);
-    auto c = MakeShardedL1BufferBFP16(device, size_bytes, config, spec);
+    auto a = MakeShardedL1MeshBufferBFP16(mesh_device, size_bytes, config, spec);
+    auto b = MakeShardedL1MeshBufferBFP16(mesh_device, size_bytes, config, spec);
+    auto c = MakeShardedL1MeshBufferBFP16(mesh_device, size_bytes, config, spec);
 
     // Data to fill the input buffers.
     std::mt19937 rng(seed);
@@ -189,7 +204,7 @@ int main(int argc, char** argv) {
     // Create circular buffers so the compute APIs can access the data.
     // NOTE: These are special circular buffers that have explicitly set L1 buffer address. As data already fully
     // resides in L1, we can simply point the circular buffers to the L1 buffers and avoid any extra allocation or data
-    // copy. This is an impotant optimization for performance. But hyper specific to use cases like this one.
+    // copy. This is an important optimization for performance. But hyper specific to use cases like this one.
     MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_0, num_tiles_per_core, a);
     MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_1, num_tiles_per_core, b);
     MakeCircularBufferBFP16(program, cores, tt::CBIndex::c_2, num_tiles_per_core, c);
@@ -205,19 +220,20 @@ int main(int argc, char** argv) {
             .compile_args = {tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_2}});
 
     // copy data from host to L1 directly
-    CommandQueue& cq = device->command_queue();
-    EnqueueWriteBuffer(cq, a, a_data, false);
-    EnqueueWriteBuffer(cq, b, b_data, false);
+    distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
+    EnqueueWriteMeshBuffer(cq, a, a_data, false);
+    EnqueueWriteMeshBuffer(cq, b, b_data, false);
 
     // Setup arguments and run the program.
     SetRuntimeArgs(program, compute, cores, {num_tiles_per_core});
-    EnqueueProgram(cq, program, true);
+    workload.add_program(device_range, std::move(program));
+    distributed::EnqueueMeshWorkload(cq, workload, false);
 
     fmt::print("Kernel execution finished. Reading results...\n");
 
     // Read the output buffer.
     std::vector<bfloat16> c_data;
-    EnqueueReadBuffer(cq, c, c_data, true);
+    distributed::EnqueueReadMeshBuffer(cq, c_data, c, true);
 
     // Print partial results so we can see the output is correct (plus or minus
     // some error due to BFP16 precision)
@@ -226,12 +242,17 @@ int main(int argc, char** argv) {
     size_t print_per_core = std::min((size_t)10, element_per_core);
 
     int core_idx = 0;
-    for (auto& core : cores) {
+    for ([[maybe_unused]] auto& core : cores) {
         const auto core_offset = core_idx * element_per_core;
         fmt::print("Core {}:\n", core_idx);
         for (int index = 0; index < print_per_core; index++) {
             const auto i = core_offset + index;
-            fmt::print("index {}: {} + {} = {}\n", i, a_data[i].to_float(), b_data[i].to_float(), c_data[i].to_float());
+            fmt::print(
+                "index {}: {} + {} = {}\n",
+                i,
+                static_cast<float>(a_data[i]),
+                static_cast<float>(b_data[i]),
+                static_cast<float>(c_data[i]));
         }
         std::cout << std::endl;
         core_idx++;
@@ -240,9 +261,10 @@ int main(int argc, char** argv) {
     // Verify the results
     bool pass = true;
     for (size_t i = 0; i < c_data.size(); i++) {
-        float expected = a_data[i].to_float() + b_data[i].to_float();
-        if (std::abs(c_data[i].to_float() - expected) > 0.2f) {  // Allow some error due to BFP16 precision
-            fmt::print(stderr, "Mismatch at index {}: expected {}, got {}\n", i, expected, c_data[i].to_float());
+        float expected = static_cast<float>(a_data[i]) + static_cast<float>(b_data[i]);
+        if (std::abs(static_cast<float>(c_data[i]) - expected) > 0.2f) {  // Allow some error due to BFP16 precision
+            fmt::print(
+                stderr, "Mismatch at index {}: expected {}, got {}\n", i, expected, static_cast<float>(c_data[i]));
             pass = false;
         }
     }
@@ -254,6 +276,6 @@ int main(int argc, char** argv) {
     }
 
     // Finally, we close the device.
-    CloseDevice(device);
+    mesh_device->close();
     return 0;
 }

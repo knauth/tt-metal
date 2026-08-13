@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 """
@@ -21,10 +21,11 @@ import subprocess
 import sys
 import shutil
 
-NOTEBOOKS_DIR = Path("ttnn/tutorials/2025_dx_rework")
+NOTEBOOKS_DIR = Path("ttnn/tutorials")
 OUTPUT_DIR = Path("ttnn/tutorials/basic_python")
 TEMPLATE_DIR = Path("scripts/nbconvert_template")
 TEMPLATE_NAME = "ttnn_examples_convert"
+EXCLUDED_TUTORIALS = ["ttnn/tutorials/ttnn_intro.ipynb"]
 
 
 def get_staged_notebooks() -> list[Path]:
@@ -38,7 +39,11 @@ def get_staged_notebooks() -> list[Path]:
         check=True,
     )
     staged_files = result.stdout.splitlines()
-    return [Path(f) for f in staged_files if f.endswith(".ipynb") and Path(f).is_relative_to(NOTEBOOKS_DIR)]
+    return [
+        Path(f)
+        for f in staged_files
+        if f.endswith(".ipynb") and Path(f).is_relative_to(NOTEBOOKS_DIR) and f not in EXCLUDED_TUTORIALS
+    ]
 
 
 def convert_with_nbconvert(notebook: Path, output_tmp: Path) -> None:
@@ -78,6 +83,11 @@ def filter_modified_files(files: list[Path]) -> list[Path]:
     """
     Filter files that have changed since last commit
     """
+
+    # If input is empty list, then `git diff --name-only` will list unstaged files
+    # which is not what we want.
+    if not files:
+        return []
 
     # Make sure that untracked files are also added to the index
     # Otherwise, `git diff` will not show them

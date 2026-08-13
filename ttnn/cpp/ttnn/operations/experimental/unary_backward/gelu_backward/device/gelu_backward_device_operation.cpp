@@ -1,31 +1,19 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "gelu_backward_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
 #include "gelu_backward_program_factory.hpp"
-
-#include <tt-metalium/constants.hpp>
-#include "tt-metalium/host_api.hpp"
 
 using namespace tt::tt_metal;
 
-namespace ttnn::operations::experimental::gelu_backward {
-
-GeluBackwardDeviceOperation::program_factory_t GeluBackwardDeviceOperation::select_program_factory(
-    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
-    return program::GeluBackwardProgramFactory{};
-}
-
-void GeluBackwardDeviceOperation::validate_on_program_cache_hit(
-    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
-    validate_on_program_cache_miss(args, tensor_args);
-}
-
+namespace ttnn::experimental::prim {
 void GeluBackwardDeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
     const auto& preallocated_input_grad = tensor_args.preallocated_input_grad;
     const auto& input_tensor = tensor_args.input;
+    const auto& grad_output = tensor_args.grad_output;
     auto out_memory_config = args.output_memory_config;
     auto output_datatype = args.output_dtype;
 
@@ -73,6 +61,32 @@ void GeluBackwardDeviceOperation::validate_on_program_cache_miss(
         "memory layout: `{}`",
         static_cast<int>(input_tensor.memory_config().memory_layout()));
 
+    TT_FATAL(
+        grad_output.storage_type() == StorageType::DEVICE,
+        "GELU_BW operation requires grad_output to be on Device. grad_output storage type: {}",
+        static_cast<int>(grad_output.storage_type()));
+
+    TT_FATAL(
+        grad_output.buffer() != nullptr,
+        "GELU_BW operation requires grad_output to be allocated in a buffer on the device. Buffer is null.");
+
+    TT_FATAL(
+        grad_output.layout() == Layout::TILE,
+        "GELU_BW operation requires grad_output to be in Tile layout. grad_output layout: {}",
+        static_cast<int>(grad_output.layout()));
+
+    TT_FATAL(
+        grad_output.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+        "GELU_BW operation requires grad_output to have Interleaved memory layout. grad_output memory layout: {}",
+        static_cast<int>(grad_output.memory_config().memory_layout()));
+
+    TT_FATAL(
+        grad_output.logical_shape() == input_tensor.logical_shape(),
+        "GELU_BW operation requires grad_output and input to have the same logical shape. grad_output logical shape: "
+        "{}, input logical shape: {}",
+        grad_output.logical_shape(),
+        input_tensor.logical_shape());
+
     if (preallocated_input_grad.has_value()) {
         const auto computed_output_shape = compute_output_specs(args, tensor_args).logical_shape();
         const auto preallocated_output_shape = preallocated_input_grad.value().logical_shape();
@@ -85,7 +99,7 @@ void GeluBackwardDeviceOperation::validate_on_program_cache_miss(
     }
 }
 
-spec_return_value_t GeluBackwardDeviceOperation::compute_output_specs(
+tt::tt_metal::TensorSpec GeluBackwardDeviceOperation::compute_output_specs(
     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
     if (tensor_args.preallocated_input_grad.has_value()) {
         return tensor_args.preallocated_input_grad->tensor_spec();
@@ -102,10 +116,10 @@ spec_return_value_t GeluBackwardDeviceOperation::compute_output_specs(
     }
 
     const auto output_shape = tensor_args.input.logical_shape();
-    return TensorSpec(output_shape, TensorLayout(output_dtype, output_layout, args.output_memory_config));
+    return tt::tt_metal::TensorSpec(output_shape, TensorLayout(output_dtype, output_layout, args.output_memory_config));
 }
 
-tensor_return_value_t GeluBackwardDeviceOperation::create_output_tensors(
+Tensor GeluBackwardDeviceOperation::create_output_tensors(
     const operation_attributes_t& args, const tensor_args_t& tensor_args) {
     if (tensor_args.preallocated_input_grad.has_value()) {
         return *tensor_args.preallocated_input_grad;
@@ -113,37 +127,25 @@ tensor_return_value_t GeluBackwardDeviceOperation::create_output_tensors(
     return create_device_tensor(compute_output_specs(args, tensor_args), tensor_args.input.device());
 }
 
-tt::stl::hash::hash_t GeluBackwardDeviceOperation::compute_program_hash(
-    const operation_attributes_t& args, const tensor_args_t& tensor_args) {
-    const auto& input_tensor = tensor_args.input;
-    const auto& grad_output = tensor_args.grad_output;
-    const auto& input_shape = input_tensor.padded_shape();
+}  // namespace ttnn::experimental::prim
 
-    auto program_factory = select_program_factory(args, tensor_args);
-    operation::Hash hash = operation::hash_operation<GeluBackwardDeviceOperation>(
-        args,
-        program_factory.index(),
-        input_tensor.dtype(),
-        input_tensor.memory_config(),
-        grad_output.dtype(),
-        grad_output.memory_config(),
-        input_shape.volume());
+namespace ttnn::prim {
 
-    return hash;
-}
-
-std::tuple<GeluBackwardDeviceOperation::operation_attributes_t, GeluBackwardDeviceOperation::tensor_args_t>
-GeluBackwardDeviceOperation::invoke(
+Tensor gelu_bw(
     const Tensor& grad_output,
     const Tensor& input,
     const std::string& approximate,
     DataType output_dtype,
     const MemoryConfig& output_memory_config,
     const std::optional<Tensor>& preallocated_output) {
-    return {
-        operation_attributes_t{
-            .output_dtype = output_dtype, .output_memory_config = output_memory_config, .approximate = approximate},
-        tensor_args_t{.grad_output = grad_output, .input = input, .preallocated_input_grad = preallocated_output}};
+    using OperationType = ttnn::experimental::prim::GeluBackwardDeviceOperation;
+
+    auto operation_attributes = OperationType::operation_attributes_t{
+        .output_dtype = output_dtype, .output_memory_config = output_memory_config, .approximate = approximate};
+    auto tensor_args = OperationType::tensor_args_t{
+        .grad_output = grad_output, .input = input, .preallocated_input_grad = preallocated_output};
+
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
 
-}  // namespace ttnn::operations::experimental::gelu_backward
+}  // namespace ttnn::prim

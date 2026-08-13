@@ -1,9 +1,10 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import os
 import torch
 from loguru import logger
+import pytest
 
 # Set Grok flags for CI, if CI environment is setup
 if os.getenv("CI") == "true":
@@ -17,16 +18,19 @@ from models.experimental.grok.tt.grok_attention import TtGrokAttention
 from models.experimental.grok.tt.grok_common import prepare_inputs_ttnn, prepare_rotation_mat_ttnn
 from models.experimental.grok.reference.model import MultiHeadAttention
 from models.experimental.grok.tt.model_config import TtModelArgs
-from models.utility_functions import (
+from models.common.utility_functions import (
     comp_pcc,
     comp_allclose,
 )
+from tests.tests_common.skip_reasons import LEGACY_CCL_SKIP
 
 
-def test_grok_attention_inference(t3k_mesh_device, reset_seeds):
+@pytest.mark.skip(reason=LEGACY_CCL_SKIP)
+@pytest.mark.parametrize("mesh_device", [(1, 8)], indirect=True)
+def test_grok_attention_inference(mesh_device, reset_seeds):
     pcc = 0.99
     dtype = ttnn.bfloat8_b
-    model_args = TtModelArgs(t3k_mesh_device, dummy_weights=os.getenv("CI") == "true")
+    model_args = TtModelArgs(mesh_device, dummy_weights=os.getenv("CI") == "true")
     model_args.n_layers = 1
     state_dict = model_args.load_state_dict()
 
@@ -47,7 +51,7 @@ def test_grok_attention_inference(t3k_mesh_device, reset_seeds):
     batch = 32
     seq_len = 1  # length to generate
 
-    tt_model = TtGrokAttention(t3k_mesh_device, state_dict, args=model_args, layer_num=0, dtype=dtype)
+    tt_model = TtGrokAttention(mesh_device, state_dict, args=model_args, layer_num=0, dtype=dtype)
 
     rot_mat = prepare_rotation_mat_ttnn(
         model_args.head_dim,
@@ -82,9 +86,7 @@ def test_grok_attention_inference(t3k_mesh_device, reset_seeds):
         # Work around program cache issue https://github.com/tenstorrent/tt-metal/issues/7159
         del attention_input, attn_mask
         tt_output_torch = (
-            ttnn.to_torch(tt_out, mesh_composer=ConcatMeshToTensor(t3k_mesh_device, dim=0))[0]
-            .squeeze(2)
-            .view(batch, 1, -1)
+            ttnn.to_torch(tt_out, mesh_composer=ConcatMeshToTensor(mesh_device, dim=0))[0].squeeze(2).view(batch, 1, -1)
         )  # [ batch, seq, hidden_dim]
 
         positions = torch.LongTensor([current_pos])

@@ -1,19 +1,20 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include <tt-metalium/work_split.hpp>
-#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
-#include "ttnn/run_operation.hpp"
-#include <tt-metalium/constants.hpp>
-#include <tt-metalium/util.hpp>
+#pragma once
 
-namespace ttnn::operations::experimental::reduction::detail {
+#include <tt-metalium/program_descriptors.hpp>
 
-tt::tt_metal::operation::ProgramWithCallbacks reduce_nc_factory(
-    const ttnn::Tensor& input,
-    const ttnn::Tensor& output,
-    int64_t dim,
-    const ttnn::DeviceComputeKernelConfig& compute_kernel_config);
+#include "fast_reduce_nc_device_operation_types.hpp"
 
-}  // namespace ttnn::operations::experimental::reduction::detail
+namespace ttnn::experimental::prim {
+
+struct FastReduceNCProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const FastReduceNCParams& operation_attributes,
+        const FastReduceNCInputs& tensor_args,
+        Tensor& tensor_return_value);
+};
+
+}  // namespace ttnn::experimental::prim

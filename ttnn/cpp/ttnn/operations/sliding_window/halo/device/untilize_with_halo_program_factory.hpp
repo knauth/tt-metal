@@ -1,46 +1,28 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
+#include <tt-metalium/workload_descriptor.hpp>
 
-namespace ttnn::operations::data_movement::detail {
+#include "ttnn/device_operation.hpp"
+#include "ttnn/operations/sliding_window/halo/device/halo_device_operation_types.hpp"
 
-tt::tt_metal::operation::ProgramWithCallbacks untilize_with_halo_multi_core(
-    tt::tt_metal::Program& program,
-    const Tensor& input_tensor,
-    uint32_t pad_val,
-    uint32_t ncores_nhw,
-    uint32_t max_out_nsticks_per_core,
-    const Tensor& padding_config0,
-    const Tensor& padding_config1,
-    const Tensor& gather_config0,
-    const Tensor& gather_config1,
-    const std::vector<uint16_t>& number_of_blocks_per_core,
-    bool remote_read,
-    bool transpose_mcast,
-    Tensor& output_tensor,
-    int block_size,
-    bool capture_buffers);  // Used by halo op to cache internally created config buffers with the program
-                            // Untilize with Halo takes them as inputs from the user, so doesn't capture
+namespace ttnn::prim {
 
-tt::tt_metal::operation::ProgramWithCallbacks inplace_untilize_with_halo_multi_core(
-    tt::tt_metal::Program& program,
-    const Tensor& input_tensor,
-    uint32_t pad_val,
-    bool padding_exists,
-    uint32_t ncores_nhw,
-    uint32_t ncores_c,
-    uint32_t max_out_nsticks_per_core,
-    uint32_t max_ref_size,
-    const Tensor& padding_config,
-    const Tensor& local_config,
-    const Tensor& remote_config,
-    bool remote_read,
-    bool transpose_mcast,
-    Tensor& output_tensor,
-    bool capture_buffers);
+struct UntilizeWithHaloProgramFactory {
+    // create_workload_descriptor() allocates the four sliding-window halo
+    // config tensors (pad_config0/1, gather_config0/1) on device and parks
+    // them on the returned WorkloadDescriptor so their backing buffers
+    // outlive the cached programs.  The buffers are bound to the
+    // CBDescriptor entries that the reader kernels stream from.
+    static tt::tt_metal::WorkloadDescriptor create_workload_descriptor(
+        const HaloParams& operation_attributes,
+        const Tensor& tensor_args,
+        Tensor& output_tensor,
+        const ttnn::MeshCoordinateRangeSet& tensor_coords);
+};
 
-}  // namespace ttnn::operations::data_movement::detail
+}  // namespace ttnn::prim

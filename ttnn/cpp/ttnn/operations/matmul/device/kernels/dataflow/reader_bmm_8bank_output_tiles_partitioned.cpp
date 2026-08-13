@@ -1,14 +1,17 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
 
-#include "dataflow_api.h"
-#include "pad_tile.hpp"
+#include "api/dataflow/dataflow_api.h"
+#include "ttnn/operations/kernel_helper_functions/pad_tile.hpp"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
-    // same arg indices as in reader_binary_diff_lenghts for compat
+    // same arg indices as in reader_binary_diff_lengths for compat
     uint32_t src0_addr = get_arg_val<uint32_t>(0);
     uint32_t src1_addr = get_arg_val<uint32_t>(1);
     uint32_t Mt = get_arg_val<uint32_t>(2);
@@ -22,22 +25,21 @@ void kernel_main() {
     uint32_t num_output_tiles = get_arg_val<uint32_t>(10);
     uint32_t MtNt = get_arg_val<uint32_t>(11);
 
-    constexpr bool src0_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr bool src1_is_dram = get_compile_time_arg_val(1) == 1;
-    constexpr uint32_t in0_last_ktile_w = get_compile_time_arg_val(2);
+    constexpr uint32_t in0_last_ktile_w = get_compile_time_arg_val(0);
+    constexpr uint32_t in0_last_ktile_h = get_compile_time_arg_val(1);
+    constexpr auto src0_args = TensorAccessorArgs<2>();
+    constexpr auto src1_args = TensorAccessorArgs<src0_args.next_compile_time_args_offset()>();
 
-    // DPRINT << "Mt=" << Mt << " Kt=" << Kt << " Nt=" << Nt << " MtKt=" << MtKt << "KtNt=" << KtNt << ENDL();
-    // DPRINT << "src0=" << src0_addr << " src1=" << src1_addr << ENDL();
-    // DPRINT << "batch=" << batch << ENDL();
+    // DPRINT("Mt={} Kt={} Nt={} MtKt={} KtNt={}\n", Mt, Kt, Nt, MtKt, KtNt);
+    // DPRINT("src0={} src1={}\n", src0_addr, src1_addr);
+    // DPRINT("batch={}\n", batch);
 
-    constexpr uint32_t cb_id_in0 = 0;
-    constexpr uint32_t cb_id_in1 = 1;
+    constexpr uint32_t dfb_id_in0 = get_named_compile_time_arg_val("cb_in0");
+    constexpr uint32_t dfb_id_in1 = get_named_compile_time_arg_val("cb_in1");
 
     constexpr uint32_t onetile = 1;
-    const uint32_t in0_tile_bytes = get_tile_size(cb_id_in0);
-    const DataFormat in0_data_format = get_dataformat(cb_id_in0);
-    const uint32_t in1_tile_bytes = get_tile_size(cb_id_in1);
-    const DataFormat in1_data_format = get_dataformat(cb_id_in1);
+    const uint32_t in0_tile_bytes = get_tile_size(dfb_id_in0);
+    const uint32_t in1_tile_bytes = get_tile_size(dfb_id_in1);
 
     uint32_t itileA = output_tile_start_id / Nt * Kt;  // input0 row = output row * input0 width
 
@@ -49,35 +51,41 @@ void kernel_main() {
         itileB += output_tile_start_id / MtNt * KtNt;  // offset into correct batch if not bcasting
     }
 
-    const InterleavedAddrGenFast<src0_is_dram> s0 = {
-        .bank_base_address = src0_addr, .page_size = in0_tile_bytes, .data_format = in0_data_format};
+    const auto s0 = TensorAccessor(src0_args, src0_addr);
+    const auto s1 = TensorAccessor(src1_args, src1_addr);
 
-    const InterleavedAddrGenFast<src1_is_dram> s1 = {
-        .bank_base_address = src1_addr, .page_size = in1_tile_bytes, .data_format = in1_data_format};
+    Noc noc;
+    DataflowBuffer dfb_in0(dfb_id_in0);
+    DataflowBuffer dfb_in1(dfb_id_in1);
 
     for (uint32_t n = 0; n < num_output_tiles; n++) {
         for (uint32_t kt = 0; kt < Kt; kt++) {
             {  // Read A's tile at (mt, kt)
-                cb_reserve_back(cb_id_in0, onetile);
-                uint32_t l1_write_addr_in0 = get_write_ptr(cb_id_in0);
-                noc_async_read_tile(itileA, s0, l1_write_addr_in0);
-                noc_async_read_barrier();
+                dfb_in0.reserve_back(onetile);
+                noc.async_read(s0, dfb_in0, in0_tile_bytes, {.page_id = itileA}, {.offset_bytes = 0});
+                noc.async_read_barrier();
                 if constexpr (in0_last_ktile_w > 0) {
                     if (kt == Kt - 1) {
-                        pad_last_ktile<in0_data_format, in0_last_ktile_w>(l1_write_addr_in0);
+                        constexpr DataFormat in0_data_format = get_dataformat(dfb_id_in0);
+                        pad_last_ktile<in0_data_format, in0_last_ktile_w>(dfb_in0.get_write_ptr());
                     }
                 }
-                cb_push_back(cb_id_in0, onetile);
+                if constexpr (in0_last_ktile_h > 0) {
+                    if (kt == Kt - 1) {
+                        constexpr DataFormat in0_data_format = get_dataformat(dfb_id_in0);
+                        pad_last_transposed_ktile<in0_data_format, in0_last_ktile_h>(dfb_in0.get_write_ptr());
+                    }
+                }
+                dfb_in0.push_back(onetile);
             }
 
             {  // Read B's tile at (kt, nt)
-                cb_reserve_back(cb_id_in1, onetile);
-                uint32_t l1_write_addr_in1 = get_write_ptr(cb_id_in1);
-                noc_async_read_tile(itileB, s1, l1_write_addr_in1);
-                noc_async_read_barrier();
-                cb_push_back(cb_id_in1, onetile);
+                dfb_in1.reserve_back(onetile);
+                noc.async_read(s1, dfb_in1, in1_tile_bytes, {.page_id = itileB}, {.offset_bytes = 0});
+                noc.async_read_barrier();
+                dfb_in1.push_back(onetile);
             }
-            // DPRINT << "Pushed itileA=" << itileA << " itileB=" << itileB << ENDL();
+            // DPRINT("Pushed itileA={} itileB={}\n", itileA, itileB);
 
             itileA += 1;   // A is MK
             itileB += Nt;  // B is KN, so to get k++ we stride by Nt

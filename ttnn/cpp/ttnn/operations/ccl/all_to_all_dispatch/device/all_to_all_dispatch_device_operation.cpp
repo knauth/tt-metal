@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -7,15 +7,12 @@
 
 #include "ttnn/tensor/types.hpp"
 #include "all_to_all_dispatch_device_operation.hpp"
+#include "ttnn/device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
 #include "cpp/ttnn/operations/data_movement/common/common.hpp"
 #include <tt-metalium/work_split.hpp>
 
 namespace ttnn::operations::ccl {
-
-AllToAllDispatchDeviceOperation::program_factory_t AllToAllDispatchDeviceOperation::select_program_factory(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    return AllToAllDispatchSparse{};
-}
 
 void AllToAllDispatchDeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
@@ -26,7 +23,7 @@ void AllToAllDispatchDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(indices_tensor.layout() == tt::tt_metal::Layout::ROW_MAJOR, "Indices tensor must be in row major layout");
 
     TT_FATAL(input_tensor.dtype() == tt::tt_metal::DataType::BFLOAT16, "Input tensor must be bfloat16");
-    TT_FATAL(indices_tensor.dtype() == tt::tt_metal::DataType::UINT16, "Indices tensor must be uint32");
+    TT_FATAL(indices_tensor.dtype() == tt::tt_metal::DataType::UINT16, "Indices tensor must be uint16");
     TT_FATAL(!operation_attributes.output_mem_config.is_sharded(), "Output memory config must not be sharded");
 
     auto output_specs = compute_output_specs(operation_attributes, tensor_args);
@@ -69,15 +66,15 @@ void AllToAllDispatchDeviceOperation::validate_on_program_cache_miss(
             input_shape[i],
             indices_shape[i]);
     }
-
-    TT_FATAL(operation_attributes.axis.has_value(), "Axis must be specified at the moment");
     TT_FATAL(
-        operation_attributes.cross_device_semaphore.has_value(),
-        "Cross device semaphore must be specified at the moment");
+        operation_attributes.output_concat_dim == 1 || operation_attributes.output_concat_dim == 2,
+        "Output concat dimension must be 1 or 2, got {}. Output concat dimension is used to determine the dimension to "
+        "concat the output tokens along.",
+        operation_attributes.output_concat_dim);
 }
 
 void AllToAllDispatchDeviceOperation::validate_on_program_cache_hit(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {}
+    const operation_attributes_t& /*operation_attributes*/, const tensor_args_t& /*tensor_args*/) {}
 
 AllToAllDispatchDeviceOperation::spec_return_value_t AllToAllDispatchDeviceOperation::compute_output_specs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
@@ -86,8 +83,9 @@ AllToAllDispatchDeviceOperation::spec_return_value_t AllToAllDispatchDeviceOpera
     auto indices_shape = tensor_args.expert_indices_tensor.tensor_spec().logical_shape();
     auto mapping_shape = tensor_args.expert_mapping_tensor.tensor_spec().logical_shape();
 
-    auto mesh_device = input_tensor.mesh_device();
+    auto* mesh_device = input_tensor.device();
     const auto& mesh_view = mesh_device->get_view();
+    uint32_t output_concat_dim = operation_attributes.output_concat_dim;
 
     // experts are expert parallel across devices
     // tokens are data parallel across devices
@@ -99,7 +97,6 @@ AllToAllDispatchDeviceOperation::spec_return_value_t AllToAllDispatchDeviceOpera
     // axis, and skip any experts that are not on the specified axis
 
     uint32_t dispatch_devices = mesh_view.num_devices();
-    uint32_t tokens_per_device = input_shape[0];
     uint32_t hidden_size = input_shape[-1];
     if (operation_attributes.axis.has_value()) {
         uint32_t axis = operation_attributes.axis.value();
@@ -108,12 +105,12 @@ AllToAllDispatchDeviceOperation::spec_return_value_t AllToAllDispatchDeviceOpera
     }
 
     // final batch in the metadata tensor
-    uint32_t dispatched_tokens = tokens_per_device * dispatch_devices;
+    uint32_t batch = (output_concat_dim == 1) ? input_shape[0] * dispatch_devices : input_shape[0];
     uint32_t selected_experts_k = indices_shape[-1];
-    uint32_t seq_len = indices_shape[-2];
+    uint32_t seq_len = (output_concat_dim == 2) ? indices_shape[-2] * dispatch_devices : indices_shape[-2];
 
-    auto output_shape = ttnn::Shape({1, dispatched_tokens, seq_len, hidden_size});
-    auto metadata_shape = ttnn::Shape({1, dispatched_tokens, seq_len, selected_experts_k});
+    auto output_shape = ttnn::Shape({1, batch, seq_len, hidden_size});
+    auto metadata_shape = ttnn::Shape({1, batch, seq_len, selected_experts_k});
 
     log_debug(tt::LogOp, "output_shape: {}", output_shape);
     log_debug(tt::LogOp, "metadata_shape: {}", metadata_shape);
@@ -122,14 +119,14 @@ AllToAllDispatchDeviceOperation::spec_return_value_t AllToAllDispatchDeviceOpera
     log_debug(tt::LogOp, "mapping_shape: {}", mapping_shape);
     log_debug(tt::LogOp, "dispatch_devices: {}", dispatch_devices);
     log_debug(tt::LogOp, "hidden_size: {}", hidden_size);
-    log_debug(tt::LogOp, "dispatched_tokens: {}", dispatched_tokens);
+    log_debug(tt::LogOp, "batch: {}", batch);
     log_debug(tt::LogOp, "selected_experts_k: {}", selected_experts_k);
 
     auto mem_config = operation_attributes.output_mem_config;
-    auto output_tokens_spec = TensorSpec(
+    auto output_tokens_spec = tt::tt_metal::TensorSpec(
         Shape(output_shape),
         tt::tt_metal::TensorLayout(input_tensor.dtype(), tt::tt_metal::PageConfig(input_tensor.layout()), mem_config));
-    auto metadata_spec = TensorSpec(
+    auto metadata_spec = tt::tt_metal::TensorSpec(
         Shape(metadata_shape),
         tt::tt_metal::TensorLayout(
             tensor_args.expert_indices_tensor.dtype(),
@@ -156,8 +153,10 @@ AllToAllDispatchDeviceOperation::tensor_return_value_t AllToAllDispatchDeviceOpe
     return {output_tensor, metadata_tensor};
 }
 
-std::tuple<AllToAllDispatchDeviceOperation::operation_attributes_t, AllToAllDispatchDeviceOperation::tensor_args_t>
-AllToAllDispatchDeviceOperation::invoke(
+}  // namespace ttnn::operations::ccl
+
+namespace ttnn::prim {
+ttnn::operations::ccl::AllToAllDispatchDeviceOperation::tensor_return_value_t all_to_all_dispatch(
     const ttnn::Tensor& input_tensor,
     const ttnn::Tensor& expert_indices_tensor,
     const ttnn::Tensor& expert_mapping_tensor,
@@ -167,22 +166,22 @@ AllToAllDispatchDeviceOperation::invoke(
     tt::tt_fabric::Topology topology,
     const ttnn::MemoryConfig& memory_config,
     const CoreRangeSet& worker_core_range_set,
-    const std::optional<GlobalSemaphore>& global_semaphore,
-    AllToAllTransferType impl) {
-    return {
-        operation_attributes_t{
+    ttnn::operations::ccl::AllToAllDispatchDeviceOperation::AllToAllTransferType impl,
+    uint32_t output_concat_dim) {
+    using OperationType = ttnn::operations::ccl::AllToAllDispatchDeviceOperation;
+    return ttnn::device_operation::launch<OperationType>(
+        OperationType::operation_attributes_t{
             .worker_core_range_set = worker_core_range_set,
             .output_mem_config = memory_config,
             .axis = axis,
             .num_links = num_links,
             .topology = topology,
-            .cross_device_semaphore = global_semaphore,
-            .impl = impl},
-        tensor_args_t{
+            .impl = impl,
+            .output_concat_dim = output_concat_dim},
+        OperationType::tensor_args_t{
             .input_tensor = input_tensor,
             .expert_indices_tensor = expert_indices_tensor,
             .expert_mapping_tensor = expert_mapping_tensor,
-            .optional_output_tensors = optional_output_tensors}};
+            .optional_output_tensors = optional_output_tensors});
 }
-
-}  // namespace ttnn::operations::ccl
+}  // namespace ttnn::prim

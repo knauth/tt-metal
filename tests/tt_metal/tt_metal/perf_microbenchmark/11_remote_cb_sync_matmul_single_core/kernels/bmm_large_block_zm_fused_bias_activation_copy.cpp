@@ -1,14 +1,13 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "compute_kernel_api/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/matmul.h"
 
-namespace NAMESPACE {
-
-void MAIN {
+void kernel_main() {
     constexpr uint32_t in0_block_w = get_compile_time_arg_val(0);  // inner block size in tiles
     constexpr uint32_t in0_block_num_tiles =
         get_compile_time_arg_val(1);  // out_subblock_h*in0_block_w*in0_num_subblocks;
@@ -26,8 +25,10 @@ void MAIN {
     constexpr uint32_t sync_cb_id = tt::CBIndex::c_2;
     constexpr uint32_t out_cb_id = tt::CBIndex::c_16;
 
+    compute_kernel_hw_startup<SrcOrder::Reverse>(in0_cb_id, in1_cb_id, out_cb_id);
+
     for (uint32_t l = 0; l < num_layers; ++l) {
-        mm_block_init(in0_cb_id, in1_cb_id, out_cb_id, false, out_block_w, out_block_h, in0_block_w);
+        matmul_block_init(in0_cb_id, in1_cb_id, false, out_block_w, out_block_h, in0_block_w);
 
         tile_regs_acquire();
 
@@ -72,9 +73,8 @@ void MAIN {
         cb_reserve_back(out_cb_id, out_block_num_tiles);
         tile_regs_wait();
         uint32_t start_dst_index = 0;
-        pack_tile_block(start_dst_index, out_cb_id, out_block_num_tiles);
+        pack_block(start_dst_index, out_cb_id, out_block_num_tiles);
         tile_regs_release();
         cb_push_back(out_cb_id, out_block_num_tiles);
     }
 }
-}  // namespace NAMESPACE

@@ -1,14 +1,28 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+
+#include <optional>
 
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/mesh_device.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
 #include "program/program_impl.hpp"
+
+namespace tt::tt_metal {
+namespace distributed {
+class MeshWorkloadImpl;
+class MeshDevice;
+}  // namespace distributed
+
+namespace program_dispatch {
+// NOLINTNEXTLINE(readability-redundant-declaration)
+uint32_t program_base_addr_on_core(distributed::MeshWorkloadImpl&, distributed::MeshDevice*, HalProgrammableCoreType);
+}  // namespace program_dispatch
+}  // namespace tt::tt_metal
 
 namespace tt::tt_metal::distributed {
 using RuntimeArgsPerCore = std::vector<std::vector<RuntimeArgsData>>;
@@ -20,7 +34,7 @@ class MeshWorkloadImpl {
     // A MeshWorkload can be fully described using a set of programs mapped to different Logical Device Regions
     // in a Mesh + configurable runtime Args
     // The current iteration supports the following compute paradigms:
-    //  - Single Program Multi Device (Completely Homogenous MeshWorkload)
+    //  - Single Program Multi Device (Completely Homogeneous MeshWorkload)
     //  - Multi Program Multi Device (Completely Heterogeneous MeshWorkload)
     // Support for configurable runtime arguments will be added in future versions.
 private:
@@ -28,7 +42,6 @@ private:
 
     bool runs_on_noc_multicast_only_cores();
     bool runs_on_noc_unicast_only_cores();
-    void compile(MeshDevice* mesh_device);
     void load_binaries(MeshCommandQueue& mesh_cq);
     void generate_dispatch_commands(MeshCommandQueue& mesh_cq);
     std::unordered_map<KernelHandle, std::shared_ptr<Kernel>>& get_kernels(uint32_t programmable_core_type_index);
@@ -36,12 +49,11 @@ private:
     std::vector<Semaphore>& semaphores();
     std::vector<uint32_t> get_program_config_sizes();
     std::unordered_set<SubDeviceId> determine_sub_device_ids(MeshDevice* mesh_device);
-    bool kernel_binary_always_stored_in_ringbuffer();
     bool is_finalized() const { return this->finalized_; }
     void set_finalized() { this->finalized_ = true; };
     ProgramBinaryStatus get_program_binary_status(std::size_t mesh_id) const;
     void set_program_binary_status(std::size_t mesh_id, ProgramBinaryStatus status);
-    ProgramConfig& get_program_config(uint32_t index);
+    ProgramConfig& get_program_config(uint32_t index, bool using_fast_dispatch);
     ProgramCommandSequence& get_dispatch_cmds_for_program(Program& program, uint64_t command_hash);
     void compile_program(const MeshCoordinateRange& device_range, MeshDevice* mesh_device);
     void finalize_offsets(MeshDevice* mesh_device);
@@ -56,8 +68,15 @@ private:
     std::unordered_map<MeshCoordinateRange, std::unordered_map<KernelHandle, RuntimeArgsPerCore>> runtime_args_;
     MeshCommandQueue* last_used_command_queue_ = nullptr;
 
-    template <typename WorkloadType, typename DeviceType>
-    friend uint32_t program_dispatch::program_base_addr_on_core(WorkloadType&, DeviceType, HalProgrammableCoreType);
+    // Cached service-vs-normal classification (see EnqueueMeshWorkload), computed once and reused so
+    // re-enqueues skip the O(programs*coords*cores) no-mixing scan. nullopt = not yet classified.
+    // Classify-once holds because the classification depends only on core placement (fixed at build) and
+    // the claimed-core set (worker cores never become service cores, and service workloads are only
+    // re-enqueued onto still-claimed cores - which the dispatch path re-checks).
+    std::optional<bool> is_service_workload_;
+
+    friend uint32_t program_dispatch::program_base_addr_on_core(
+        MeshWorkloadImpl&, ::tt::tt_metal::distributed::MeshDevice*, HalProgrammableCoreType);
     friend void EnqueueMeshWorkload(MeshCommandQueue& mesh_cq, MeshWorkload& mesh_workload, bool blocking);
     friend FDMeshCommandQueue;
     friend class tt::tt_metal::Program;
@@ -75,6 +94,7 @@ public:
     void add_program(const MeshCoordinateRange& device_range, Program&& program);
     std::unordered_map<MeshCoordinateRange, Program>& get_programs() { return programs_; }
     const std::unordered_map<MeshCoordinateRange, Program>& get_programs() const { return programs_; }
+    void compile(MeshDevice* mesh_device);
 
     // For testing purposes only
     void set_last_used_command_queue_for_testing(MeshCommandQueue* mesh_cq);

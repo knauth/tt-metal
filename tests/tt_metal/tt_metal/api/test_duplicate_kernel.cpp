@@ -1,9 +1,9 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/core_descriptor.hpp>
+#include "llrt/core_descriptor.hpp"
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include <exception>
@@ -14,17 +14,15 @@
 #include <vector>
 
 #include "compile_program_with_kernel_path_env_var_fixture.hpp"
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/dispatch_core_common.hpp>
 #include "mesh_dispatch_fixture.hpp"
 #include <tt-metalium/distributed.hpp>
 #include "gtest/gtest.h"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/program.hpp>
-#include "umd/device/tt_core_coordinates.h"
-#include "umd/device/types/xy_pair.h"
-#include <tt-metalium/utils.hpp>
+#include <umd/device/types/core_coordinates.hpp>
+#include <umd/device/types/xy_pair.hpp>
 
 namespace tt::tt_metal {
 
@@ -32,25 +30,24 @@ using namespace tt;
 
 // Ensures we cannot create duplicate kernels
 TEST_F(MeshDispatchFixture, TensixFailOnDuplicateKernelCreationDataflow) {
-    for (unsigned int id = 0; id < this->devices_.size(); id++) {
-        std::shared_ptr<distributed::MeshDevice> mesh_device = this->devices_.at(id);
+    for (const auto& device : this->devices_) {
         distributed::MeshWorkload workload;
         auto zero_coord = distributed::MeshCoordinate(0, 0);
         auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
         tt_metal::Program program = CreateProgram();
-        distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+        workload.add_program(device_range, std::move(program));
         auto& program_ = workload.get_programs().at(device_range);
 
-        CoreCoord compute_grid = this->devices_.at(id)->compute_with_storage_grid_size();
+        CoreCoord compute_grid = device->compute_with_storage_grid_size();
         EXPECT_THROW(
             {
-                auto test_kernel1 = tt_metal::CreateKernel(
+                tt_metal::CreateKernel(
                     program_,
                     "tests/tt_metal/tt_metal/test_kernels/dataflow/dram_copy.cpp",
                     CoreRange(CoreCoord(0, 0), CoreCoord(compute_grid.x, compute_grid.y)),
                     DataMovementConfig{
                         .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = tt_metal::NOC::RISCV_0_default});
-                auto test_kernel2 = tt_metal::CreateKernel(
+                tt_metal::CreateKernel(
                     program_,
                     "tests/tt_metal/tt_metal/test_kernels/dataflow/dram_copy.cpp",
                     CoreRange(CoreCoord(0, 0), CoreCoord(compute_grid.x, compute_grid.y)),
@@ -62,20 +59,19 @@ TEST_F(MeshDispatchFixture, TensixFailOnDuplicateKernelCreationDataflow) {
 }
 
 TEST_F(MeshDispatchFixture, TensixFailOnDuplicateKernelCreationCompute) {
-    for (unsigned int id = 0; id < this->devices_.size(); id++) {
-        std::shared_ptr<distributed::MeshDevice> mesh_device = this->devices_.at(id);
+    for (const auto& device : this->devices_) {
         distributed::MeshWorkload workload;
         auto zero_coord = distributed::MeshCoordinate(0, 0);
         auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
         tt_metal::Program program = CreateProgram();
-        distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+        workload.add_program(device_range, std::move(program));
         auto& program_ = workload.get_programs().at(device_range);
 
-        CoreCoord compute_grid = this->devices_.at(id)->compute_with_storage_grid_size();
+        CoreCoord compute_grid = device->compute_with_storage_grid_size();
         std::vector<uint32_t> compute_kernel_args = {};
         EXPECT_THROW(
             {
-                auto test_kernel1 = tt_metal::CreateKernel(
+                tt_metal::CreateKernel(
                     program_,
                     "tests/tt_metal/tt_metal/test_kernels/compute/broadcast.cpp",
                     CoreRange(CoreCoord(0, 0), CoreCoord(compute_grid.x, compute_grid.y)),
@@ -85,7 +81,7 @@ TEST_F(MeshDispatchFixture, TensixFailOnDuplicateKernelCreationCompute) {
                         .math_approx_mode = false,
                         .compile_args = compute_kernel_args,
                         .opt_level = KernelBuildOptLevel::O3});
-                auto test_kernel2 = tt_metal::CreateKernel(
+                tt_metal::CreateKernel(
                     program_,
                     "tests/tt_metal/tt_metal/test_kernels/compute/matmul.cpp",
                     CoreRange(CoreCoord(0, 0), CoreCoord(compute_grid.x, compute_grid.y)),
@@ -101,18 +97,16 @@ TEST_F(MeshDispatchFixture, TensixFailOnDuplicateKernelCreationCompute) {
 }
 
 TEST_F(MeshDispatchFixture, TensixPassOnNormalKernelCreation) {
-    for (unsigned int id = 0; id < this->devices_.size(); id++) {
-        std::shared_ptr<distributed::MeshDevice> mesh_device = this->devices_.at(id);
+    for ([[maybe_unused]] const auto& mesh_device : this->devices_) {
         distributed::MeshWorkload workload;
         auto zero_coord = distributed::MeshCoordinate(0, 0);
         auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
         tt_metal::Program program = CreateProgram();
-        distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+        workload.add_program(device_range, std::move(program));
         auto& program_ = workload.get_programs().at(device_range);
-        CoreCoord compute_grid = this->devices_.at(id)->compute_with_storage_grid_size();
         std::vector<uint32_t> compute_kernel_args = {};
         EXPECT_NO_THROW({
-            auto test_kernel1 = tt_metal::CreateKernel(
+            tt_metal::CreateKernel(
                 program_,
                 "tests/tt_metal/tt_metal/test_kernels/compute/broadcast.cpp",
                 CoreCoord(1, 0),
@@ -122,7 +116,7 @@ TEST_F(MeshDispatchFixture, TensixPassOnNormalKernelCreation) {
                     .math_approx_mode = false,
                     .compile_args = compute_kernel_args,
                     .opt_level = KernelBuildOptLevel::O3});
-            auto test_kernel2 = tt_metal::CreateKernel(
+            tt_metal::CreateKernel(
                 program_,
                 "tests/tt_metal/tt_metal/test_kernels/compute/matmul.cpp",
                 CoreCoord(0, 0),
@@ -137,24 +131,23 @@ TEST_F(MeshDispatchFixture, TensixPassOnNormalKernelCreation) {
 }
 
 TEST_F(MeshDispatchFixture, TensixPassOnMixedOverlapKernelCreation) {
-    for (unsigned int id = 0; id < this->devices_.size(); id++) {
-        std::shared_ptr<distributed::MeshDevice> mesh_device = this->devices_.at(id);
+    for (const auto& device : this->devices_) {
         distributed::MeshWorkload workload;
         auto zero_coord = distributed::MeshCoordinate(0, 0);
         auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
         tt_metal::Program program = CreateProgram();
-        distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+        workload.add_program(device_range, std::move(program));
         auto& program_ = workload.get_programs().at(device_range);
-        CoreCoord compute_grid = this->devices_.at(id)->compute_with_storage_grid_size();
+        CoreCoord compute_grid = device->compute_with_storage_grid_size();
         std::vector<uint32_t> compute_kernel_args = {};
         EXPECT_NO_THROW({
-            auto test_kernel1 = tt_metal::CreateKernel(
+            tt_metal::CreateKernel(
                 program_,
                 "tests/tt_metal/tt_metal/test_kernels/dataflow/dram_copy.cpp",
                 CoreRange(CoreCoord(0, 0), CoreCoord(compute_grid.x, compute_grid.y)),
                 DataMovementConfig{
                     .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = tt_metal::NOC::RISCV_0_default});
-            auto test_kernel2 = tt_metal::CreateKernel(
+            tt_metal::CreateKernel(
                 program_,
                 "tests/tt_metal/tt_metal/test_kernels/compute/matmul.cpp",
                 CoreRange(CoreCoord(0, 0), CoreCoord(compute_grid.x, compute_grid.y)),

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,6 +9,7 @@ import torch
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.tt_transformers.tt.common import RopeScaling, gather_cos_sin, get_rot_transformation_mat, precompute_freqs
+from models.tt_transformers.tt.prefetcher import Prefetcher
 from ttnn import ReplicateTensorToMesh, ShardTensor2dMesh
 
 
@@ -26,11 +27,14 @@ class RotarySetup(LightweightModule):
         max_seq_len: int,
         rope_theta: float,
         rope_scaling: Optional[RopeScaling],
+        use_qk_fused: bool = False,  # For Qwen2.5 VL, we do not use qk fused ops (rotary embedding + paged cache update)
         datatype=ttnn.bfloat16,
+        prefetcher: Optional[Prefetcher] = None,
     ):
         super().__init__()
 
         self.batch_size = batch_size
+        self.rope_deltas = torch.zeros(batch_size, dtype=torch.int32)
         self.head_dim = head_dim
         self.device = device
         self.is_mesh_device = isinstance(device, ttnn._ttnn.multi_device.MeshDevice)
@@ -43,7 +47,7 @@ class RotarySetup(LightweightModule):
         self.datatype = datatype
 
         # Generate the cos/sin matrices needed for ttnn.embedding op
-        cos_matrix, sin_matrix = compute_gather_cos_sin(
+        self.cos_matrix_pt, self.sin_matrix_pt = compute_gather_cos_sin(
             dhead=head_dim,
             end=max_seq_len * 2,
             theta=rope_theta,
@@ -51,8 +55,7 @@ class RotarySetup(LightweightModule):
             orig_context_len=rope_scaling.original_max_position_embeddings if rope_scaling is not None else None,
             position_ids=torch.arange(max_seq_len),
         )
-
-        self.set_cos_sin(cos_matrix, sin_matrix)
+        self.setup_cos_sin()
 
         self.batch_grid = (
             ttnn.CoreGrid(y=4, x=8)
@@ -102,45 +105,48 @@ class RotarySetup(LightweightModule):
             mesh_mapper=ReplicateTensorToMesh(device) if self.is_mesh_device else None,
         )
 
-    def set_cos_sin(self, cos_matrix, sin_matrix):
-        # [INFO] we avoid re-allocating the cos_matrix and sin_matrix tensors to allow for correct processing of captured trace
-        if hasattr(self, "cos_matrix"):
-            assert (
-                cos_matrix.shape == self.cos_matrix.shape
-            ), "cos_matrix must be the same size as the existing cos_matrix"
-            assert (
-                sin_matrix.shape == self.sin_matrix.shape
-            ), "sin_matrix must be the same size as the existing sin_matrix"
+    def update_cos_sin(self, cos_matrix_pt=None, sin_matrix_pt=None):
+        if cos_matrix_pt is not None:
+            self.cos_matrix_pt.copy_(cos_matrix_pt)
+        if sin_matrix_pt is not None:
+            self.sin_matrix_pt.copy_(sin_matrix_pt)
 
-            for mat, mat_tt in zip((cos_matrix, sin_matrix), (self.cos_matrix, self.sin_matrix)):
-                mat = ttnn.from_torch(
-                    mat,
-                    device=None,
-                    layout=ttnn.TILE_LAYOUT,
-                    dtype=self.datatype,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
-                )
-                mat = ttnn.unsqueeze_to_4D(mat)
-                ttnn.copy_host_to_device_tensor(mat, mat_tt)
-        else:
-            # [INFO] tt-transformers RotarySetup uses a single cos_matrix and sin_matrix for all batches
-            assert (
-                cos_matrix.shape[0] == 1 and sin_matrix.shape[0] == 1
-            ), "Init values of cos_matrix and sin_matrix must have batch size 1"
-            for mat, attr_name in zip((cos_matrix, sin_matrix), ("cos_matrix", "sin_matrix")):
-                setattr(
-                    self,
-                    attr_name,
+        # [INFO] we avoid re-allocating the cos_matrix and sin_matrix tensors to allow for correct processing of captured trace
+        assert hasattr(self, "cos_matrix")
+        assert hasattr(self, "sin_matrix")
+        assert (
+            self.cos_matrix_pt.shape == self.cos_matrix.shape
+        ), "cos_matrix must be the same size as the existing cos_matrix"
+        assert (
+            self.sin_matrix_pt.shape == self.sin_matrix.shape
+        ), "sin_matrix must be the same size as the existing sin_matrix"
+        for mat, mat_tt in zip((self.cos_matrix_pt, self.sin_matrix_pt), (self.cos_matrix, self.sin_matrix)):
+            ttnn.copy_host_to_device_tensor(
+                ttnn.unsqueeze_to_4D(
                     ttnn.from_torch(
-                        mat.expand(
-                            self.batch_size, -1, -1, -1
-                        ),  # [INFO] Qwen2.5 VL produces cos and sin matrices with shape [batch_size, 1, seq_len, head_dim]
-                        device=self.device,
+                        mat,
+                        device=None,
                         layout=ttnn.TILE_LAYOUT,
                         dtype=self.datatype,
                         mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
-                    ),
-                )
+                    )
+                ),
+                mat_tt,
+            )
+
+    def setup_cos_sin(self):
+        for mat, attr_name in zip((self.cos_matrix_pt, self.sin_matrix_pt), ("cos_matrix", "sin_matrix")):
+            setattr(
+                self,
+                attr_name,
+                ttnn.from_torch(
+                    mat,
+                    device=self.device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=self.datatype,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.device),
+                ),
+            )
 
     def get_rot_idxs(self, position_idxs, on_host=False):
         assert isinstance(position_idxs, torch.Tensor), "Position ids must be a torch tensor"
@@ -149,14 +155,14 @@ class RotarySetup(LightweightModule):
 
         if on_host:  # If tensor is on host, don't pass a mesh mapper if single-device
             rot_idxs = ttnn.as_tensor(
-                position_idxs,
+                position_idxs + self.rope_deltas,
                 dtype=ttnn.uint32,
                 layout=ttnn.ROW_MAJOR_LAYOUT,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(self.device) if self.is_mesh_device else None,
             )
         else:  # On device
             rot_idxs = ttnn.as_tensor(
-                position_idxs,
+                position_idxs + self.rope_deltas,
                 dtype=ttnn.uint32,
                 layout=ttnn.ROW_MAJOR_LAYOUT,
                 device=self.device,
@@ -174,23 +180,14 @@ class RotarySetup(LightweightModule):
         assert position_idxs.device != device, "rot_idxs must be on device"
 
         # [INFO] Qwen2.5 VL produces cos and sin matrices with shape [batch_size, 1, seq_len, head_dim]
-        # todo)) { Optimize the slicing work-around below
         assert len(position_idxs.shape) == 1, "position_idxs must be a [batch] tensor"
-        batch_size = position_idxs.shape[0]
-        cos, sin = None, None
-        for i in range(batch_size):
-            # [INFO] This is a work-around to avoid the slicing issue in position_idxs[i:i+1]
-            # todo)) this workaround can be removed after pulling changes from `main` --> the bug is fixed there
-            pos_i = ttnn.squeeze(ttnn.reshape(position_idxs, (batch_size, 1))[i : i + 1], dim=-1)
-            cos_i = ttnn.embedding(pos_i, self.cos_matrix[i : i + 1, ...])  # [1, head_dim]
-            sin_i = ttnn.embedding(pos_i, self.sin_matrix[i : i + 1, ...])  # [1, head_dim]
 
-            cos = cos_i if cos is None else ttnn.concat([cos, cos_i], dim=0)  # towards [batch_size, head_dim]
-            sin = sin_i if sin is None else ttnn.concat([sin, sin_i], dim=0)  # towards [batch_size, head_dim]
+        # Reshape from [batch] to [1, batch] for batched embedding
+        rot_idxs = ttnn.reshape(position_idxs, (1, position_idxs.shape[0]))
 
-        cos = ttnn.to_layout(cos, ttnn.TILE_LAYOUT)
-        sin = ttnn.to_layout(sin, ttnn.TILE_LAYOUT)
-        # } todo))
+        # Single batched embedding call instead of loop - much more efficient
+        cos = ttnn.embedding(rot_idxs, self.cos_matrix, layout=ttnn.TILE_LAYOUT)  # [1, batch, head_dim]
+        sin = ttnn.embedding(rot_idxs, self.sin_matrix, layout=ttnn.TILE_LAYOUT)  # [1, batch, head_dim]
 
         cos = ttnn.unsqueeze_to_4D(cos)  # [1, 1, batch_size, head_dim]
         sin = ttnn.unsqueeze_to_4D(sin)  # [1, 1, batch_size, head_dim]

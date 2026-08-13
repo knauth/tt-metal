@@ -1,16 +1,16 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
 
 #include <array>
-#include <core/ttnn_all_includes.hpp>
 
 #include "autograd/auto_context.hpp"
 #include "core/device.hpp"
-#include "core/random.hpp"
 #include "core/tt_tensor_utils.hpp"
+#include "test_utils/random_data.hpp"
+#include "ttnn/operations/experimental/dropout/dropout.hpp"
 #include "ttnn_fixed/trivial_ttnn_ops.hpp"
 
 class DropoutTest : public ::testing::Test {
@@ -35,13 +35,9 @@ TEST_F(DropoutTest, TestSeed) {
     auto shapes = {std::vector<int>{64, 1, 256, 384}, std::vector<int>{1, 1, 32, 32}};
     for (auto& shape : shapes) {
         fmt::println("Testing shape: {}", shape);
-        xt::xarray<float> xtensor_a = xt::empty<float>(shape);
         auto& rng = ttml::autograd::ctx().get_generator();
         uint32_t seed = rng();
-        ttml::core::parallel_generate(
-            std::span{xtensor_a.data(), xtensor_a.size()},
-            []() { return std::uniform_real_distribution<float>(-0.5f, 0.5f); },
-            seed);
+        xt::xarray<float> xtensor_a = ttml::test_utils::make_uniform_xarray<float>(shape, -0.5F, 0.5F, seed);
 
         auto xtensor_a_tensor = ttml::core::from_xtensor(xtensor_a, device);
         auto num_cache_before = device->num_program_cache_entries();
@@ -85,27 +81,8 @@ TEST_F(DropoutTest, TestProb) {
     EXPECT_NEAR(std_ratio, 0.05, 0.05);
 }
 
-namespace {
-xt::xarray<float> golden_dropout(
-    const xt::xarray<float>& input, float p = 0.5f, bool scale = true, uint64_t seed = 42ULL) {
-    // 1) Create a random engine seeded for reproducibility
-    std::mt19937_64 rng(seed);
-
-    auto rand_vals = xt::empty<float>(input.shape());
-    ttml::core::parallel_generate(
-        std::span{rand_vals.data(), rand_vals.size()},
-        []() { return std::uniform_real_distribution<float>(0.0f, 1.0f); },
-        seed);
-    auto mask = xt::cast<float>(rand_vals >= p);
-
-    float scale_factor = (scale && (1.0f - p) > 1e-7f) ? (1.0f / (1.0f - p)) : 1.0f;
-    auto output = input * mask * scale_factor;
-
-    return output;
-}
-}  // namespace
-
 TEST_F(DropoutTest, TestKeepRatioApproximatelyNormal) {
+    // TODO: Enable once RNG is improved. Tracking issue: https://github.com/tenstorrent/tt-metal/issues/38149
     GTEST_SKIP() << "Currently random number generator using in the WH is not perfect. This Test show that "
                     "distribution is not normal.";
     // -------------------------------------------------------------------

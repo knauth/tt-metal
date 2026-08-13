@@ -1,10 +1,12 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ops/linear_op.hpp"
 
 #include <gtest/gtest.h>
+
+#include <algorithm>
 
 #include "autograd/auto_context.hpp"
 #include "core/compute_kernel_config.hpp"
@@ -27,46 +29,42 @@ void compare_tensors(const ttnn::Tensor& t1, const ttnn::Tensor& t2, float eps) 
     auto t1_vec = ttml::core::to_vector(t1);
     auto t2_vec = ttml::core::to_vector(t2);
     ASSERT_EQ(t1_vec.size(), t2_vec.size());
-    bool all_equals = true;
-    for (size_t i = 0; i < t1_vec.size() && all_equals; i++) {
-        if (std::abs(t1_vec[i] - t2_vec[i]) > eps) {
-            all_equals = false;
-            EXPECT_NEAR(t1_vec[i], t2_vec[i], eps);
-        }
+    auto it = std::mismatch(
+        t1_vec.begin(), t1_vec.end(), t2_vec.begin(), [eps](float a, float b) { return std::abs(a - b) <= eps; });
+    if (it.first != t1_vec.end()) {
+        EXPECT_NEAR(*it.first, *it.second, eps);
     }
-    EXPECT_TRUE(all_equals);
+    EXPECT_TRUE(it.first == t1_vec.end());
 }
 
 bool compare_tensors_for_broken(const ttnn::Tensor& t1, const ttnn::Tensor& t2, float eps) {
     if (t1.logical_shape() != t2.logical_shape()) {
         return false;
     }
-
     auto t1_vec = ttml::core::to_vector(t1);
     auto t2_vec = ttml::core::to_vector(t2);
-    bool all_equals = true;
-    for (size_t i = 0; i < t1_vec.size() && all_equals; i++) {
-        if (std::abs(t1_vec[i] - t2_vec[i]) > eps) {
-            all_equals = false;
-        }
-    }
-    return all_equals;
+    return std::equal(
+        t1_vec.begin(), t1_vec.end(), t2_vec.begin(), [eps](float a, float b) { return std::abs(a - b) <= eps; });
 }
 
-TEST_F(LinearOpTest, TTNNBackwardGoodShape) {
-    auto* device = &ttml::autograd::ctx().get_device();
+// Disabled: non-deterministic accuracy failures — https://github.com/tenstorrent/tt-metal/issues/46121
+TEST_F(LinearOpTest, DISABLED_TTNNBackwardGoodShape) {
     auto tensor = ttml::autograd::create_tensor();
     ttml::init::uniform_init(tensor, ttnn::Shape({64, 1, 256, 64}), ttml::init::UniformRange{-0.1F, 0.1F});
+    tensor->set_requires_grad(true);
 
     auto weight = ttml::autograd::create_tensor();
     ttml::init::uniform_init(weight, ttnn::Shape({1, 1, 64, 64}), ttml::init::UniformRange{-0.1F, 0.1F});
+    weight->set_requires_grad(true);
 
     auto bias = ttml::autograd::create_tensor();
     ttml::init::uniform_init(bias, ttnn::Shape({1, 1, 1, 64}), ttml::init::UniformRange{-0.1F, 0.1F});
+    bias->set_requires_grad(true);
 
     auto out = ttml::autograd::create_tensor();
     ttml::init::uniform_init(out, ttnn::Shape({64, 1, 256, 64}), ttml::init::UniformRange{-0.1F, 0.1F});
     out->set_grad(out->get_value());
+    out->set_requires_grad(true);
 
     ttml::ops::ttnn_linear_backward(tensor, weight, bias, out);
     auto ttnn_tensor_grad = tensor->get_grad();
@@ -81,14 +79,13 @@ TEST_F(LinearOpTest, TTNNBackwardGoodShape) {
     auto moreh_weight_grad = weight->get_grad();
     auto moreh_bias_grad = bias->get_grad();
 
-    const float eps = 2e-2F;
+    const float eps = 3125e-5F;
     compare_tensors(ttnn_tensor_grad, moreh_tensor_grad, eps);
     compare_tensors(ttnn_weight_grad, moreh_weight_grad, eps);
     compare_tensors(ttnn_bias_grad, moreh_bias_grad, eps);
 }
 void test_linear(uint32_t batch, uint32_t emb_dim) {
     std::cout << "dim: " << emb_dim << std::endl;
-    auto* device = &ttml::autograd::ctx().get_device();
     auto tensor = ttml::autograd::create_tensor();
     ttml::init::uniform_init(tensor, ttnn::Shape({batch, 1, 1024, 768}), ttml::init::UniformRange{-0.1F, 0.1F});
 

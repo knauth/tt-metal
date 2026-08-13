@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -17,24 +17,29 @@
 #include "c_tensix_core.h"
 #include "tdma_xmov.h"
 #include "noc_nonblocking_api.h"
-#include "firmware_common.h"
+#include "internal/firmware_common.h"
 #include "tools/profiler/kernel_profiler.hpp"
-#include "dev_msgs.h"
-#include "risc_attribs.h"
-#include "circular_buffer.h"
-#include "circular_buffer_init.h"
-#include "dataflow_api.h"
+#include "tools/profiler/perf_counters.hpp"
+#include "hostdev/dev_msgs.h"
+#include "internal/risc_attribs.h"
+#include "internal/circular_buffer_interface.h"
+#include "internal/circular_buffer_init.h"
+#include "internal/hw_thread.h"
 #include "dev_mem_map.h"
 #include "noc_overlay_parameters.h"
 
-#include "debug/watcher_common.h"
-#include "debug/waypoint.h"
-#include "debug/dprint.h"
-#include "debug/stack_usage.h"
+#include "internal/debug/watcher_common.h"
+#include "api/debug/waypoint.h"
+#include "api/debug/dprint.h"
+#include "api/debug/device_print.h"
+#include "internal/debug/stack_usage.h"
+#include "api/debug/checkpoint.h"
 
 // clang-format on
 
+// Global so triage can see these values.
 uint8_t noc_index;
+uint8_t noc_mode = DM_DEDICATED_NOC;
 
 constexpr uint32_t RISCV_IC_BRISC_MASK = 0x1;
 constexpr uint32_t RISCV_IC_NCRISC_MASK = 0x10;
@@ -44,6 +49,7 @@ constexpr uint32_t RISCV_IC_TRISC2_MASK = 0x8;
 constexpr uint32_t RISCV_IC_TRISC_ALL_MASK = RISCV_IC_TRISC0_MASK | RISCV_IC_TRISC1_MASK | RISCV_IC_TRISC2_MASK;
 
 tt_l1_ptr mailboxes_t* const mailboxes = (tt_l1_ptr mailboxes_t*)(MEM_MAILBOX_BASE);
+tt_l1_ptr subordinate_map_t* const subordinate_sync = (subordinate_map_t*)mailboxes->subordinate_sync.map;
 
 c_tensix_core core;
 
@@ -70,12 +76,23 @@ uint32_t tt_l1_ptr* rta_l1_base __attribute__((used));
 uint32_t tt_l1_ptr* crta_l1_base __attribute__((used));
 uint32_t tt_l1_ptr* sem_l1_base[ProgrammableCoreType::COUNT] __attribute__((used));
 
+#if defined(WATCHER_ENABLED) && !defined(WATCHER_DISABLE_ASSERT)
+uint32_t rta_count __attribute__((used));
+uint32_t crta_count __attribute__((used));
+#endif
+
 // These arrays are stored in local memory of FW, but primarily used by the kernel which shares
 // FW symbols. Hence mark these as 'used' so that FW compiler doesn't optimize it out.
-uint16_t dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] __attribute__((used));
-uint16_t l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS] __attribute__((used));
+bank_noc_xy_t dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] __attribute__((used));
+bank_noc_xy_t l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS] __attribute__((used));
 int32_t bank_to_dram_offset[NUM_DRAM_BANKS] __attribute__((used));
 int32_t bank_to_l1_offset[NUM_L1_BANKS] __attribute__((used));
+uint8_t prev_noc_mode = DM_DEDICATED_NOC;
+
+// These arrays are used to store the worker logical to virtual coordinate mapping
+// Round up to nearest multiple of 4 to ensure uint32_t alignment for L1 to local copies
+uint8_t worker_logical_col_to_virtual_col[round_up_to_mult_of_4(noc_size_x)] __attribute__((used));
+uint8_t worker_logical_row_to_virtual_row[round_up_to_mult_of_4(noc_size_y)] __attribute__((used));
 
 #define MEM_MOVER_VIEW_IRAM_BASE_ADDR (0x4 << 12)
 
@@ -162,8 +179,6 @@ void enable_power_management() {
 }
 
 void set_deassert_addresses() {
-    volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
-
 #ifdef ARCH_BLACKHOLE
     WRITE_REG(RISCV_DEBUG_REG_NCRISC_RESET_PC, MEM_NCRISC_FIRMWARE_BASE);
     WRITE_REG(RISCV_DEBUG_REG_TRISC0_RESET_PC, MEM_TRISC0_FIRMWARE_BASE);
@@ -172,6 +187,8 @@ void set_deassert_addresses() {
     WRITE_REG(RISCV_DEBUG_REG_TRISC_RESET_PC_OVERRIDE, 0b111);
     WRITE_REG(RISCV_DEBUG_REG_NCRISC_RESET_PC_OVERRIDE, 0x1);
 #else
+    volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
+
     cfg_regs[NCRISC_RESET_PC_PC_ADDR32] = MEM_NCRISC_FIRMWARE_BASE;
     cfg_regs[TRISC_RESET_PC_SEC0_PC_ADDR32] = MEM_TRISC0_FIRMWARE_BASE;
     cfg_regs[TRISC_RESET_PC_SEC1_PC_ADDR32] = MEM_TRISC1_FIRMWARE_BASE;
@@ -251,43 +268,43 @@ void device_setup() {
 
 inline void deassert_ncrisc_trisc() {
     // Below sets ncrisc to go so we can wait until it is cleared on first iteration
-    mailboxes->subordinate_sync.all = RUN_SYNC_MSG_ALL_INIT;
+    subordinate_sync->all = RUN_SYNC_MSG_ALL_INIT;
 
     // Bring ncrisc/triscs out of reset
     deassert_all_reset();
 }
 
-inline void run_triscs(dispatch_core_processor_masks enables) {
+inline void run_triscs(uint32_t enables) {
     // Wait for init_sync_registers to complete. Should always be done by the time we get here.
-    while (mailboxes->subordinate_sync.trisc0 != RUN_SYNC_MSG_DONE) {
+    while (subordinate_sync->trisc0 != RUN_SYNC_MSG_DONE) {
         invalidate_l1_cache();
     }
 
-    if (enables & DISPATCH_CLASS_MASK_TENSIX_ENABLE_COMPUTE) {
-        mailboxes->subordinate_sync.trisc0 = RUN_SYNC_MSG_GO;
-        mailboxes->subordinate_sync.trisc1 = RUN_SYNC_MSG_GO;
-        mailboxes->subordinate_sync.trisc2 = RUN_SYNC_MSG_GO;
+    if (enables & (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::MATH0))) {
+        subordinate_sync->trisc0 = RUN_SYNC_MSG_GO;
+        subordinate_sync->trisc1 = RUN_SYNC_MSG_GO;
+        subordinate_sync->trisc2 = RUN_SYNC_MSG_GO;
     }
 }
 
-inline void start_ncrisc_kernel_run_early(dispatch_core_processor_masks enables) {
+inline void start_ncrisc_kernel_run_early(uint32_t enables) {
     // On Wormhole, start_ncrisc_kernel_run will reset NCRISC to start the
     // kernel running. We delay it until later to give the NCRISC time to load
     // CBs before we wait on it.
 #if !defined(ARCH_WORMHOLE)
-    if (enables & DISPATCH_CLASS_MASK_TENSIX_ENABLE_DM1) {
-        mailboxes->subordinate_sync.dm1 = RUN_SYNC_MSG_GO;
+    if (enables & (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
+        subordinate_sync->dm1 = RUN_SYNC_MSG_GO;
     }
 #endif
 }
 
-inline void start_ncrisc_kernel_run(dispatch_core_processor_masks enables) {
+inline void start_ncrisc_kernel_run(uint32_t enables) {
 #if defined(ARCH_WORMHOLE)
-    if (enables & DISPATCH_CLASS_MASK_TENSIX_ENABLE_DM1) {
+    if (enables & (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
         // The NCRISC behaves badly if it jumps from L1 to IRAM, so instead halt it and then reset it to the IRAM
         // address it provides.
-        while (mailboxes->subordinate_sync.dm1 != RUN_SYNC_MSG_WAITING_FOR_RESET);
-        mailboxes->subordinate_sync.dm1 = RUN_SYNC_MSG_GO;
+        while (subordinate_sync->dm1 != RUN_SYNC_MSG_WAITING_FOR_RESET);
+        subordinate_sync->dm1 = RUN_SYNC_MSG_GO;
         volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
         cfg_regs[NCRISC_RESET_PC_PC_ADDR32] = mailboxes->ncrisc_halt.resume_addr;
         assert_just_ncrisc_reset();
@@ -302,7 +319,7 @@ inline void start_ncrisc_kernel_run(dispatch_core_processor_masks enables) {
 
 inline void wait_ncrisc_trisc() {
     WAYPOINT("NTW");
-    while (mailboxes->subordinate_sync.all != RUN_SYNC_MSG_ALL_SUBORDINATES_DONE) {
+    while (subordinate_sync->all != RUN_SYNC_MSG_ALL_SUBORDINATES_DONE) {
 #if defined(ARCH_WORMHOLE)
         // Avoid hammering L1 while other cores are trying to work. Seems not to
         // be needed on Blackhole, probably because invalidate_l1_cache takes
@@ -314,13 +331,22 @@ inline void wait_ncrisc_trisc() {
     WAYPOINT("NTD");
 }
 
-inline void trigger_sync_register_init() { mailboxes->subordinate_sync.trisc0 = RUN_SYNC_MSG_INIT_SYNC_REGISTERS; }
+inline void trigger_sync_register_init() { subordinate_sync->trisc0 = RUN_SYNC_MSG_INIT_SYNC_REGISTERS; }
 
-inline void barrier_remote_cb_interface_setup(uint8_t noc_index, uint32_t end_cb_index) {
+inline void barrier_remote_cb_interface_setup(uint8_t noc_index, uint32_t noc_mode, uint32_t end_cb_index) {
 #if defined(ARCH_BLACKHOLE)
     // cq_dispatch does not update noc transaction counts so skip this barrier on the dispatch core
     if (end_cb_index != NUM_CIRCULAR_BUFFERS) {
-        noc_async_atomic_barrier(noc_index);
+        WAYPOINT("NABW");
+        if (noc_mode == DM_DYNAMIC_NOC) {
+            do {
+                invalidate_l1_cache();
+            } while (!ncrisc_dynamic_noc_nonposted_atomics_flushed(noc_index));
+        } else {
+            while (!ncrisc_noc_nonposted_atomics_flushed(noc_index));
+        }
+        invalidate_l1_cache();
+        WAYPOINT("NABD");
     }
 #endif
 }
@@ -332,6 +358,7 @@ int main() {
     do_crt1((uint32_t*)MEM_BRISC_INIT_LOCAL_L1_BASE_SCRATCH);
 
     noc_bank_table_init(MEM_BANK_TO_NOC_SCRATCH);
+    noc_worker_logical_to_virtual_map_init(MEM_LOGICAL_TO_VIRTUAL_SCRATCH);
 
     mailboxes->launch_msg_rd_ptr = 0;  // Initialize the rdptr to 0
     noc_index = 0;
@@ -340,6 +367,7 @@ int main() {
 
     risc_init();
     device_setup();
+    DEVICE_PRINT_INITIALIZE_LOCK();
 
     // Set ncrisc's resume address to 0 so we know when ncrisc has overwritten it
     mailboxes->ncrisc_halt.resume_addr = 0;
@@ -352,10 +380,9 @@ int main() {
     // Initialize the NoCs to a safe state
     // This ensures if we send any noc txns without running a kernel setup are valid
     // ex. Immediately after starting, we send a RUN_MSG_RESET_READ_PTR signal
-    uint8_t noc_mode;
     noc_init(MEM_NOC_ATOMIC_RET_VAL_ADDR);
     noc_local_state_init(noc_index);
-    uint8_t prev_noc_mode = DM_DEDICATED_NOC;
+    noc_clear_all_packet_tags();
     trigger_sync_register_init();
 
     DeviceProfilerInit();
@@ -374,11 +401,15 @@ int main() {
             // While the go signal for kernel execution is not sent, check if the worker was signalled
             // to reset its launch message read pointer.
             if ((go_message_signal == RUN_MSG_RESET_READ_PTR) ||
-                (go_message_signal == RUN_MSG_RESET_READ_PTR_FROM_HOST)) {
+                (go_message_signal == RUN_MSG_RESET_READ_PTR_FROM_HOST) ||
+                (go_message_signal == RUN_MSG_REPLAY_TRACE)) {
                 // Set the rd_ptr on workers to specified value
                 mailboxes->launch_msg_rd_ptr = 0;
-                if (go_message_signal == RUN_MSG_RESET_READ_PTR) {
-                    DeviceTraceProfilerInit();
+                if (go_message_signal == RUN_MSG_RESET_READ_PTR || go_message_signal == RUN_MSG_REPLAY_TRACE) {
+                    if (go_message_signal == RUN_MSG_REPLAY_TRACE) {
+                        DeviceIncrementTraceCount();
+                        DeviceTraceOnlyProfilerInit();
+                    }
                     uint32_t go_message_index = mailboxes->go_message_index;
                     // Querying the noc_index is safe here, since the RUN_MSG_RESET_READ_PTR go signal is currently
                     // guaranteed to only be seen after a RUN_MSG_GO signal, which will set the noc_index to a valid
@@ -404,20 +435,24 @@ int main() {
             launch_msg_t* launch_msg_address = &(mailboxes->launch[launch_msg_rd_ptr]);
             DeviceValidateProfiler(launch_msg_address->kernel_config.enables);
             DeviceZoneSetCounter(launch_msg_address->kernel_config.host_assigned_id);
-            enum dispatch_core_processor_masks enables =
-                (enum dispatch_core_processor_masks)launch_msg_address->kernel_config.enables;
+
+            uint32_t enables = launch_msg_address->kernel_config.enables;
             // Trigger the NCRISC to start loading CBs and IRAM as soon as possible.
-            if (enables & DISPATCH_CLASS_MASK_TENSIX_ENABLE_DM1) {
-                mailboxes->subordinate_sync.dm1 = RUN_SYNC_MSG_LOAD;
+            if (enables &
+                (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
+                subordinate_sync->dm1 = RUN_SYNC_MSG_LOAD;
             }
             // Copies from L1 to IRAM on chips where NCRISC has IRAM
             uint32_t kernel_config_base =
-                firmware_config_init(mailboxes, ProgrammableCoreType::TENSIX, DISPATCH_CLASS_TENSIX_DM0);
+                firmware_config_init(mailboxes, ProgrammableCoreType::TENSIX, internal_::get_hw_thread_idx());
             // Invalidate the i$ now the kernels have loaded and before running
             volatile tt_reg_ptr uint32_t* cfg_regs = core.cfg_regs_base(0);
             cfg_regs[RISCV_IC_INVALIDATE_InvalidateAll_ADDR32] =
                 RISCV_IC_BRISC_MASK | RISCV_IC_TRISC_ALL_MASK | RISCV_IC_NCRISC_MASK;
 
+#ifdef DEBUG_CHECKPOINT_ENABLED
+            debug_checkpoint_init(enables);
+#endif
             run_triscs(enables);
 
             noc_index = launch_msg_address->kernel_config.brisc_noc_id;
@@ -451,17 +486,32 @@ int main() {
 
             // Run the BRISC kernel
             WAYPOINT("R");
-            if (enables & DISPATCH_CLASS_MASK_TENSIX_ENABLE_DM0) {
-                uint32_t local_cb_mask = launch_msg_address->kernel_config.local_cb_mask;
-                setup_local_cb_read_write_interfaces<true, true, false>(cb_l1_base, 0, local_cb_mask);
+            int index = static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM0);
+            if (enables & (1u << index)) {
+                // Split 64-bit CB mask into 32-bit halves for efficient RISC-V processing
+                // Wormhole: lower half only (TRISC memory constraint), Blackhole: both halves
+
+#if defined(WATCHER_ENABLED) && !defined(WATCHER_DISABLE_CB_SANITIZE)
+                // Zero all CB interfaces so stale entries from previous programs
+                // don't cause false positives in the CB sanitize check.
+                for (uint32_t i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
+                    get_local_cb_interface(i).fifo_size = 0;
+                }
+#endif
+                uint64_t local_cb_mask = launch_msg_address->kernel_config.local_cb_mask;
+                uint32_t local_cb_mask_low = static_cast<uint32_t>(local_cb_mask & 0xFFFFFFFFULL);
+                setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
+#ifdef ARCH_BLACKHOLE
+                uint32_t local_cb_mask_upper = static_cast<uint32_t>(local_cb_mask >> 32);
+                setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 32, local_cb_mask_upper);
+#endif
                 cb_l1_base =
                     (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg_address->kernel_config.remote_cb_offset);
                 uint32_t end_cb_index = launch_msg_address->kernel_config.min_remote_cb_start_index;
                 experimental::setup_remote_cb_interfaces<true>(
                     cb_l1_base, end_cb_index, noc_index, noc_mode, true, cmd_buf);
-                barrier_remote_cb_interface_setup(noc_index, end_cb_index);
+                barrier_remote_cb_interface_setup(noc_index, noc_mode, end_cb_index);
                 start_ncrisc_kernel_run(enables);
-                int index = static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM0);
                 uint32_t kernel_lma =
                     (kernel_config_base + launch_msg_address->kernel_config.kernel_text_offset[index]);
                 auto stack_free = reinterpret_cast<uint32_t (*)()>(kernel_lma)();
@@ -482,7 +532,7 @@ int main() {
                     uint32_t end_cb_index = launch_msg_address->kernel_config.min_remote_cb_start_index;
                     experimental::setup_remote_cb_interfaces<true>(
                         cb_l1_base, end_cb_index, noc_index, noc_mode, true, cmd_buf);
-                    barrier_remote_cb_interface_setup(noc_index, end_cb_index);
+                    barrier_remote_cb_interface_setup(noc_index, noc_mode, end_cb_index);
                 }
                 start_ncrisc_kernel_run(enables);
                 wait_for_go_message();
@@ -491,19 +541,24 @@ int main() {
 
             wait_ncrisc_trisc();
 
+            // BRISC reads perf counters after TRISCs finish (BRISC has NOC access for DRAM push).
+            ReadPerfCounters();
+
             trigger_sync_register_init();
 
-            if constexpr (WATCHER_ASSERT_ENABLED) {
+            if constexpr (ASSERT_ENABLED) {
                 if (noc_mode == DM_DYNAMIC_NOC) {
                     WAYPOINT("NKFW");
                     // Assert that no noc transactions are outstanding, to ensure that all reads and writes have landed
                     // and the NOC interface is in a known idle state for the next kernel.
+                    invalidate_l1_cache();
                     for (int noc = 0; noc < NUM_NOCS; noc++) {
                         ASSERT(ncrisc_dynamic_noc_reads_flushed(noc));
                         ASSERT(ncrisc_dynamic_noc_nonposted_writes_sent(noc));
                         ASSERT(ncrisc_dynamic_noc_nonposted_writes_flushed(noc));
                         ASSERT(ncrisc_dynamic_noc_nonposted_atomics_flushed(noc));
                         ASSERT(ncrisc_dynamic_noc_posted_writes_sent(noc));
+                        ASSERT(ncrisc_noc_packet_tags_cleared(noc), DebugAssertNCriscNOCPacketTagClearedTripped);
                     }
                     WAYPOINT("NKFD");
                 }
@@ -518,6 +573,7 @@ int main() {
 
             uint32_t go_message_index = mailboxes->go_message_index;
             mailboxes->go_messages[go_message_index].signal = RUN_MSG_DONE;
+            DEVICE_PRINT_KERNEL_FINISHED();
 
             // Notify dispatcher core that tensix has completed running kernels, if the launch_msg was populated
             if (launch_msg_address->kernel_config.mode == DISPATCH_MODE_DEV) {

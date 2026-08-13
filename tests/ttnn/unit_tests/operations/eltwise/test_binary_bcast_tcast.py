@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,9 +7,11 @@ import pytest
 import ttnn
 
 from functools import partial
-from tests.ttnn.unit_tests.operations.eltwise.backward.utility_funcs import compare_pcc
+from tests.ttnn.nightly.unit_tests.operations.eltwise.backward.utility_funcs import compare_pcc
 from tests.tt_eager.python_api_testing.sweep_tests.generation_funcs import gen_func_with_cast_tt
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
+
+pytestmark = pytest.mark.use_module_device
 
 
 @pytest.mark.parametrize(
@@ -40,7 +42,7 @@ def test_binary_scalar_ops(input_shapes, dtype, device):
         b_pt, dtype=dtype, device=device, layout=ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
     )
     cq_id = 0
-    out_tt = ttnn.add(a_tt, b_tt, queue_id=cq_id, use_legacy=False)
+    out_tt = ttnn.add(a_tt, b_tt, queue_id=cq_id)
     out_pt = a_pt + b_pt
 
     comp_pass = compare_pcc([out_tt], [out_pt])

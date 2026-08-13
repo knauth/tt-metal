@@ -1,50 +1,62 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/dataflow/noc_semaphore.h"
 
 void kernel_main() {
-    uint32_t receiver_semaphore = get_semaphore(get_compile_time_arg_val(0));
-    uint32_t sender_semaphore = get_semaphore(get_compile_time_arg_val(1));
+    // Compile time args
+    constexpr uint32_t receiver_sem_id = get_compile_time_arg_val(0);          // Ready-to-receive signal
+    constexpr uint32_t sender_sem_id = get_compile_time_arg_val(1);            // Data-sent confirmation
+    constexpr uint32_t noc_start_x = get_compile_time_arg_val(2);              // Starting X coordinate of core range
+    constexpr uint32_t noc_start_y = get_compile_time_arg_val(3);              // Starting Y coordinate of core range
+    constexpr uint32_t noc_end_x = get_compile_time_arg_val(4);                // Ending X coordinate of core range
+    constexpr uint32_t noc_end_y = get_compile_time_arg_val(5);                // Ending Y coordinate of core range
+    constexpr uint32_t Ht = get_compile_time_arg_val(6);                       // Height tiles to process
+    constexpr uint32_t Wt_final = get_compile_time_arg_val(7);                 // Total width tiles from all cores
+    constexpr uint32_t num_dests = get_compile_time_arg_val(8);                // Number of sending cores
+    constexpr uint32_t final_values_dfb_index = get_compile_time_arg_val(9);   // Aggregated TopK values
+    constexpr uint32_t final_indices_dfb_index = get_compile_time_arg_val(10);  // Aggregated TopK indices
 
-    constexpr uint32_t noc_start_x = get_compile_time_arg_val(2);
-    constexpr uint32_t noc_start_y = get_compile_time_arg_val(3);
-    constexpr uint32_t noc_end_x = get_compile_time_arg_val(4);
-    constexpr uint32_t noc_end_y = get_compile_time_arg_val(5);
+    Noc noc;
+    Semaphore<> receiver_sem(receiver_sem_id);
+    Semaphore<> sender_sem(sender_sem_id);
+    DataflowBuffer final_values_dfb(final_values_dfb_index);
+    DataflowBuffer final_indices_dfb(final_indices_dfb_index);
 
-    constexpr uint32_t Ht = get_compile_time_arg_val(6);
-    constexpr uint32_t Wt_final = get_compile_time_arg_val(7);
-    constexpr uint32_t num_dests = get_compile_time_arg_val(8);
+    // Collect local TopK results from all cores
+    for (uint32_t i = 0; i < Ht; ++i) {  // Process each height row
+        // Reserve space for incoming data from all local cores
+        final_values_dfb.reserve_back(Wt_final);   // Space for all TopK values
+        final_indices_dfb.reserve_back(Wt_final);  // Space for all TopK indices
 
-    constexpr uint32_t final_values_cb_index = tt::CBIndex::c_26;
-    constexpr uint32_t final_indices_cb_index = tt::CBIndex::c_27;
+        // Initialize semaphores for this height row
+        // Reset synchronization state for this height row
+        sender_sem.set(INVALID);  // Mark data as not yet sent
+        receiver_sem.set(VALID);  // Signal readiness to receive
 
-    volatile tt_l1_ptr uint32_t* receiver_semaphore_addr =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(receiver_semaphore);
-    volatile tt_l1_ptr uint32_t* sender_semaphore_addr =
-        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sender_semaphore);
+        // Coordinate multicast reception
+        // Enable all local cores to send their data simultaneously by broadcasting
+        // the receiver semaphore state. This allows for efficient parallel transmission.
+        receiver_sem.set_multicast(
+            noc, noc_start_x, noc_start_y, noc_end_x, noc_end_y, num_dests);
+        noc.async_write_barrier();
 
-    uint64_t mcast_receiver_semaphore_noc_addr =
-        get_noc_multicast_addr(noc_start_x, noc_start_y, noc_end_x, noc_end_y, receiver_semaphore);
+        // Wait for all data to arrive
+        // Block until all expected data (Wt_final tiles) has been received from
+        // the local cores. The sender semaphore is incremented by each sending core.
+        sender_sem.wait(Wt_final);
 
-    for (uint32_t i = 0; i < Ht; ++i) {
-        // Look for space in buffer
-        cb_reserve_back(final_values_cb_index, Wt_final);
-        cb_reserve_back(final_indices_cb_index, Wt_final);
+        // Commit received data
+        // Mark the received data as available to the final compute kernel
+        final_values_dfb.push_back(Wt_final);
+        final_indices_dfb.push_back(Wt_final);
+    }  // i loop
 
-        // Data is unsent so label the sender semaphore as INVALID
-        noc_semaphore_set(sender_semaphore_addr, INVALID);
-
-        // Set the receiver semaphore to VALID to allow the sender to write
-        noc_semaphore_set(receiver_semaphore_addr, VALID);
-
-        // Update the multicast address for the receiver semaphore, to allow the senders to write
-        noc_semaphore_set_multicast(receiver_semaphore, mcast_receiver_semaphore_noc_addr, num_dests);
-        noc_semaphore_wait(sender_semaphore_addr, Wt_final);
-
-        cb_push_back(final_values_cb_index, Wt_final);
-        cb_push_back(final_indices_cb_index, Wt_final);
-    }
+    // Ensure all NoC operations complete before kernel termination
+    noc.async_write_barrier();
 }

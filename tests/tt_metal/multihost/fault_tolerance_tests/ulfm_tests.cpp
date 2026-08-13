@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 #include <tt-metalium/distributed_context.hpp>
@@ -112,7 +112,7 @@ TEST(FaultTolerance, DisableBrokenBlock) {
     ctx = filtered_ctx;  // continue with communicator containing only healthy blocks
 
     // ‑‑ 5 · Verify global properties -------------------------------------
-    const int expected_blocks = world / ranks_per_block - 1;  // one block lost
+    const int expected_blocks = (world / ranks_per_block) - 1;  // one block lost
     const int expected_ranks = expected_blocks * ranks_per_block;
     const int new_world = *ctx->size();
 
@@ -124,8 +124,8 @@ TEST(FaultTolerance, DisableBrokenBlock) {
     int size_val = new_world;
     std::vector<int> gathered(expected_ranks);
     ctx->all_gather(
-        tt::stl::Span<std::byte>(reinterpret_cast<std::byte*>(&size_val), sizeof(int)),
-        tt::stl::Span<std::byte>(reinterpret_cast<std::byte*>(gathered.data()), gathered.size() * sizeof(int)));
+        ttsl::Span<std::byte>(reinterpret_cast<std::byte*>(&size_val), sizeof(int)),
+        ttsl::Span<std::byte>(reinterpret_cast<std::byte*>(gathered.data()), gathered.size() * sizeof(int)));
     for (int v : gathered) {
         EXPECT_EQ(v, new_world);
     }

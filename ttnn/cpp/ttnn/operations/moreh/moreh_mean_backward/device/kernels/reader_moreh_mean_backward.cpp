@@ -1,8 +1,12 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ttnn/deprecated/tt_dnn/kernels/dataflow/moreh_common.hpp"
+#include "ttnn/kernel/dataflow/moreh_common.hpp"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
+
 static constexpr int32_t MAX_NUM_DIMENSIONS = 8;
 
 inline uint32_t get_output_grad_tile(
@@ -29,8 +33,8 @@ inline uint32_t get_output_grad_tile(
 
 void kernel_main() {
     // compile-time args
-    constexpr bool output_grad_is_dram = (get_compile_time_arg_val(0) == 1);
-    constexpr uint32_t input_grad_rank = get_compile_time_arg_val(1);
+    constexpr uint32_t input_grad_rank = get_compile_time_arg_val(0);
+    constexpr auto output_grad_args = TensorAccessorArgs<1>();
 
     // runtime args
     ArgFetcher arg_fetcher;
@@ -78,27 +82,26 @@ void kernel_main() {
         uint32_t u;
     } scaler;
     scaler.f = 0.0f;
-    fill_cb_with_value(cb_id_in1, scaler.u);
+    DataflowBuffer dfb_in1(cb_id_in1);
+    fill_cb_with_value(dfb_in1, scaler.u);
 
     scaler.f = 1.0f / num_dim;
-    fill_cb_with_value(cb_id_in2, scaler.u, 1);
+    DataflowBuffer dfb_in2(cb_id_in2);
+    fill_cb_with_value(dfb_in2, scaler.u, 1);
 
-    uint32_t l1_write_addr_in0;
-    uint32_t output_grad_tile_bytes = get_tile_size(cb_id_in0);
-    const auto output_grad_data_format = get_dataformat(cb_id_in0);
-    const InterleavedAddrGenFast<output_grad_is_dram> output_grad_addrg = {
-        .bank_base_address = output_grad_addr,
-        .page_size = output_grad_tile_bytes,
-        .data_format = output_grad_data_format};
+    const auto output_grad_addrg = TensorAccessor(output_grad_args, output_grad_addr);
+
+    Noc noc;
+    DataflowBuffer dfb_in0(cb_id_in0);
+    const auto in0_tile_bytes = get_tile_size(cb_id_in0);
 
     for (uint32_t i = start_id; i < start_id + num_output_tiles; i++) {
         auto read_tile_id = get_output_grad_tile(
             i, input_grad_rank, output_grad_dim, output_grad_stride, input_grad_dim, input_grad_stride, need_bcast_dim);
 
-        cb_reserve_back(cb_id_in0, onetile);
-        l1_write_addr_in0 = get_write_ptr(cb_id_in0);
-        noc_async_read_tile(read_tile_id, output_grad_addrg, l1_write_addr_in0);
-        noc_async_read_barrier();
-        cb_push_back(cb_id_in0, onetile);
+        dfb_in0.reserve_back(onetile);
+        noc.async_read(output_grad_addrg, dfb_in0, in0_tile_bytes, {.page_id = read_tile_id}, {.offset_bytes = 0});
+        noc.async_read_barrier();
+        dfb_in0.push_back(onetile);
     }
 }

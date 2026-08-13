@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,9 +6,9 @@
 import torch
 
 import ttnn
-from models.utility_functions import comp_pcc
+from models.common.utility_functions import comp_pcc
 from loguru import logger
-from models.utility_functions import is_wormhole_b0
+from models.common.utility_functions import is_wormhole_b0
 
 
 def test_eltwise_unary_chain(device):
@@ -34,7 +34,7 @@ def test_eltwise_unary_chain(device):
         [
             ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU),
             ttnn.UnaryWithParam(ttnn.UnaryOpType.EXP, False),
-            ttnn.UnaryWithParam(ttnn.UnaryOpType.POWER, 2),
+            ttnn.UnaryWithParam(ttnn.UnaryOpType.SQUARE),
         ],
     )
     assert list(xtt.padded_shape) == [N, C, H, W]
@@ -80,7 +80,7 @@ def test_eltwise_binary_fused(device):
     xtt = ttnn.add(
         xt,
         yt,
-        activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU), ttnn.UnaryWithParam(ttnn.UnaryOpType.POWER, 2)],
+        activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.RELU), ttnn.UnaryWithParam(ttnn.UnaryOpType.SQUARE)],
     )
     assert list(xtt.padded_shape) == [N, C, H, W]
 

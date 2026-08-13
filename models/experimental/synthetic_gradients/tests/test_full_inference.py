@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,7 +7,7 @@ from torch import nn
 
 import ttnn
 
-from models.utility_functions import tilize_to_list, untilize, comp_allclose_and_pcc
+from models.common.utility_functions import tilize_to_list, untilize, comp_allclose_and_pcc
 
 epsilon1 = 1e-5
 epsilon2 = 1e-5

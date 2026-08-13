@@ -1,9 +1,11 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
-#include "dataflow_api.h"
+#include <api/dataflow/dataflow_api.h>
+#include "api/dataflow/dataflow_buffer.h"
+#include <ttnn/operations/pool/device/kernels/experimental_device_api.hpp>
 
 void kernel_main() {
     uint32_t dst_addr = get_arg_val<uint32_t>(0);
@@ -18,19 +20,19 @@ void kernel_main() {
     uint32_t start_block_id = get_arg_val<uint32_t>(2);
 
     constexpr uint32_t cb_id_out0 = get_compile_time_arg_val(0);
-    constexpr bool dst0_is_dram = get_compile_time_arg_val(1) == 1;
-    constexpr uint32_t output_page_size = get_compile_time_arg_val(2);
-    constexpr bool dst_page_size_is_pow2 = get_compile_time_arg_val(3) == 1;
-    constexpr uint32_t dst_log_base_2_of_page_size = get_compile_time_arg_val(4);
-    constexpr uint32_t scale_h = get_compile_time_arg_val(5);
-    constexpr uint32_t scale_w = get_compile_time_arg_val(6);
-    constexpr uint32_t height = get_compile_time_arg_val(7);
-    constexpr uint32_t width = get_compile_time_arg_val(8);
-    constexpr uint32_t block_height = get_compile_time_arg_val(9);
-    constexpr uint32_t num_tiles_per_block_row = get_compile_time_arg_val(10);
+    constexpr uint32_t output_page_size = get_compile_time_arg_val(1);
+    constexpr uint32_t scale_h = get_compile_time_arg_val(2);
+    constexpr uint32_t scale_w = get_compile_time_arg_val(3);
+    constexpr uint32_t height = get_compile_time_arg_val(4);
+    constexpr uint32_t width = get_compile_time_arg_val(5);
+    constexpr uint32_t block_height = get_compile_time_arg_val(6);
+    constexpr uint32_t num_tiles_per_block_row = get_compile_time_arg_val(7);
 
-    const auto s0 = get_interleaved_addr_gen<dst0_is_dram, dst_page_size_is_pow2>(
-        dst_addr, output_page_size, dst_log_base_2_of_page_size);
+    constexpr auto dst_args = TensorAccessorArgs<8>();
+    const auto s0 = TensorAccessor(dst_args, dst_addr);
+
+    DataflowBuffer out_dfb(cb_id_out0);
+    Noc noc;
 
     constexpr uint32_t in_width = width / scale_w;
     constexpr uint32_t in_height = height / scale_h;
@@ -41,9 +43,7 @@ void kernel_main() {
     uint32_t current_stick = block_height * start_block_id;
 
     for (uint32_t b = start_block_id; b < end_block_id; b++) {
-        cb_wait_front(cb_id_out0, num_tiles_per_block_row);
-
-        uint64_t base_l1_read_addr = get_read_ptr(cb_id_out0);
+        out_dfb.wait_front(num_tiles_per_block_row);
 
         for (uint32_t in_block_row = 0; in_block_row < block_height; ++in_block_row) {
             uint32_t curr_index = current_stick % (in_width * in_height);
@@ -51,7 +51,7 @@ void kernel_main() {
             uint32_t x = curr_index / in_width;
             uint32_t y = curr_index % in_width;
 
-            uint64_t read_addr = base_l1_read_addr + in_block_row * output_page_size;
+            uint32_t read_offset = in_block_row * output_page_size;
 
             // calculate the start index where writer will start writing the data.
             // total --> scale_h * scale_w times data will be written to the DRAM.
@@ -60,15 +60,19 @@ void kernel_main() {
 
             for (uint32_t j = 0; j < scale_h; j++) {
                 for (uint32_t k = 0; k < scale_w; k++) {
-                    uint64_t offset = j * width + k;
+                    uint32_t offset = j * width + k;
 
-                    uint64_t dst_noc_addr_1 = get_noc_addr((start_index + offset), s0);
-                    noc_async_write(read_addr, dst_noc_addr_1, output_page_size);
+                    noc.async_write(
+                        out_dfb,
+                        s0,
+                        output_page_size,
+                        {.offset_bytes = read_offset},
+                        {.page_id = start_index + offset});
                 }
             }
             current_stick++;
         }
-        noc_async_write_barrier();
-        cb_pop_front(cb_id_out0, num_tiles_per_block_row);
+        noc.async_write_barrier();
+        out_dfb.pop_front(num_tiles_per_block_row);
     }
 }

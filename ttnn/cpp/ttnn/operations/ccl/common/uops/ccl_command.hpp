@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -13,10 +13,8 @@
 
 #include "ttnn/operations/ccl/common/types/ccl_types.hpp"
 // For command dest type
-#include <tt-metalium/fabric_edm_packet_header.hpp>
 
-namespace ttnn {
-namespace ccl {
+namespace ttnn::ccl {
 namespace v2 {
 struct TensorSlice {
     using ords_t = Shape4D<uint32_t>;
@@ -59,7 +57,6 @@ struct CclCommandWaitValue {
 };
 struct CclCommandAtomicInc {
     uint32_t value = 1;
-    uint32_t wrap_value = std::numeric_limits<uint32_t>::max();
 };
 
 struct noc_transfer_info {
@@ -224,6 +221,11 @@ struct CclCommandArg {};
 using args_elem_t = uint32_t;
 template <typename T, CclCommandArgCode CODE>
 struct CclCommandArgBase {
+private:
+    CclCommandArgBase() = default;
+    friend T;
+
+public:
     // Let the user override
     using field_type = typename command_arg_field<CODE>::type;  // Ensure T::type is accessible
     static constexpr std::size_t size_in_words() { return (sizeof(T) + sizeof(uint32_t) - 1) / sizeof(uint32_t); }
@@ -378,7 +380,6 @@ struct CclCommandArg<CclCommandArgCode::SET_FULL_TENSOR_SLICE_SPEC_IN_PAGES>
 
         CclCommandArg<CclCommandArgCode::SET_WORKER_PAGES_PER_SLICE>::pack_to(
             &args[i], command_tensor.worker_pages_per_slice);
-        i += CclCommandArg<CclCommandArgCode::SET_WORKER_PAGES_PER_SLICE>::size_in_words();
     }
 
     void pack_to(args_elem_t* args) const {
@@ -401,7 +402,6 @@ struct CclCommandArg<CclCommandArgCode::SET_FULL_TENSOR_SLICE_SPEC_IN_PAGES>
         i += CclCommandArg<CclCommandArgCode::SET_WORKER_START_OFFSET_IN_SLICE_IN_PAGES>::size_in_words();
 
         CclCommandArg<CclCommandArgCode::SET_WORKER_PAGES_PER_SLICE>::unpack(&args[i], out.worker_pages_per_slice);
-        i += CclCommandArg<CclCommandArgCode::SET_WORKER_PAGES_PER_SLICE>::size_in_words();
     }
 
     void unpack(volatile args_elem_t const* args) {
@@ -430,17 +430,14 @@ struct CclCommandArg<CclCommandArgCode::SET_ATOMIC_INC_VALUE>
           CclCommandArgCode::SET_ATOMIC_INC_VALUE> {
     static void pack_to(args_elem_t* args, CclCommandAtomicInc const& atomic_inc_args) {
         args[0] = atomic_inc_args.value;
-        args[1] = atomic_inc_args.wrap_value;
     }
     void pack_to(args_elem_t* args) { pack_to(&args[0], this->value); }
 
     static void unpack(volatile args_elem_t const* args, CclCommandAtomicInc& out) {
         out.value = args[0];
-        out.wrap_value = args[1];
     }
     void unpack(volatile args_elem_t const* args) {
         this->value.value = args[0];
-        this->value.wrap_value = args[1];
     }
 };
 
@@ -526,7 +523,7 @@ struct CclCommandCoreDescriptorTypeMcast {
         return value;
     }
     static CclCommandCoreDescriptorTypeMcast from_uint32(uint32_t value) {
-        CclCommandCoreDescriptorTypeMcast mcast;
+        CclCommandCoreDescriptorTypeMcast mcast{};
         mcast.noc0_start_x = (value >> 0) & 0xFF;
         mcast.noc0_start_y = (value >> 8) & 0xFF;
         mcast.noc0_end_x = (value >> 16) & 0xFF;
@@ -549,7 +546,7 @@ using CclCommandCoreDescriptorArgs = std::variant<
 // A command is composed of one or more arguments
 // This enum specifies the high level command
 // Future commands are to be added and will enable
-// functionalilty such as synchronizing
+// functionality such as synchronizing
 enum class CclCommandCode : uint8_t {
     STREAM_TENSOR_TO_EDM = 0,  // TODO: rename uses of to the below
     STREAM_TENSOR_TO_CB = 0,
@@ -576,12 +573,10 @@ enum class CclCommandCode : uint8_t {
 
 
 enum CclCommandDestType : uint8_t {
-    CHIP_UNICAST = tt::tt_fabric::CHIP_UNICAST,
-    CHIP_MULTICAST = tt::tt_fabric::CHIP_MULTICAST,
+    CHIP_UNICAST = 0,
+    CHIP_MULTICAST = 1,
     CHIP_LOCAL_ONLY = 2
 };
-static_assert(tt::tt_fabric::CHIP_UNICAST < 2);
-static_assert(tt::tt_fabric::CHIP_MULTICAST < 2);
 struct DestTypeArgsNull {};
 static_assert(sizeof(DestTypeArgsNull) <= 2);
 struct UnicastCommandDestArgs {
@@ -611,7 +606,7 @@ struct CclCommandHeader {
         UnicastCommandDestArgs unicast;
         MulticastCommandDestArgs multicast;
         LocalOnlyCommandDestArgs local_only;
-    } command_dest_args;
+    } command_dest_args{};
 
     CclCommandHeader() :
         code(CclCommandCode::INVALID), dest_type(CclCommandDestType::CHIP_LOCAL_ONLY), arg_count(0) {}
@@ -674,5 +669,4 @@ struct CclCommandHeader {
 static_assert(sizeof(CclCommandHeader) == sizeof(uint32_t));
 
 }  // namespace cmd
-}  // namespace ccl
-}  // namespace ttnn
+}  // namespace ttnn::ccl

@@ -1,19 +1,22 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <mutex>
 #include <core_coord.hpp>
 #include <stdint.h>
-#include <umd/device/types/cluster_descriptor_types.h>
+#include <umd/device/types/cluster_descriptor_types.hpp>
 #include <string>
+#include "impl/context/context_types.hpp"
+#include <tt-metalium/experimental/context/metal_env.hpp>
 
 struct metal_SocDescriptor;
 
 namespace tt::tt_metal {
 class WatcherServer {
 public:
-    WatcherServer();
+    WatcherServer(MetalEnv& env);
     ~WatcherServer();
 
     void init_devices();    // Always runs, puts watcher mailboxes in a default state
@@ -40,7 +43,7 @@ public:
     std::unique_lock<std::mutex> get_lock();
 
     // Helper function for manually dumping watcher contents. TODO: remove when watcher_dump tool is removed.
-    void isolated_dump(std::vector<chip_id_t>& device_ids);
+    void isolated_dump(std::vector<ChipId>& device_ids);
 
 private:
     class Impl;

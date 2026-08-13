@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,18 +11,15 @@ from sklearn.metrics import top_k_accuracy_score
 from ttnn.model_preprocessing import preprocess_model_parameters
 
 import ttnn
-from models.demos.ttnn_falcon7b.tt.common import create_custom_preprocessor, create_kv_cache
+from models.common.utility_functions import is_blackhole, is_wormhole_b0, profiler
+from models.demos.ttnn_falcon7b.tt.common import (
+    build_past_key_values_cache,
+    create_custom_preprocessor,
+    create_kv_cache,
+)
 from models.demos.ttnn_falcon7b.tt.falcon_causallm import TtFalconCausalLM
 from models.demos.ttnn_falcon7b.tt.model_config import get_model_config, get_tt_cache_path
 from models.perf.perf_utils import prep_perf_report
-from models.utility_functions import (
-    disable_persistent_kernel_cache,
-    enable_persistent_kernel_cache,
-    is_blackhole,
-    is_e75,
-    is_wormhole_b0,
-    profiler,
-)
 from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import comp_pcc
 
 
@@ -50,9 +47,13 @@ def run_test_FalconCausalLM_end_to_end(
 
     configuration = transformers.FalconConfig.from_pretrained(model_version)
     configuration.num_hidden_layers = num_layers
-    model = transformers.models.falcon.modeling_falcon.FalconForCausalLM.from_pretrained(
-        model_version, config=configuration
-    ).eval()
+    model = (
+        transformers.models.falcon.modeling_falcon.FalconForCausalLM.from_pretrained(
+            model_version, config=configuration
+        )
+        .eval()
+        .to(torch.float32)
+    )
 
     profiler.end("hugging_face_model_setup")
 
@@ -101,7 +102,7 @@ def run_test_FalconCausalLM_end_to_end(
     pytorch_out, pytorch_layer_present = model(
         input_ids=model_input,
         attention_mask=None,
-        past_key_values=past_key_values,
+        past_key_values=build_past_key_values_cache(past_key_values),
         use_cache=True,
         return_dict=False,
     )
@@ -198,7 +199,6 @@ def run_test_FalconCausalLM_end_to_end(
 
     logger.info(f"Enable profiler and enable binary and compile cache")
     profiler.enable()
-    enable_persistent_kernel_cache()
     if llm_mode == "prefill":
         tt_layer_past = ()
         for i in range(num_layers):
@@ -336,7 +336,7 @@ def run_test_FalconCausalLM_end_to_end(
         logger.info("Falcon PCC Check Passed!")
     else:
         logger.warning("Falcon PCC Check Failed!")
-        if is_wormhole_b0():  # only assert for pcc on wormhole until grayskull pcc is fixed
+        if is_wormhole_b0():
             assert does_pass, f"PCC value is lower than {pcc}"
 
 
@@ -384,13 +384,8 @@ def test_perf_bare_metal(
     model_config_str,
     model_location_generator,
 ):
-    if is_e75(device) and batch == 32:
-        pytest.skip("Falcon batch 32 is not supported on E75")
-
     model_config = get_model_config(model_config_str)
     tt_cache_path = get_tt_cache_path(model_version)
-
-    disable_persistent_kernel_cache()
 
     run_test_FalconCausalLM_end_to_end(
         device,

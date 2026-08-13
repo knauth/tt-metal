@@ -1,20 +1,67 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "gtest/gtest.h"
 #include "tests/tt_metal/tt_metal/common/multi_device_fixture.hpp"
 #include "dispatch/system_memory_manager.hpp"
+#include "allocator/allocator.hpp"
 
 #include "tt_metal/test_utils/stimulus.hpp"
 
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/buffer_distribution_spec.hpp>
 #include <tt-metalium/allocator.hpp>
+#include <impl/dispatch/dispatch_mem_map.hpp>
 
 namespace distribution_spec_tests {
-using tt::tt_metal::BufferDistributionSpec;
+using tt::tt_metal::BufferDistributionSpec;  // NOLINT(misc-unused-using-decls)
 constexpr uint32_t PADDING = tt::tt_metal::UncompressedBufferPageMapping::PADDING;
+
+// Shared fixture that creates the MeshDevice once per test suite instead of per test case.
+// This significantly speeds up parameterized tests by avoiding repeated device setup/teardown.
+class BufferDistributionSpecFixture : public ::testing::Test {
+public:
+    inline static std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_device_;
+
+protected:
+    static void SetUpTestSuite() {
+        auto* slow_dispatch = getenv("TT_METAL_SLOW_DISPATCH_MODE");
+        if (slow_dispatch) {
+            // Cannot skip in SetUpTestSuite, will be handled in SetUp
+            return;
+        }
+
+        const auto system_mesh_shape = tt::tt_metal::MetalContext::instance().get_system_mesh().shape();
+        auto core_type = tt::tt_metal::DispatchCoreType::WORKER;
+
+        mesh_device_ = tt::tt_metal::distributed::MeshDevice::create(
+            tt::tt_metal::distributed::MeshDeviceConfig(system_mesh_shape, std::nullopt),
+            DEFAULT_L1_SMALL_SIZE,
+            DEFAULT_TRACE_REGION_SIZE,
+            /*num_command_queues=*/1,
+            core_type,
+            {},
+            DEFAULT_WORKER_L1_SIZE);
+    }
+
+    static void TearDownTestSuite() {
+        if (mesh_device_) {
+            mesh_device_->close();
+            mesh_device_.reset();
+        }
+    }
+
+    void SetUp() override {
+        auto* slow_dispatch = getenv("TT_METAL_SLOW_DISPATCH_MODE");
+        if (slow_dispatch) {
+            GTEST_SKIP() << "Skipping test suite, since it can only be run in Fast Dispatch Mode.";
+        }
+        if (!mesh_device_) {
+            GTEST_SKIP() << "MeshDevice not initialized.";
+        }
+    }
+};
 
 struct BufferDistributionSpecInputs {
     tt::tt_metal::Shape physical_tensor_shape;
@@ -27,7 +74,7 @@ struct BufferDistributionSpecInputs {
 };
 
 struct MeshBufferAllocationExpected {
-    std::vector<CoreCoord> cores;
+    std::vector<tt::tt_metal::CoreCoord> cores;
     size_t num_cores;
     size_t num_dev_pages;
     size_t aligned_size;
@@ -69,7 +116,7 @@ std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> create_replicated_mesh_bu
         .sharding_args = buffer_distribution_spec,
     };
 
-    // Mirrors allocate_mesh_buffer_on_device in ttnn
+    // Mirrors allocate_device_buffer in ttnn
     const tt::tt_metal::distributed::ReplicatedBufferConfig mesh_buffer_config{.size = host_size_in_bytes};
     return tt::tt_metal::distributed::MeshBuffer::create(mesh_buffer_config, device_local_config, mesh_device);
 }
@@ -80,7 +127,7 @@ std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> create_replicated_mesh_bu
 using namespace distribution_spec_tests;
 using namespace tt::tt_metal;
 
-class MeshBufferAllocationTests : public GenericMeshDeviceFixture,
+class MeshBufferAllocationTests : public BufferDistributionSpecFixture,
                                   public ::testing::WithParamInterface<BufferAllocationParams> {};
 
 TEST_P(MeshBufferAllocationTests, Allocation) {
@@ -91,7 +138,7 @@ TEST_P(MeshBufferAllocationTests, Allocation) {
 
     // Extract local single-device buffer (ie. shard_view) concepts for testing
     const tt::tt_metal::distributed::MeshCoordinate mesh_coordinate{0, 0};
-    const auto shard_view = mesh_buffer->get_device_buffer(mesh_coordinate);
+    auto* const shard_view = mesh_buffer->get_device_buffer(mesh_coordinate);
 
     // Check that the stored cores in local device buffer matches expected cores to be used
     auto page_mapping = shard_view->buffer_distribution_spec()->compute_page_mapping();
@@ -132,9 +179,9 @@ INSTANTIATE_TEST_SUITE_P(
             },
             MeshBufferAllocationExpected{
                 .cores = {{0, 0}, {1, 0}, {2, 0}, {3, 0}, {0, 1}, {1, 1}, {2, 1}, {3, 1}, {0, 2}, {1, 2}, {2, 2}, {3, 2}, {0, 3}, {1, 3}, {2, 3}, {3, 3}},
-                .num_cores = 16,
-                .num_dev_pages = 10 * 16,  // Shard shape is 10 pages
-                .aligned_size = 2048 * 160,
+                .num_cores = 6,
+                .num_dev_pages = 10 * 6,  // Shard shape is 10 pages
+                .aligned_size = 2048 * 60,
                 .aligned_size_per_bank = 2048 * 10,
             },
         },
@@ -152,9 +199,9 @@ INSTANTIATE_TEST_SUITE_P(
             },
             MeshBufferAllocationExpected{
                 .cores = {{0, 0}, {0, 1}, {0, 2}, {0, 3}, {1, 0}, {1, 1}, {1, 2}, {1, 3}, {2, 0}, {2, 1}, {2, 2}, {2, 3}, {3, 0}, {3, 1}, {3, 2}, {3, 3}},
-                .num_cores = 16,
-                .num_dev_pages = 384 * 16,  // Shard shape is 384 pages
-                .aligned_size = 256 * 6144,
+                .num_cores = 4,
+                .num_dev_pages = 384 * 4,  // Shard shape is 384 pages
+                .aligned_size = 256 * 1536,
                 .aligned_size_per_bank = 256 * 384,
             },
         },
@@ -202,19 +249,19 @@ INSTANTIATE_TEST_SUITE_P(
 );
 // clang-format on
 
-class MeshBufferReadWriteTests : public GenericMeshDeviceFixture,
+class MeshBufferReadWriteTests : public BufferDistributionSpecFixture,
                                  public ::testing::WithParamInterface<std::tuple<bool, bool, BufferReadWriteParams>> {};
 
 TEST_P(MeshBufferReadWriteTests, WriteReadLoopback) {
     const auto& [cq_write, cq_read, params] = GetParam();
 
     // Create a replicated mesh buffer across generic mesh device; tests will only use first device
-    const auto mesh_buffer = create_replicated_mesh_buffer_from_inputs(params.inputs, mesh_device_.get());
+    auto mesh_buffer = create_replicated_mesh_buffer_from_inputs(params.inputs, mesh_device_.get());
 
     // Extract local single-device buffer (ie. shard_view) concepts for testing
     const tt::tt_metal::distributed::MeshCoordinate mesh_coordinate{0, 0};
-    const auto shard_view = mesh_buffer->get_device_buffer(mesh_coordinate);
-    const auto local_device = shard_view->device();
+    auto* const shard_view = mesh_buffer->get_device_buffer(mesh_coordinate);
+    auto* const local_device = shard_view->device();
     const auto host_size_in_bytes = mesh_buffer->device_local_size();
     const auto bank_base_address = mesh_buffer->address();
     const auto page_size = mesh_buffer->page_size();
@@ -228,9 +275,9 @@ TEST_P(MeshBufferReadWriteTests, WriteReadLoopback) {
      * Here, buffer refers to local device buffer or shard view
      * - Initialize buffer and command queue state to 0
      * - Initialize src vector
-     * - Write to buffer (with either EnqueueWriteBuffer or WriteToBuffer)
+     * - Write to buffer (with either EnqueueWriteMeshBuffer or WriteToBuffer)
      * - Validate written results are correct per core (using explicitly hard-coded core mapping)
-     * - Read from buffer (with either EnqueueReadBuffer or ReadFromBuffer)
+     * - Read from buffer (with either ReadShard or ReadFromBuffer)
      */
 
     // Initialize local device buffer to 0
@@ -246,7 +293,7 @@ TEST_P(MeshBufferReadWriteTests, WriteReadLoopback) {
     {
         uint16_t channel =
             tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(local_device->id());
-        chip_id_t mmio_device_id =
+        ChipId mmio_device_id =
             tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(local_device->id());
         uint32_t cq_size = local_device->sysmem_manager().get_cq_size();
         uint32_t cq_start = MetalContext::instance().dispatch_mem_map().get_host_command_queue_addr(
@@ -254,12 +301,24 @@ TEST_P(MeshBufferReadWriteTests, WriteReadLoopback) {
 
         std::vector<uint32_t> cq_zeros((cq_size - cq_start) / sizeof(uint32_t), 0);
 
-        tt::tt_metal::MetalContext::instance().get_cluster().write_sysmem(
-            cq_zeros.data(),
-            (cq_size - cq_start),
-            get_absolute_cq_offset(channel, 0, cq_size) + cq_start,
-            mmio_device_id,
-            channel);
+        if (local_device->sysmem_manager().is_dram_backed()) {
+            const uint32_t dram_channel = local_device->allocator_impl()->get_dram_channel_from_bank_id(
+                local_device->sysmem_manager().get_dram_region_bank_id());
+            tt::tt_metal::MetalContext::instance().get_cluster().write_dram_vec(
+                cq_zeros.data(),
+                (cq_size - cq_start),
+                local_device->id(),
+                dram_channel,
+                local_device->sysmem_manager().get_dram_region_base_addr() +
+                    get_absolute_cq_offset(channel, 0, cq_size) + cq_start);
+        } else {
+            tt::tt_metal::MetalContext::instance().get_cluster().write_sysmem(
+                cq_zeros.data(),
+                (cq_size - cq_start),
+                get_absolute_cq_offset(channel, 0, cq_size) + cq_start,
+                mmio_device_id,
+                channel);
+        }
     }
 
     // Create src vector
@@ -267,12 +326,8 @@ TEST_P(MeshBufferReadWriteTests, WriteReadLoopback) {
         tt::test_utils::generate_uniform_random_vector<uint8_t>(0, UINT8_MAX, host_size_in_bytes / sizeof(uint8_t));
 
     if (cq_write) {
-        log_info(tt::LogTest, "Writing with: FDMeshCommandQueue enqueue_write_shards");
-        std::vector<tt::tt_metal::distributed::MeshCommandQueue::ShardDataTransfer> shard_data_transfer{{
-            .shard_coord = tt::tt_metal::distributed::MeshCoordinate{0, 0},
-            .host_data = const_cast<void*>(reinterpret_cast<const void*>(src.data())),
-        }};
-        mesh_device_->mesh_command_queue().enqueue_write_shards(mesh_buffer, shard_data_transfer, /*blocking=*/false);
+        log_info(tt::LogTest, "Writing with: FDMeshCommandQueue EnqueueWriteMeshBuffer");
+        EnqueueWriteMeshBuffer(mesh_device_->mesh_command_queue(), mesh_buffer, src, /*blocking=*/false);
         Finish(mesh_device_->mesh_command_queue());
     } else {
         log_info(tt::LogTest, "Writing with: WriteToBuffer (equivalent to SDMeshCommandQueue enqueue_write_shards)");
@@ -333,12 +388,13 @@ TEST_P(MeshBufferReadWriteTests, WriteReadLoopback) {
     std::vector<uint8_t> dst(host_size_in_bytes / sizeof(uint8_t), 0);
 
     if (cq_read) {
-        log_info(tt::LogTest, "Reading with: FDMeshCommandQueue enqueue_read_shards");
-        std::vector<tt::tt_metal::distributed::MeshCommandQueue::ShardDataTransfer> shard_data_transfer{{
-            .shard_coord = tt::tt_metal::distributed::MeshCoordinate{0, 0},
-            .host_data = const_cast<void*>(reinterpret_cast<const void*>(dst.data())),
-        }};
-        mesh_device_->mesh_command_queue().enqueue_read_shards(shard_data_transfer, mesh_buffer, /*blocking=*/false);
+        log_info(tt::LogTest, "Reading with: FDMeshCommandQueue ReadShard");
+        ReadShard(
+            mesh_device_->mesh_command_queue(),
+            dst,
+            mesh_buffer,
+            tt::tt_metal::distributed::MeshCoordinate{0, 0},
+            /*blocking=*/false);
         Finish(mesh_device_->mesh_command_queue());
     } else {
         log_info(tt::LogTest, "Reading with: ReadFromBuffer (equivalent to SDMeshCommandQueue enqueue_read_shards)");
@@ -390,7 +446,7 @@ INSTANTIATE_TEST_SUITE_P(
                     .physical_shard_shape = tt::tt_metal::Shape{1, 64, 96},
                     .page_shape = tt::tt_metal::Shape2D{32, 32},
                     .bytes_per_element = 1.0625,  // Headers for block float amortized over elements
-                    .grid = CoreRangeSet(tt::stl::Span<const CoreRange>(
+                    .grid = CoreRangeSet(ttsl::Span<const CoreRange>(
                         {CoreRange({4, 6}, {6, 6}), CoreRange({1, 1}, {1, 1}), CoreRange({0, 3}, {3, 3})})),
                     .shard_orientation = ShardOrientation::ROW_MAJOR,
                     .buffer_type = BufferType::L1,
@@ -460,7 +516,7 @@ INSTANTIATE_TEST_SUITE_P(
                     .page_shape = tt::tt_metal::Shape2D{32, 32},
                     .bytes_per_element = 2,
                     .grid = CoreRangeSet(
-                        tt::stl::Span<const CoreRange>({CoreRange({0, 0}, {2, 0}), CoreRange({0, 1}, {1, 1})})),
+                        ttsl::Span<const CoreRange>({CoreRange({0, 0}, {2, 0}), CoreRange({0, 1}, {1, 1})})),
                     .shard_orientation = ShardOrientation::ROW_MAJOR,
                     .buffer_type = BufferType::L1,
                 },
@@ -477,3 +533,42 @@ INSTANTIATE_TEST_SUITE_P(
         )       // Combine
 );
 // clang-format on
+
+// Device-free check of the shard->core placement formula for both 1D strategies.
+// 8 single-page shards over 2 cores (R = 4 shards per core). Round-robin spreads
+// consecutive shards across cores; CONTIGUOUS_1D (shard-contiguous) packs a contiguous run per core.
+TEST(BufferDistributionSpecContiguous, ShardContiguousVsRoundRobinPlacement) {
+    const tt::tt_metal::Shape tensor_in_pages{8, 1};
+    const tt::tt_metal::Shape shard_in_pages{1, 1};
+    const CoreRangeSet grid(CoreRange({0, 0}, {1, 0}));  // 2 cores
+
+    BufferDistributionSpec round_robin(
+        tensor_in_pages, shard_in_pages, grid, ShardOrientation::ROW_MAJOR, ShardDistributionStrategy::ROUND_ROBIN_1D);
+    BufferDistributionSpec shard_contiguous(
+        tensor_in_pages, shard_in_pages, grid, ShardOrientation::ROW_MAJOR, ShardDistributionStrategy::CONTIGUOUS_1D);
+
+    ASSERT_EQ(round_robin.num_cores(), 2u);
+    ASSERT_EQ(shard_contiguous.num_cores(), 2u);
+
+    const auto round_robin_map = round_robin.compute_page_mapping().core_host_page_indices;
+    const auto shard_contiguous_map = shard_contiguous.compute_page_mapping().core_host_page_indices;
+
+    // Round-robin: core c holds shards c, c + num_cores, ...
+    EXPECT_EQ(round_robin_map[0], (std::vector<uint32_t>{0, 2, 4, 6}));
+    EXPECT_EQ(round_robin_map[1], (std::vector<uint32_t>{1, 3, 5, 7}));
+
+    // Shard-contiguous: core c holds the contiguous run c*R .. c*R + R - 1.
+    EXPECT_EQ(shard_contiguous_map[0], (std::vector<uint32_t>{0, 1, 2, 3}));
+    EXPECT_EQ(shard_contiguous_map[1], (std::vector<uint32_t>{4, 5, 6, 7}));
+}
+
+// CONTIGUOUS_1D requires a uniform shards-per-core; an indivisible count must fatal.
+TEST(BufferDistributionSpecContiguous, ShardContiguousRequiresUniformShardsPerCore) {
+    const tt::tt_metal::Shape tensor_in_pages{7, 1};  // 7 shards over 2 cores -> not uniform
+    const tt::tt_metal::Shape shard_in_pages{1, 1};
+    const CoreRangeSet grid(CoreRange({0, 0}, {1, 0}));  // 2 cores
+
+    BufferDistributionSpec shard_contiguous(
+        tensor_in_pages, shard_in_pages, grid, ShardOrientation::ROW_MAJOR, ShardDistributionStrategy::CONTIGUOUS_1D);
+    EXPECT_ANY_THROW((void)shard_contiguous.compute_page_mapping());
+}

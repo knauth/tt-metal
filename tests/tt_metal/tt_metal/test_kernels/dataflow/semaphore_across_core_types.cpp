@@ -1,9 +1,9 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 void kernel_main() {
     constexpr ProgrammableCoreType eth_core_type = static_cast<ProgrammableCoreType>(get_compile_time_arg_val(0));
@@ -13,7 +13,7 @@ void kernel_main() {
     uint32_t other_sem_id = get_arg_val<uint32_t>(2);
     uint32_t sem_init_value = get_arg_val<uint32_t>(3);
 
-#if defined(COMPILE_FOR_ERISC) || defined(COMPILE_FOR_IDLE_ERISC)
+#if defined(COMPILE_FOR_ERISC) || defined(COMPILE_FOR_IDLE_ERISC) || defined(COMPILE_FOR_AERISC)
     volatile tt_l1_ptr uint32_t* my_sem_addr =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore<eth_core_type>(my_sem_id));
     volatile tt_l1_ptr uint32_t* other_sem_addr =

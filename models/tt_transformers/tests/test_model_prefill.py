@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import bz2
@@ -9,16 +9,16 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.common.utility_functions import comp_pcc
 from models.tt_transformers.tt.common import PagedAttentionConfig, create_tt_model
 from models.tt_transformers.tt.generator import Generator
 from models.tt_transformers.tt.model_config import DecodersPrecision
-from models.utility_functions import comp_pcc, skip_for_grayskull
 
 
 @torch.no_grad()
-@skip_for_grayskull("Requires wormhole_b0 to run")
 @pytest.mark.timeout(900)
 @pytest.mark.models_performance_bare_metal
+@pytest.mark.parametrize("use_prefetcher", ([False]))
 @pytest.mark.parametrize(
     "mesh_device",
     [
@@ -46,8 +46,8 @@ from models.utility_functions import comp_pcc, skip_for_grayskull
 )
 @pytest.mark.parametrize(
     "seq_len",
-    (128, 3072, 4096, 8192, 16384, 32768),
-    ids=["128", "3k", "4k", "8k", "16k", "32k"],
+    (128, 256, 3072, 4096, 8192, 16384, 32768),
+    ids=["128", "256", "3k", "4k", "8k", "16k", "32k"],
 )
 @pytest.mark.parametrize(
     "max_seq_len",
@@ -82,8 +82,10 @@ def test_model_inference(
     ensure_gc,
     is_ci_env,
     request,
+    use_prefetcher,
 ):
     test_id = request.node.callspec.id
+    use_hf_rope = request.config.getoption("--use_hf_rope")
     if is_ci_env:
         if "accuracy" in test_id:
             pytest.skip("CI test only runs performance mode to reduce CI pipeline load")
@@ -91,8 +93,16 @@ def test_model_inference(
         # TODO: Save ref outputs to avoid running reference model for large seq_len
         if seq_len > 8192:
             pytest.skip("CI test only runs up to 8192 seq_len to avoid out of ram issues for ref model")
-        if num_layers != 1 and seq_len != 4096:
+        if use_hf_rope:
+            if num_layers != 1 and seq_len != 256:
+                pytest.skip("When HF rope is used CI only runs full model for 256 seq len to reduce CI pipeline load")
+
+        elif num_layers != 1 and seq_len != 4096:
             pytest.skip("CI only runs full model for 4k seq len to reduce CI pipeline load")
+
+        hf_model_env = os.getenv("HF_MODEL", "")
+        if ("Llama" in hf_model_env) and ("Vision" in hf_model_env) and (num_layers is None):
+            pytest.skip("Skipping Llama Vision full model test: no CrossAttention functionality in this test.")
 
     run_ref_pt = True  # Flag to run reference PyTorch model and compare PCC
     dtype = ttnn.bfloat8_b
@@ -121,9 +131,16 @@ def test_model_inference(
         paged_attention_config=paged_attention_config,
         dtype=dtype,
         num_layers=num_layers,
+        use_prefetcher=use_prefetcher,
+        use_hf_rope=use_hf_rope,
     )
 
-    if model_args.base_model_name.startswith("Mistral-") or model_args.base_model_name.startswith("Qwen3-"):
+    if (
+        model_args.base_model_name.startswith("Mistral-")
+        or model_args.base_model_name.startswith("Qwen3-")
+        or model_args.base_model_name.startswith("Phi-3-mini-")
+        or model_args.base_model_name.startswith("phi-4")
+    ):
         # TODO: Per layer KV cache fetching is not implemented for all models
         # See issue https://github.com/tenstorrent/tt-metal/issues/19806"
         cache_pcc = False
@@ -133,7 +150,10 @@ def test_model_inference(
     # This sets the minimum PCC for each iteration based on optimization mode
     # TODO: See issue https://github.com/tenstorrent/tt-metal/issues/19806
     perf_out_pcc_map = {"Mistral-7B-Instruct-v0.3": 0.73}
-    acc_out_pcc_map = {"Mistral-7B-Instruct-v0.3": 0.75}
+    acc_out_pcc_map = {
+        "Mistral-7B-Instruct-v0.3": 0.75,
+        "Phi-3-mini-128k-instruct": 0.89,
+    }
     kv_cache_pcc_map = {"Mistral-7B-Instruct-v0.3": 0.75}
 
     if num_layers == 1:
@@ -151,8 +171,9 @@ def test_model_inference(
         default_expec_kv_cache_pcc = 0.88
         expec_kv_cache_pcc = kv_cache_pcc_map.get(model_args.model_name, default_expec_kv_cache_pcc)
 
+    processor = model_args.processor
     tokenizer = model_args.tokenizer
-    generator = Generator([tt_model], [model_args], mesh_device, tokenizer=tokenizer)
+    generator = Generator([tt_model], [model_args], mesh_device, processor=processor, tokenizer=tokenizer)
     logger.info("Finished loading TT model.")
 
     # Create page table if paged attention is enabled
@@ -180,24 +201,20 @@ def test_model_inference(
     if run_ref_pt:
         logger.info("Loading reference model...")
         state_dict_prefix = model_args.get_state_dict_prefix("", None)
-        reference_state_dict = {
-            k[len(state_dict_prefix) :]: v
-            for k, v in state_dict.items()
-            if (
-                any([f"{state_dict_prefix}layers.{i}." in k for i in range(model_args.n_layers)])
-                or any(
-                    [
-                        f"{state_dict_prefix}{name}" in k
-                        for name in ["tok_embeddings.weight", "norm.weight", "output.weight"]
-                    ]
-                )
-            )
-        }
-        reference_model = model_args.reference_transformer()
-        reference_model.load_state_dict(reference_state_dict)
+        reference_model = model_args.reference_transformer(load_checkpoint=True)
         # Embedding on host
         embd = model_args.reference_embedding()
-        embd.load_state_dict({"emb.weight": state_dict[f"{state_dict_prefix}tok_embeddings.weight"]})
+        if model_args.is_llama_vision():
+            weight = torch.cat(
+                [
+                    state_dict[f"{state_dict_prefix}tok_embeddings.weight"],
+                    state_dict[f"{state_dict_prefix}learnable_embedding.weight"],
+                ],
+                dim=0,
+            )
+        else:
+            weight = state_dict[f"{state_dict_prefix}tok_embeddings.weight"]
+        embd.load_state_dict({"emb.weight": weight})
         logger.info("Finished loading reference model.")
 
     # Select the first token from the prompt for initial decoding
@@ -238,12 +255,8 @@ def test_model_inference(
         if cache_pcc:
             for i in range(model_args.n_layers):
                 pytorch_layer_present = [
-                    reference_model.layers[i]
-                    .attention.cache_k.clone()
-                    .permute(0, 2, 1, 3),  # [batch_size, n_kv_heads, seq, head_dim]
-                    reference_model.layers[i]
-                    .attention.cache_v.clone()
-                    .permute(0, 2, 1, 3),  # [batch_size, n_kv_heads, seq, head_dim]
+                    reference_model.cache_k[i].clone().permute(0, 2, 1, 3),  # [batch_size, n_kv_heads, seq, head_dim]
+                    reference_model.cache_v[i].clone().permute(0, 2, 1, 3),  # [batch_size, n_kv_heads, seq, head_dim]
                 ]
 
                 tt_layer_present = []

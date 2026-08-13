@@ -1,8 +1,8 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 #include <tt-metalium/buffer_types.hpp>
 #include "ttnn/operations/ccl/shared_with_host/hetergeneous_data_structs.hpp"
 #include "ttnn/operations/ccl/common/types/ccl_types.hpp"
@@ -11,9 +11,8 @@
 #include "ttnn/operations/ccl/common/uops/ccl_command_device.hpp"
 #include "ttnn/operations/ccl/common/types/ccl_types_device.hpp"
 #include "ttnn/operations/ccl/kernel_common/worker_edm_adapters.hpp"
-#include "ttnn/operations/ccl/all_gather/device/kernels/dataflow/worker_ring_gather_utils.hpp"
-#include "debug/dprint.h"
-#include "api/ttnn/tensor/enum_types.hpp"
+#include "api/debug/dprint.h"
+#include "api/ttnn/tensor/layout/layout.hpp"
 #include <cstdint>
 
 using ttnn::ccl::coord_t;
@@ -24,25 +23,30 @@ using tt::tt_metal::TensorMemoryLayout;
 using ttnn::ccl::Shape4D;
 using shape_t = Shape4D<uint32_t>;
 
-void dprint(ttnn::ccl::cmd::CclCommandTensor const& command_tensor) {
-    DPRINT << "\ttensor_slice_shape.w: " << (uint32_t)command_tensor.tensor_slice_shape.w << "\n";
-    DPRINT << "\ttensor_slice_shape.z: " << (uint32_t)command_tensor.tensor_slice_shape.z << "\n";
-    DPRINT << "\ttensor_slice_shape.y: " << (uint32_t)command_tensor.tensor_slice_shape.y << "\n";
-    DPRINT << "\ttensor_slice_shape.x: " << (uint32_t)command_tensor.tensor_slice_shape.x << "\n";
-    DPRINT << "\ttensor_slice_offset.w: " << (uint32_t)command_tensor.tensor_slice_offset.w << "\n";
-    DPRINT << "\ttensor_slice_offset.z: " << (uint32_t)command_tensor.tensor_slice_offset.z << "\n";
-    DPRINT << "\ttensor_slice_offset.y: " << (uint32_t)command_tensor.tensor_slice_offset.y << "\n";
-    DPRINT << "\ttensor_slice_offset.x: " << (uint32_t)command_tensor.tensor_slice_offset.x << "\n";
-    DPRINT << "\tworker_start_offset_in_slice.w: " << (uint32_t)command_tensor.worker_start_offset_in_slice.w << "\n";
-    DPRINT << "\tworker_start_offset_in_slice.z: " << (uint32_t)command_tensor.worker_start_offset_in_slice.z << "\n";
-    DPRINT << "\tworker_start_offset_in_slice.y: " << (uint32_t)command_tensor.worker_start_offset_in_slice.y << "\n";
-    DPRINT << "\tworker_start_offset_in_slice.x: " << (uint32_t)command_tensor.worker_start_offset_in_slice.x << "\n";
-    DPRINT << "\tworker_pages_per_slice: " << (uint32_t)command_tensor.worker_pages_per_slice << "\n";
+void dprint(const ttnn::ccl::cmd::CclCommandTensor& command_tensor) {
+    DPRINT(
+        "\ttensor_slice_shape: ({}, {}, {}, {})\n"
+        "\ttensor_slice_offset: ({}, {}, {}, {})\n"
+        "\tworker_start_offset_in_slice: ({}, {}, {}, {})\n"
+        "\tworker_pages_per_slice: {}\n",
+        command_tensor.tensor_slice_shape.w,
+        command_tensor.tensor_slice_shape.z,
+        command_tensor.tensor_slice_shape.y,
+        command_tensor.tensor_slice_shape.x,
+        command_tensor.tensor_slice_offset.w,
+        command_tensor.tensor_slice_offset.z,
+        command_tensor.tensor_slice_offset.y,
+        command_tensor.tensor_slice_offset.x,
+        command_tensor.worker_start_offset_in_slice.w,
+        command_tensor.worker_start_offset_in_slice.z,
+        command_tensor.worker_start_offset_in_slice.y,
+        command_tensor.worker_start_offset_in_slice.x,
+        command_tensor.worker_pages_per_slice);
 }
 
 void print_tensor_command(uint32_t command_index, ttnn::ccl::cmd::CclCommandTensor const& command_tensor) {
 #ifdef DEBUG_PRINT_ENABLED
-    DPRINT << "cmd[" << (uint32_t)command_index << "]:\n";
+    DPRINT("cmd[{}]:\n", command_index);
     dprint(command_tensor);
 #endif
 }
@@ -114,6 +118,74 @@ constexpr bool is_sharded_tensor_layout(tt::tt_metal::TensorMemoryLayout tensor_
 template <typename T>
 constexpr Shape4D<T> build_wrapped_row_tensor_slice(T n_pages) {
     return Shape4D<T>{1, 1, 1, n_pages};
+}
+
+template <typename AddrGen>
+FORCE_INLINE void read_wrapped_chunk_from_output_tensor_to_address(
+    uint32_t& curr_page_idx,
+    uint32_t& offset_into_worker_slice,
+    const ttnn::ccl::coord_t& offset_worker_slice,
+    const ttnn::ccl::coord_t& worker_slice_shape,
+
+    // In tiles for tile layout
+    const ttnn::ccl::coord_t& tensor_shape,
+    const ttnn::ccl::coord_t& tensor_slice_shape,
+    const uint32_t local_l1_scratch_buffer_address,
+    const AddrGen& s,
+    const uint32_t num_pages,
+    const uint32_t page_size,
+    bool& last_page_of_worker) {
+    // we expected caller to reset this and the last curr_page_idx when we set it true
+    uint32_t local_l1_read_addr = local_l1_scratch_buffer_address;
+
+    int32_t contig_pages = 1;
+    for (uint32_t i = 0; i < num_pages; i += contig_pages) {
+        contig_pages = 1;
+#ifdef ROW_MAJOR_LAYOUT
+#ifdef INTERLEAVED_MEM_LAYOUT
+        uint64_t src_noc_addr = s.get_noc_addr(curr_page_idx);
+        noc_async_read(src_noc_addr, local_l1_read_addr, page_size);
+#elif defined SHARDED_MEM_LAYOUT
+        ASSERT(false);  // unimplemented
+#endif
+#elif defined TILED_LAYOUT
+#ifdef INTERLEAVED_MEM_LAYOUT
+        noc_async_read_page(curr_page_idx, s, local_l1_read_addr);
+        // common with `write_chunk_v2`
+#elif defined SHARDED_MEM_LAYOUT
+        auto const& [noc_yx, page_offset, contig_pages_] =
+            s.get_page_location_with_contiguous_pages_in_row_in_bank(curr_page_idx);
+        /*
+         * num_pages - i: check if we are outside the number of pages remaining
+         * contig_pages_: check if we are outside the max number of contig pages we can read in a row in a bank
+         * contig_edge_of_tensor_slice: check if we are outside the edge of the tensor slice (in which case, we wrap
+         * around if we aren't at the end)
+         */
+        uint32_t flattened_offset_worker_slice = offset_worker_slice.x + (offset_worker_slice.y * tensor_slice_shape.x);
+        uint32_t contig_edge_of_tensor_slice =
+            tensor_slice_shape.x - ((flattened_offset_worker_slice + offset_into_worker_slice) % tensor_slice_shape.x);
+
+        contig_pages = std::min<int32_t>(num_pages - i, std::min<int32_t>(contig_pages_, contig_edge_of_tensor_slice));
+        uint64_t src_noc_addr = get_noc_addr(
+            static_cast<uint32_t>(noc_yx.noc_x), noc_yx.noc_y, s.bank_base_address + (page_offset * s.page_size) + 0);
+        noc_async_read(src_noc_addr, local_l1_read_addr, page_size * contig_pages);
+#endif
+
+        // Update the curr_page_idx based on how the worker chunks + tensor slice is laid out in global tensor
+        advance_worker_global_page_interleaved(
+            curr_page_idx,  // Updated internally
+            offset_into_worker_slice,
+            offset_worker_slice,
+            worker_slice_shape,
+            tensor_slice_shape,
+            tensor_shape,
+            contig_pages,
+            last_page_of_worker);
+
+#endif
+        local_l1_read_addr += page_size * contig_pages;
+    }
+    noc_async_read_barrier();
 }
 
 ///////////////////////////////////////////////////
@@ -248,7 +320,7 @@ void kernel_main() {
     const uint32_t local_l1_scratch_buffer_address = get_write_ptr(cb_id);
 
 #ifdef DEBUG_PRINT_ENABLED
-    DPRINT << "ccl_send has " << (uint32_t)num_commands << " commands" << ENDL();
+    DPRINT("ccl_send has {} commands\n", num_commands);
 #endif
 
     for (std::size_t i = 0; i < num_commands; ++i) {

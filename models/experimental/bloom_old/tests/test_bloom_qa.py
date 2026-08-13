@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,7 +9,7 @@ from transformers import (
     BloomTokenizerFast,
     pipeline,
 )
-from models.utility_functions import print_diff_argmax
+from models.common.utility_functions import print_diff_argmax
 from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import (
     comp_allclose,
     comp_pcc,
@@ -37,6 +37,7 @@ def run_bloom_qa_inference(device):
     torch.manual_seed(0)
 
     model_name = "bigscience/bloom-560m"
+    # NOTE(transformers-5.x): `torchscript=` was removed from transformers configs in 5.x; drop it (a default no-op) when running this experimental model under 5.x.
     hugging_bloom_reference_model = BloomForQuestionAnswering.from_pretrained(model_name, torchscript=False)
     hugging_bloom_reference_model.eval()
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,8 +7,10 @@ import torch
 import ttnn
 
 from functools import partial
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 from tests.tt_eager.python_api_testing.sweep_tests.generation_funcs import gen_func_with_cast_tt
+
+pytestmark = pytest.mark.use_module_device
 
 
 @pytest.mark.parametrize(

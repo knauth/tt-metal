@@ -1,21 +1,21 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "mod_div_lib.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/matmul.h"
-#include "compute_kernel_api/pack_untilize.h"
+#include "internal/mod_div_lib.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/pack_untilize.h"
 
 #ifdef FUSE_BIAS
-#include "compute_kernel_api/bcast.h"
+#include "api/compute/bcast.h"
 #endif
 
-#include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
-
-namespace NAMESPACE {
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/sfpu_split_includes.h"
 
 FORCE_INLINE void reload_from_cb_to_dst(
     uint32_t in0_cb_id,
@@ -31,12 +31,12 @@ FORCE_INLINE void reload_from_cb_to_dst(
 
     uint32_t start_dst_index = 0;
     uint32_t start_tile_index = 0;
-    copy_block_matmul_partials(mm_partials_cb_id, start_tile_index, start_dst_index, out_subblock_num_tiles);
+    copy_block(mm_partials_cb_id, start_tile_index, start_dst_index, out_subblock_num_tiles);
 
     cb_pop_front(mm_partials_cb_id, out_subblock_num_tiles);
     // Reconfigure srcA back
-    mm_block_init_short_with_dt(
-        in0_cb_id, in1_cb_id, mm_partials_cb_id, false, out_subblock_w, out_subblock_h, in0_block_w);
+    reconfig_data_format_srca(mm_partials_cb_id, in1_cb_id);
+    matmul_block_init(in0_cb_id, in1_cb_id, false, out_subblock_w, out_subblock_h, in0_block_w);
 }
 
 template <uint32_t out_subblock_w, uint32_t out_block_w>
@@ -73,7 +73,7 @@ inline void reblock_and_untilize(
     cb_pop_front(interm_cb_id, num_tiles_in_row_of_subblocks);
 }
 
-void MAIN {
+void kernel_main() {
 // RUNTIME ARGS
 #ifdef MATMUL_DRAM_SHARDED
     const bool is_worker_core = get_arg_val<uint32_t>(0) == 1;
@@ -113,6 +113,7 @@ void MAIN {
 #ifdef FUSE_BIAS
     constexpr uint32_t bias_cb_id = tt::CBIndex::c_3;
     constexpr uint32_t mm_out_cb_id = mm_partials_cb_id;
+    constexpr bool row_broadcast_bias = (bool)get_compile_time_arg_val(14);
 #else
     constexpr uint32_t mm_out_cb_id = untilize_mode_out_cb_id;
 #endif
@@ -123,7 +124,8 @@ void MAIN {
 
     constexpr bool spill = num_blocks > 1;
 
-    mm_block_init(in0_cb_id, in1_cb_id, mm_partials_cb_id, false, out_subblock_w, out_subblock_h, in0_block_w);
+    compute_kernel_hw_startup<SrcOrder::Reverse>(in0_cb_id, in1_cb_id, mm_partials_cb_id);
+    matmul_block_init(in0_cb_id, in1_cb_id, false, out_subblock_w, out_subblock_h, in0_block_w);
     for (uint32_t b = 0; b < batch; b++) {
         bool enable_reload = false;
         uint32_t out_num_tiles_to_wait = out_subblock_num_tiles;
@@ -131,7 +133,7 @@ void MAIN {
 #ifdef PACK_RELU
         // for each batch we start we relu disabled so that intermediate results are not relu'd
         if constexpr (batch > 1) {
-            PACK((llk_pack_relu_config(ReluType::NO_RELU)));
+            PACK((llk_pack_relu_config(ReluConfig::none())));
         }
 #endif
 
@@ -145,7 +147,7 @@ void MAIN {
 #if not defined FUSE_BIAS and defined PACK_RELU
             if (last_out) {
                 // if last block we pack the final result with relu enabled
-                PACK((llk_pack_relu_config(ReluType::ZERO_RELU)));
+                PACK((llk_pack_relu_config(ReluConfig::zero())));
             }
 #endif
 
@@ -223,7 +225,7 @@ void MAIN {
 #endif
 
                         uint32_t start_dst_index = 0;
-                        pack_tile_block(start_dst_index, mm_out_cb_id, out_subblock_num_tiles);
+                        pack_block(start_dst_index, mm_out_cb_id, out_subblock_num_tiles);
 
                         tile_regs_release();
                         cb_push_back(mm_out_cb_id, out_subblock_num_tiles);
@@ -248,7 +250,7 @@ void MAIN {
 #endif
 
                         uint32_t start_dst_index = 0;
-                        pack_tile_block(start_dst_index, mm_partials_cb_id, out_subblock_num_tiles);
+                        pack_block(start_dst_index, mm_partials_cb_id, out_subblock_num_tiles);
 
                         tile_regs_release();
                         cb_push_back(mm_partials_cb_id, out_subblock_num_tiles);
@@ -292,7 +294,7 @@ void MAIN {
 #ifdef FUSE_BIAS
 #ifdef PACK_RELU
         // if last block we pack the final result with relu enabled
-        PACK((llk_pack_relu_config(ReluType::ZERO_RELU)));
+        PACK((llk_pack_relu_config(ReluConfig::zero())));
 #endif
 #if defined FP32_DEST_ACC_EN or defined PACKER_L1_ACC
         PACK((pack_reconfig_data_format(out_cb_id)));
@@ -302,7 +304,11 @@ void MAIN {
 #endif
 
         reconfig_data_format(in1_cb_id, mm_partials_cb_id, in0_cb_id, bias_cb_id);
-        add_bcast_rows_init_short(mm_partials_cb_id, bias_cb_id);
+        if constexpr (row_broadcast_bias) {
+            add_bcast_rows_init(mm_partials_cb_id, bias_cb_id);
+        } else {
+            add_init(mm_partials_cb_id, bias_cb_id);
+        }
         // reconfigure unpacker df for src B
         cb_wait_front(bias_cb_id, in1_per_core_w);
         for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
@@ -312,10 +318,14 @@ void MAIN {
                 cb_wait_front(mm_partials_cb_id, out_subblock_num_tiles);
                 tile_regs_acquire();
                 for (uint32_t i = 0, j = 0; j < out_subblock_h; j++) {
-                    uint32_t bcast_tile_idx = in1_index_subblock_offset;
+                    uint32_t bias_tile_idx = in1_index_subblock_offset;
                     for (uint32_t k = 0; k < out_subblock_w; k++, i++) {
-                        add_tiles_bcast_rows(mm_partials_cb_id, bias_cb_id, i, bcast_tile_idx, i);
-                        bcast_tile_idx++;
+                        if constexpr (row_broadcast_bias) {
+                            add_tiles_bcast_rows(mm_partials_cb_id, bias_cb_id, i, bias_tile_idx, i);
+                        } else {
+                            add_tiles(mm_partials_cb_id, bias_cb_id, i, bias_tile_idx, i);
+                        }
+                        bias_tile_idx++;
                     }
                 }
 // if there's no SFPU fusion, we commit the regs so packer can start packing
@@ -348,7 +358,7 @@ void MAIN {
 #endif  // FUSE_BIAS
         if constexpr (untilize_out) {
 #ifdef PACK_RELU
-            PACK((llk_pack_relu_config(ReluType::NO_RELU)));
+            PACK((llk_pack_relu_config(ReluConfig::none())));
 #endif  // PACK_RELU
 #ifndef FUSE_BIAS
             reconfig_data_format_srca(in1_cb_id, mm_partials_cb_id);
@@ -369,7 +379,7 @@ void MAIN {
         }
         if constexpr (batch > 1) {
             // reconfigure init for matmul
-            mm_block_init_short(in0_cb_id, in1_cb_id, 0, out_subblock_w, out_subblock_h, in0_block_w);
+            matmul_block_init(in0_cb_id, in1_cb_id, 0, out_subblock_w, out_subblock_h, in0_block_w);
 #ifdef FUSE_BIAS
             // reconfigure unpacker df for src A and src B
             reconfig_data_format(mm_partials_cb_id, in1_cb_id, bias_cb_id, in0_cb_id);
@@ -380,4 +390,3 @@ void MAIN {
         }
     }
 }
-}  // namespace NAMESPACE

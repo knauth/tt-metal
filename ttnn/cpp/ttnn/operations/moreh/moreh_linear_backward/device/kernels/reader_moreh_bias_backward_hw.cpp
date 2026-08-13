@@ -1,8 +1,11 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "ttnn/deprecated/tt_dnn/kernels/dataflow/moreh_common.hpp"
+#include "ttnn/kernel/dataflow/moreh_common.hpp"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
     ArgFetcher arg_fetcher;
@@ -14,7 +17,7 @@ void kernel_main() {
     const bool do_mask_h = (arg_fetcher.get_next_arg_val<uint32_t>() == 1);
     const bool do_mask_w = (arg_fetcher.get_next_arg_val<uint32_t>() == 1);
 
-    constexpr bool src_is_dram = get_compile_time_arg_val(0) == 1;
+    constexpr auto src_args = TensorAccessorArgs<0>();
 
     constexpr uint32_t cb_id_in0 = 0;
     constexpr uint32_t cb_id_scaler = 1;
@@ -25,24 +28,25 @@ void kernel_main() {
         uint32_t u;
     } scaler;
     scaler.f = 1.0f;
-    fill_cb_with_value(cb_id_scaler, scaler.u);
+    DataflowBuffer dfb_scaler(cb_id_scaler);
+    fill_cb_with_value(dfb_scaler, scaler.u);
 
     if (do_mask_h || do_mask_w) {
-        generate_mask_h_w(cb_id_mask_h_w, mask_h, mask_w);
+        DataflowBuffer dfb_mask_h_w(cb_id_mask_h_w);
+        generate_mask_h_w(dfb_mask_h_w, mask_h, mask_w);
     }
 
-    uint32_t l1_write_addr_in0;
-    uint32_t src_tile_bytes = get_tile_size(cb_id_in0);
-    auto src_data_format = get_dataformat(cb_id_in0);
-    const InterleavedAddrGenFast<src_is_dram> s0 = {
-        .bank_base_address = src_addr, .page_size = src_tile_bytes, .data_format = src_data_format};
+    const auto s0 = TensorAccessor(src_args, src_addr);
+
+    Noc noc;
+    DataflowBuffer dfb_in0(cb_id_in0);
+    const auto in0_tile_bytes = get_tile_size(cb_id_in0);
 
     constexpr uint32_t onetile = 1;
     for (uint32_t i = start_id; i < start_id + num_tiles; i++) {
-        cb_reserve_back(cb_id_in0, onetile);
-        l1_write_addr_in0 = get_write_ptr(cb_id_in0);
-        noc_async_read_tile(i, s0, l1_write_addr_in0);
-        noc_async_read_barrier();
-        cb_push_back(cb_id_in0, onetile);
+        dfb_in0.reserve_back(onetile);
+        noc.async_read(s0, dfb_in0, in0_tile_bytes, {.page_id = i}, {.offset_bytes = 0});
+        noc.async_read_barrier();
+        dfb_in0.push_back(onetile);
     }
 }

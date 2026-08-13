@@ -1,15 +1,15 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
-#include <umd/device/cluster.h>
 
-#include <core/ttnn_all_includes.hpp>
 #include <core/xtensor_utils.hpp>
+#include <umd/device/cluster.hpp>
 
 #include "autograd/auto_context.hpp"
 #include "autograd/tensor.hpp"
+#include "core/system_utils.hpp"
 #include "core/tt_tensor_utils.hpp"
 #include "core/xtensor_utils.hpp"
 #include "datasets/dataloader.hpp"
@@ -18,11 +18,13 @@
 #include "modules/linear_module.hpp"
 #include "ops/losses.hpp"
 #include "optimizers/sgd.hpp"
+#include "ttnn/distributed/distributed_tensor.hpp"
+#include "ttnn_fixed/distributed/tt_metal.hpp"
 
 namespace {
 
 auto check_board_is_n300() {
-    return tt::umd::Cluster::create_cluster_descriptor()->get_board_type(0) == BoardType::N300;
+    return tt::umd::Cluster::create_cluster_descriptor()->get_board_type(0) == tt::BoardType::N300;
 }
 
 }  // namespace
@@ -33,6 +35,8 @@ protected:
         if (!check_board_is_n300()) {
             GTEST_SKIP() << "Skipping N300 specific tests";
         }
+
+        ttml::ttnn_fixed::distributed::enable_fabric(2U);
         ttml::autograd::ctx().open_device(tt::tt_metal::distributed::MeshShape(1, 2));
     }
 
@@ -51,6 +55,8 @@ using DataLoader = ttml::datasets::DataLoader<
     BatchType>;
 
 TEST_F(LinearRegressionDDPTest, Full) {
+    // Skip with watcher enabled github issue #37193
+    SKIP_FOR_WATCHER();
     const size_t training_samples_count = 1000;
     const size_t num_features = 64;
     const size_t num_targets = 32;
@@ -70,7 +76,7 @@ TEST_F(LinearRegressionDDPTest, Full) {
     auto* device = &ttml::autograd::ctx().get_device();
 
     std::function<BatchType(std::vector<DatasetSample> && samples)> collate_fn =
-        [&num_features, &num_targets, device](std::vector<DatasetSample>&& samples) {
+        [device](std::vector<DatasetSample>&& samples) {
             const uint32_t batch_size = samples.size();
             std::vector<float> data;
             std::vector<float> targets;
@@ -100,7 +106,6 @@ TEST_F(LinearRegressionDDPTest, Full) {
     auto sgd_config = ttml::optimizers::SGDConfig{.lr = learning_rate, .momentum = 0.0F};
     auto optimizer = ttml::optimizers::SGD(model->parameters(), sgd_config);
 
-    int training_step = 0;
     const int num_epochs = 1;
     for (int epoch = 0; epoch < num_epochs; ++epoch) {
         for (const auto& [data, targets] : train_dataloader) {

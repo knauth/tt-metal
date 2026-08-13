@@ -1,14 +1,16 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
+
+#pragma once
 
 #include <cstdint>
 #include <array>
 #include "eth_l1_address_map.h"
-#include "dataflow_api.h"
-#include "ethernet/dataflow_api.h"
-#include "debug/assert.h"
-#include "debug/dprint.h"
+#include "api/dataflow/dataflow_api.h"
+#include "internal/ethernet/dataflow_api.h"
+#include "api/debug/assert.h"
+#include "api/debug/dprint.h"
 #include "eth_ubenchmark_types.hpp"
 #include "risc_common.h"
 
@@ -254,7 +256,7 @@ FORCE_INLINE void check_write_worker_done_and_send_ack(
         send_ack_condition = send_ack_condition && write_worker_done(curr_trid);
     }
     if (send_ack_condition) {
-        // DPRINT << "read_ptr " << read_ptr << ENDL();
+        // DPRINT("read_ptr {}\n", read_ptr);
         ack_complete(buffer_slot_addrs[read_ptr], buffer_slot_sync_addrs[read_ptr], full_payload_size);
         read_ptr = advance_buffer_slot_ptr(read_ptr);
         num_messages_ack++;
@@ -299,7 +301,7 @@ FORCE_INLINE void receiver_uni_dir(
         total_msgs = num_messages * NUM_BUFFER_SLOTS;
     }
 
-    DPRINT << "RECEIVER MAIN LOOP" << ENDL();
+    DPRINT("RECEIVER MAIN LOOP\n");
 
     uint32_t receiver_buffer_read_ptr = 0;
     uint32_t receiver_buffer_write_ptr = 0;
@@ -343,7 +345,7 @@ FORCE_INLINE void send_receiver_bi_dir(
         total_msgs = num_messages * NUM_BUFFER_SLOTS * 2;
     }
 
-    DPRINT << "SENDER-RECEIVER MAIN LOOP" << ENDL();
+    DPRINT("SENDER-RECEIVER MAIN LOOP\n");
 
     uint32_t sender_buffer_read_ptr = 0;
     uint32_t sender_buffer_write_ptr = 0;

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -8,7 +8,7 @@
 #pragma once
 #if defined(KERNEL_BUILD) || defined(FW_BUILD)
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 
 #endif
 
@@ -50,11 +50,11 @@ struct ShardCoordInfo {
 template <uint32_t columns_per_shard, uint32_t total_pages_last_dim, shard_addr_gen_consts::ContiguityType contiguity>
 struct ShardCoordInfo get_width_sharded_coordinates(uint32_t page_num) {
     // Returns core index followed by the page number
-    struct ShardCoordInfo coord_info;
+    struct ShardCoordInfo coord_info{};
     uint32_t page_row = page_num / total_pages_last_dim;
-    uint32_t page_col = page_num - page_row * total_pages_last_dim;
+    uint32_t page_col = page_num - (page_row * total_pages_last_dim);
     uint32_t w_core_id = page_col / columns_per_shard;
-    uint32_t w_offset = page_col - w_core_id * columns_per_shard;
+    uint32_t w_offset = page_col - (w_core_id * columns_per_shard);
     coord_info.core_num = w_core_id;
     coord_info.page_num = page_row * columns_per_shard + w_offset;
     if constexpr (
@@ -73,7 +73,7 @@ struct ShardCoordInfo get_width_sharded_coordinates(uint32_t page_num) {
 template <uint32_t rows_per_shard, uint32_t total_pages_last_dim, shard_addr_gen_consts::ContiguityType contiguity>
 struct ShardCoordInfo get_height_sharded_coordinates(uint32_t page_num) {
     // Returns core index followed by the page number
-    struct ShardCoordInfo coord_info;
+    struct ShardCoordInfo coord_info{};
     constexpr uint32_t num_pages_per_core = total_pages_last_dim * rows_per_shard;
     coord_info.core_num = page_num / num_pages_per_core;
     coord_info.page_num = page_num - coord_info.core_num * num_pages_per_core;
@@ -99,17 +99,17 @@ template <
 experimental::shard_addr_gen_utils::ShardCoordInfo get_block_sharded_coordinates(uint32_t page_num) {
     // Returns core index followed by the page number
     // Calculate how many cores are in the sharding grid
-    constexpr uint32_t cores_per_block_row = (total_pages_last_dim - 1) / columns_per_shard + 1;
-    experimental::shard_addr_gen_utils::ShardCoordInfo coord_info;
+    constexpr uint32_t cores_per_block_row = ((total_pages_last_dim - 1) / columns_per_shard) + 1;
+    experimental::shard_addr_gen_utils::ShardCoordInfo coord_info{};
     // Get row and column ID of this page
     uint32_t page_row = page_num / total_pages_last_dim;
-    uint32_t page_col = page_num - page_row * total_pages_last_dim;
+    uint32_t page_col = page_num - (page_row * total_pages_last_dim);
     // Find the w direction core and the offset within it
     uint32_t w_core_id = page_col / columns_per_shard;
-    uint32_t w_offset = page_col - w_core_id * columns_per_shard;
+    uint32_t w_offset = page_col - (w_core_id * columns_per_shard);
     // Find the h direction core and the offset within it
     uint32_t h_core_id = page_row / rows_per_shard;
-    uint32_t h_offset = page_row - h_core_id * rows_per_shard;
+    uint32_t h_offset = page_row - (h_core_id * rows_per_shard);
     // Find the coord_info
     coord_info.core_num = w_core_id + h_core_id * cores_per_block_row;
     coord_info.page_num = w_offset + h_offset * columns_per_shard;
@@ -139,7 +139,7 @@ std::pair<const mapping_table_t* const, uint32_t> get_shard_map(uint32_t L1_addr
     // and .second holds the size of the map
     constexpr ShardingInfoType CONSTANT_ARGS{};
     const mapping_table_t* const map = reinterpret_cast<const mapping_table_t* const>(L1_address);
-    constexpr uint32_t incrementation = (CONSTANT_ARGS.number_of_cores - 1) / 2 + 1;
+    constexpr uint32_t incrementation = ((CONSTANT_ARGS.number_of_cores - 1) / 2) + 1;
     return std::pair<const mapping_table_t* const, uint32_t>(map, incrementation);
 }
 
@@ -159,8 +159,8 @@ std::pair<const mapping_table_t* const, uint32_t> get_shard_map(uint32_t L1_addr
 
     The above parameters are usually obtained using get_compile_time_arg_val.
     In the program factory you can create an vector containing the above parameters in order using the function
-    shard_builder:generate_compile_time_args(const tt::tt_metal::Tensor& t)
-    defined in ttnn/cpp/ttnn/operations/ccl/sharding_addrgen_helper.cpp
+    shard_builder:generate_compile_time_args(const ttnn::Tensor& t)
+    defined in ttnn/operations/ccl/sharding_addrgen_helper.cpp
 
     It also needs a shard array map which can be extracted from the RT args using shard_addr_gen_utils::get_shard_map
 function which requires the ShardedInfo class object ex. auto mapping =
@@ -170,8 +170,8 @@ const shard_array_map = mapping.first;
 rt_index += mapping.second;//contains the size of the map hence how much to increment the rt values
 
 In the program factory you can create an vector containing the runtime arguments extracted by this function using the
-function shard_builder:generate_run_time_args(const tt::tt_metal::Tensor& t)
-    defined in ttnn/cpp/ttnn/operations/ccl/sharding_addrgen_helper.cpp
+function shard_builder:generate_run_time_args(const ttnn::Tensor& t)
+    defined in ttnn/operations/ccl/sharding_addrgen_helper.cpp
 
 
 
@@ -263,6 +263,10 @@ struct ShardedAddrGen {
         return return_val;
     }
 
+    // Uses the legacy noc_async_read primitive because get_sharded_addr
+    // produces a precomposed 64-bit noc address.
+    // Consumers migrating to Device 2.0 should use get_noc_addr() / its
+    // components together with Noc::async_read directly.
     FORCE_INLINE
     void noc_async_read_page(
         const uint32_t id, const uint32_t dest_addr, const uint32_t offset = 0, uint8_t noc = noc_index) const {

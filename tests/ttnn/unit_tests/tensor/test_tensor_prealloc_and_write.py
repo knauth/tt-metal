@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,8 +7,7 @@ import pytest
 import torch
 
 import ttnn
-from models.utility_functions import comp_pcc
-from models.utility_functions import is_grayskull
+from models.common.utility_functions import comp_pcc
 
 
 @pytest.mark.parametrize("shape", [(1, 10, 64, 96), (32, 1, 64, 64), (32, 3, 256, 256), (16, 1, 1024, 1024)])

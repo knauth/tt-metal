@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -12,10 +12,12 @@
 #include "ttnn/core.hpp"
 #include "ttnn/device_operation.hpp"
 #include "ttnn/types.hpp"
-#include "ttnn/decorators.hpp"
 #include "ttnn/global_semaphore.hpp"
+#include <tt-metalium/global_semaphore.hpp>
+#include <tt-metalium/program_descriptors.hpp>
 #include <tt-metalium/sub_device.hpp>
-#include <tt-metalium/fabric_edm_types.hpp>
+#include <tt-metalium/workload_descriptor.hpp>
+#include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
 #include <vector>
 
 namespace ttnn::operations::ccl {
@@ -42,8 +44,14 @@ struct AllToAllDispatchDeviceOperation {
         const std::optional<uint32_t> axis;
         const uint32_t num_links;
         const tt::tt_fabric::Topology topology;
-        const std::optional<GlobalSemaphore> cross_device_semaphore;
         const AllToAllTransferType impl;
+        const uint32_t output_concat_dim;
+        static constexpr auto attribute_names = std::forward_as_tuple(
+            "worker_core_range_set", "output_mem_config", "axis", "num_links", "topology", "impl", "output_concat_dim");
+        auto attribute_values() const {
+            return std::forward_as_tuple(
+                worker_core_range_set, output_mem_config, axis, num_links, topology, impl, output_concat_dim);
+        };
     };
     struct tensor_args_t {
         const Tensor input_tensor;
@@ -52,37 +60,25 @@ struct AllToAllDispatchDeviceOperation {
         const std::optional<std::array<Tensor, 2>> optional_output_tensors;
     };
 
-    using spec_return_value_t = std::array<ttnn::TensorSpec, 2>;
+    using spec_return_value_t = std::array<tt::tt_metal::TensorSpec, 2>;
 
     using tensor_return_value_t = std::array<Tensor, 2>;
 
     struct AllToAllDispatchSparse {
-        // Shared variables are the variables that are shared between the create and override_runtime_arguments methods
-        struct shared_variables_t {
-            tt::tt_metal::KernelHandle ternary_reader_kernel_id;
-            tt::tt_metal::KernelHandle binary_writer_kernel_id;
-            std::vector<CoreCoord> cores;
-        };
-        using cached_mesh_workload_t = ttnn::device_operation::AdaptedCachedMeshWorkload<shared_variables_t>;
-
-        static cached_mesh_workload_t create_mesh_workload(
+        // Builds the entire workload in one call (cache miss):
+        //   1. Allocates the two GlobalSemaphores used by the kernels (init / cross-device)
+        //      and parks them on `WorkloadDescriptor::semaphores` so the framework keeps
+        //      them alive for the cached workload's lifetime.
+        //   2. Runs the cross-device Synchronize barrier once per workload.
+        //   3. Loops `tensor_coords.coords()` and pushes a per-coord ProgramDescriptor
+        //      into `programs`.  Each program depends on its mesh coordinate (fabric
+        //      routing / DEST_CHIP_ID define / linearized mesh index), so descriptors
+        //      cannot be shared across coords.
+        static tt::tt_metal::WorkloadDescriptor create_workload_descriptor(
             const operation_attributes_t& operation_attributes,
-            const ttnn::MeshCoordinateRangeSet& tensor_coords,
-            const tensor_args_t& tensor_args,
-            tensor_return_value_t& tensor_return_value);
-
-        static ttnn::device_operation::CachedProgram<shared_variables_t> create_at(
-            const operation_attributes_t& operation_attributes,
-            const ttnn::MeshCoordinate& mesh_coordinate,
             const tensor_args_t& tensor_args,
             tensor_return_value_t& tensor_return_value,
             const ttnn::MeshCoordinateRangeSet& tensor_coords);
-
-        static void override_runtime_arguments(
-            cached_mesh_workload_t& cached_program,
-            const operation_attributes_t& operation_attributes,
-            const tensor_args_t& tensor_args,
-            tensor_return_value_t& tensor_return_value);
     };
 
     using program_factory_t = std::variant<AllToAllDispatchSparse>;
@@ -90,8 +86,6 @@ struct AllToAllDispatchDeviceOperation {
     // Mandatory methods
 
     // Select the program factory based on the operation attributes and tensor args
-    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
-
     // Validate the operation when it creates a program.
     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
 
@@ -103,24 +97,20 @@ struct AllToAllDispatchDeviceOperation {
 
     // Create the output tensors based on the operation attributes and tensor args
     static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
-
-    static std::tuple<operation_attributes_t, tensor_args_t> invoke(
-        const ttnn::Tensor& input_tensor,
-        const ttnn::Tensor& expert_indices_tensor,
-        const ttnn::Tensor& expert_mapping_tensor,
-        std::optional<uint32_t> axis,
-        const std::optional<std::array<ttnn::Tensor, 2>>& optional_output_tensors,
-        uint32_t num_links,
-        tt::tt_fabric::Topology topology,
-        const ttnn::MemoryConfig& memory_config,
-        const CoreRangeSet& worker_core_range_set,
-        const std::optional<GlobalSemaphore>& global_semaphore,
-        AllToAllTransferType impl);
 };
 }  // namespace ttnn::operations::ccl
 
 namespace ttnn::prim {
-// Register the operation with the ttnn::register_operation API to make it available to the user as ttnn::prim::example
-constexpr auto all_to_all_dispatch = ttnn::
-    register_operation<"ttnn::prim::all_to_all_dispatch", ttnn::operations::ccl::AllToAllDispatchDeviceOperation>();
+ttnn::operations::ccl::AllToAllDispatchDeviceOperation::tensor_return_value_t all_to_all_dispatch(
+    const ttnn::Tensor& input_tensor,
+    const ttnn::Tensor& expert_indices_tensor,
+    const ttnn::Tensor& expert_mapping_tensor,
+    std::optional<uint32_t> axis,
+    const std::optional<std::array<ttnn::Tensor, 2>>& optional_output_tensors,
+    uint32_t num_links,
+    tt::tt_fabric::Topology topology,
+    const ttnn::MemoryConfig& memory_config,
+    const CoreRangeSet& worker_core_range_set,
+    ttnn::operations::ccl::AllToAllDispatchDeviceOperation::AllToAllTransferType impl,
+    uint32_t output_concat_dim);
 }  // namespace ttnn::prim

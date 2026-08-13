@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -15,7 +15,7 @@ from tests.ttnn.utils_for_testing import (
     start_measuring_time,
     stop_measuring_time,
 )
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 
 # Override the default timeout in seconds for hang detection.
 TIMEOUT = 30
@@ -44,9 +44,7 @@ def mesh_device_fixture():
     ttnn.SetDefaultDevice(device)
 
     device_name = "Unknown"
-    if ttnn.device.is_grayskull(device):
-        device_name = "grayskull"
-    elif ttnn.device.is_wormhole_b0(device):
+    if ttnn.device.is_wormhole_b0(device):
         device_name = "wormhole_b0"
     elif ttnn.device.is_blackhole(device):
         device_name = "blackhole"
@@ -63,7 +61,6 @@ def run_conv2d_full_sweep(
     output_layout,
     has_bias,
     enable_act_double_buffer,
-    enable_split_reader,
     activations_dtype,
     weights_dtype,
     math_fidelity,
@@ -126,7 +123,6 @@ def run_conv2d_full_sweep(
         override_sharding_config=override_sharding_config,
         output_layout=output_layout,
         enable_act_double_buffer=enable_act_double_buffer,
-        enable_split_reader=enable_split_reader,
     )
     compute_config = ttnn.init_device_compute_kernel_config(
         device.arch(),
@@ -181,6 +177,9 @@ def run_conv2d_full_sweep(
 def run_conv2d_short_sweep(
     input_specs,
     device,
+    config_tensors_in_dram=False,
+    output_dtype=None,  # ttnn dtype object (e.g., ttnn.bfloat8_b)
+    compute_config=None,  # ttnn compute config object
 ) -> list:
     # for tt-forge suite, extra arguments are tensor configs
     is_forge_suite = False
@@ -260,7 +259,13 @@ def run_conv2d_short_sweep(
 
     tt_bias_tensor = None
     conv_config = ttnn.Conv2dConfig()
-    conv_output_dtype = ttnn.bfloat16
+    # Set config_tensors_in_dram if requested (helps avoid L1 OOM for memory-intensive configs)
+    if config_tensors_in_dram:
+        conv_config.config_tensors_in_dram = True
+
+    # Use provided dtype or default to bfloat16
+    conv_output_dtype = output_dtype if output_dtype is not None else ttnn.bfloat16
+
     if is_forge_suite:
         input_layout = ttnn.Layout(input_layout)
         input_dtype = ttnn.DataType(input_dtype)
@@ -274,8 +279,7 @@ def run_conv2d_short_sweep(
             tt_bias_tensor = ttnn.from_torch(torch_bias_tensor, weights_dtype)
         output_layout = ttnn.Layout(output_layout)
         output_dtype = ttnn.DataType(output_dtype)
-        if stride_h == kernel_height and stride_w == kernel_width and stride_h >= 16 and pad_h == 0 and pad_w == 0:
-            conv_config.enable_kernel_stride_folding = True
+
         conv_output_dtype = output_dtype
         conv_config.weights_dtype = weights_dtype
         conv_config.output_layout = output_layout
@@ -285,7 +289,6 @@ def run_conv2d_short_sweep(
             tt_bias_tensor = ttnn.from_torch(torch_bias_tensor, ttnn.bfloat16)
 
         tt_input_tensor = ttnn.from_torch(torch_input_tensor, ttnn.bfloat16, device=device)
-
     start_time = start_measuring_time()
     [tt_output_tensor_on_device, [out_height, out_width], [weights_device, bias_device]] = ttnn.conv2d(
         input_tensor=tt_input_tensor,
@@ -306,6 +309,7 @@ def run_conv2d_short_sweep(
         return_output_dim=True,
         return_weights_and_bias=True,
         dtype=conv_output_dtype,
+        compute_config=compute_config,
     )
 
     tt_output_tensor = ttnn.from_device(tt_output_tensor_on_device)
@@ -317,9 +321,14 @@ def run_conv2d_short_sweep(
     torch_output_tensor = torch_output_tensor.reshape(batch_size, out_height, out_width, torch_output_tensor.shape[-1])
     torch_output_tensor = torch_output_tensor[:, :, :, :output_channels]
 
-    torch_output_tensor = torch.permute(torch_output_tensor, (0, 3, 1, 2))
+    torch_out_golden_tensor = torch.permute(torch_out_golden_tensor, (0, 2, 3, 1))
 
-    return [check_with_pcc_without_tensor_printout(torch_output_tensor, torch_out_golden_tensor, pcc=0.985), e2e_perf]
+    return [
+        *check_with_pcc_without_tensor_printout(torch_output_tensor, torch_out_golden_tensor, pcc=0.985),
+        e2e_perf,
+        torch_output_tensor,
+        torch_out_golden_tensor,
+    ]
 
 
 def run_conv1d_short_sweep(

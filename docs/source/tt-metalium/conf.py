@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -23,8 +23,8 @@ sys.path.insert(0, os.path.abspath(".."))
 MetalSphinxConfig = collections.namedtuple("MetalSphinxConfig", ["fullname", "shortname"])
 
 config_lookup = {
-    "tt-metalium": MetalSphinxConfig(fullname="TT-Metalium", shortname="tt-metalium"),
-    "ttnn": MetalSphinxConfig(fullname="TT-NN", shortname="ttnn"),
+    "tt-metalium": MetalSphinxConfig(fullname="TT-Metalium&trade;", shortname="tt-metalium"),
+    "ttnn": MetalSphinxConfig(fullname="TT-NN&trade;", shortname="ttnn"),
 }
 
 if "REQUESTED_DOCS_PKG" not in os.environ:
@@ -104,6 +104,7 @@ html_baseurl = f"/tt-metal/" + os.environ["DOCS_VERSION"] + f"/{metal_sphinx_con
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ["_static"]
+html_js_files = ["posthog.js"]
 
 html_context = {"logo_link_url": "https://docs.tenstorrent.com/"}
 

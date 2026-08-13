@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,15 +14,22 @@ __all__ = []
 def apply_activations(tensor, activations):
     import torch
 
-    string_to_function = {
-        "relu": torch.relu,
-        "gelu": torch.nn.functional.gelu,
-        "silu": torch.nn.functional.silu,
+    act_func_map = {
+        ttnn.UnaryOpType.RELU: torch.nn.functional.relu,
+        ttnn.UnaryOpType.SILU: torch.nn.functional.silu,
+        ttnn.UnaryOpType.MISH: torch.nn.functional.mish,
+        ttnn.UnaryOpType.SIGMOID: torch.nn.functional.sigmoid,
+        ttnn.UnaryOpType.TANH: torch.nn.functional.tanh,
+        ttnn.UnaryOpType.LOG: torch.log,
+        ttnn.UnaryOpType.SOFTPLUS: torch.nn.functional.softplus,
+        ttnn.UnaryOpType.GELU: torch.nn.functional.gelu,
+        ttnn.UnaryOpType.GELU_TANH: lambda x: torch.nn.functional.gelu(x, approximate="tanh"),
+        ttnn.UnaryOpType.SQRT: torch.sqrt,
     }
 
     if activations is not None:
         for activation in activations:
-            activation_function = string_to_function[activation]
+            activation_function = act_func_map[activation.op_type]
             tensor = activation_function(tensor)
     return tensor
 
@@ -180,7 +187,6 @@ def _golden_function(input_tensor_a, input_tensor_b, *args, **kwargs):
     return torch.divide(input_tensor_a, input_tensor_b)
 
 
-ttnn.attach_golden_function(ttnn.divide, golden_function=_golden_function)
 ttnn.attach_golden_function(ttnn.divide_, golden_function=_golden_function)
 
 
@@ -312,10 +318,10 @@ def _golden_function_isclose(input_tensor_a, input_tensor_b, *args, rtol=1e-05, 
 ttnn.attach_golden_function(ttnn.isclose, golden_function=_golden_function_isclose)
 
 
-def _golden_function_div(input_tensor_a, input_tensor_b, round_mode=None, *args, **kwargs):
+def _golden_function_div(input_tensor_a, input_tensor_b, rounding_mode=None, *args, **kwargs):
     import torch
 
-    return torch.div(input_tensor_a, input_tensor_b, rounding_mode=round_mode)
+    return torch.div(input_tensor_a, input_tensor_b, rounding_mode=rounding_mode)
 
 
 ttnn.attach_golden_function(ttnn.div, golden_function=_golden_function_div)
@@ -353,12 +359,7 @@ def _golden_function_remainder(input_tensor_a, input_tensor_b, *args, device, **
         if input_dtype == torch.bfloat16:
             input_tensor_a = input_tensor_a.float()
 
-    result = torch.nan_to_num(
-        torch.remainder(input_tensor_a, input_tensor_b),
-        nan=device.sfpu_nan(),
-        posinf=device.sfpu_inf(),
-        neginf=-device.sfpu_inf(),
-    )
+    result = torch.remainder(input_tensor_a, input_tensor_b)
 
     if input_dtype == torch.bfloat16:
         result = result.bfloat16()
@@ -375,12 +376,7 @@ def _golden_function_fmod(input_tensor_a, input_tensor_b, *args, device, **kwarg
         input_dtype = input_tensor_a.dtype
         if input_dtype == torch.bfloat16:
             input_tensor_a = input_tensor_a.float()
-        result = torch.nan_to_num(
-            torch.fmod(input_tensor_a, input_tensor_b),
-            nan=device.sfpu_nan(),
-            posinf=device.sfpu_inf(),
-            neginf=-device.sfpu_inf(),
-        )
+        result = torch.fmod(input_tensor_a, input_tensor_b)
         if input_dtype == torch.bfloat16:
             result = result.bfloat16()
     else:
@@ -401,7 +397,9 @@ def torch_squared_difference(x, y, *args, **kwargs):
 def _golden_function_outer(input_tensor_a, input_tensor_b, *args, **kwargs):
     import torch
 
-    return torch.outer(input_tensor_a.squeeze(), input_tensor_b.squeeze())
+    if input_tensor_a.dim() == 1 and input_tensor_b.dim() == 1:
+        return torch.outer(input_tensor_a, input_tensor_b)
+    return torch.einsum("...i,...j->...ij", input_tensor_a, input_tensor_b)
 
 
 ttnn.attach_golden_function(ttnn.outer, golden_function=_golden_function_outer)

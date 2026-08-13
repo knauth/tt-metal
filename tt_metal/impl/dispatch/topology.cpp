@@ -1,54 +1,40 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "topology.hpp"
 
-#include <device_pool.hpp>
+#include "device/device_manager.hpp"
 #include <host_api.hpp>
 #include <enchantum/enchantum.hpp>
-#include <tt-metalium/erisc_datamover_builder.hpp>
-#include <tt-metalium/mesh_graph.hpp>
+#include <experimental/fabric/mesh_graph.hpp>
 #include <tt_metal.hpp>
-#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <typeinfo>
 #include <memory>
-#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
-#include <variant>
+#include <vector>
 
-#include "assert.hpp"
+#include <tt_stl/assert.hpp>
 #include "command_queue_common.hpp"
-#include "control_plane.hpp"
 #include "core_coord.hpp"
-#include "data_types.hpp"
 #include "device.hpp"
-#include "impl/context/metal_context.hpp"
 #include "dispatch_core_common.hpp"
-#include "hostdevcommon/fabric_common.h"
 #include "kernel_config/fd_kernel.hpp"
-#include "kernel_types.hpp"
-#include "metal_soc_descriptor.h"
-#include "persistent_kernel_cache.hpp"
 #include "program/program_impl.hpp"
-#include "tt-metalium/program.hpp"
+#include "program.hpp"
 #include <tt_stl/span.hpp>
-#include <tt-metalium/fabric.hpp>
+#include <experimental/fabric/fabric.hpp>
 #include "system_memory_manager.hpp"
-#include "tt_metal/fabric/fabric_host_utils.hpp"
-#include "tt_metal/fabric/fabric_context.hpp"
-#include <umd/device/tt_core_coordinates.h>
-#include <umd/device/tt_xy_pair.h>
-
-// hack for test_basic_fabric_apis.cpp
-// https://github.com/tenstorrent/tt-metal/issues/20000
-// TODO: delete this once tt_fabric_api.h fully support low latency feature
-extern "C" bool isFabricUnitTest() __attribute__((weak));
-bool isFabricUnitTest() { return false; }
+#include <umd/device/types/core_coordinates.hpp>
+#include <umd/device/types/xy_pair.hpp>
+#include "dispatch_mem_map.hpp"
+#include "impl/context/metal_context.hpp"
+#include <llrt/tt_cluster.hpp>
+#include "dispatch_core_manager.hpp"
 
 namespace tt::tt_metal {
 
@@ -79,9 +65,9 @@ void increment_node_ids(DispatchKernelNode& node, uint32_t inc) {
 // Downstream: send data to tunnel and/or prefetch_d variant and/or dispatch_d
 //
 constexpr noc_selection_t k_prefetcher_noc = {
-    .non_dispatch_noc = tt::tt_metal::NOC::NOC_0,
-    .upstream_noc = tt::tt_metal::NOC::NOC_0,
-    .downstream_noc = tt::tt_metal::NOC::NOC_0,
+    .non_dispatch_noc = NOC::NOC_0,
+    .upstream_noc = NOC::NOC_0,
+    .downstream_noc = NOC::NOC_0,
 };
 
 //
@@ -94,8 +80,8 @@ constexpr noc_selection_t k_prefetcher_noc = {
 // Downstream: relay data from dispatch_d to dispatch_h (return to host) and/or dispatch_s
 //
 constexpr noc_selection_t k_dispatcher_noc = {
-    .non_dispatch_noc = tt::tt_metal::NOC::NOC_0,
-    .upstream_noc = tt::tt_metal::NOC::NOC_1,
+    .non_dispatch_noc = NOC::NOC_0,
+    .upstream_noc = NOC::NOC_1,
     .downstream_noc = k_dispatch_downstream_noc,
 };
 
@@ -109,9 +95,9 @@ constexpr noc_selection_t k_dispatcher_noc = {
 // Downstream: relay data from dispatch_d to dispatch_h (return to host) and/or dispatch_s
 //
 constexpr noc_selection_t k_dispatcher_s_noc = {
-    .non_dispatch_noc = tt::tt_metal::NOC::NOC_1,
-    .upstream_noc = tt::tt_metal::NOC::NOC_1,
-    .downstream_noc = tt::tt_metal::NOC::NOC_1,
+    .non_dispatch_noc = NOC::NOC_1,
+    .upstream_noc = NOC::NOC_1,
+    .downstream_noc = NOC::NOC_1,
 };
 
 // Must be on different NOCs because Dispatch+S may be running on the same
@@ -125,9 +111,16 @@ static_assert(k_dispatcher_noc.non_dispatch_noc != k_dispatcher_s_noc.non_dispat
 // Must be NoC0
 //
 constexpr noc_selection_t k_fabric_mux_noc = {
-    .non_dispatch_noc = tt::tt_metal::NOC::NOC_0,
-    .upstream_noc = tt::tt_metal::NOC::NOC_0,
-    .downstream_noc = tt::tt_metal::NOC::NOC_0,
+    .non_dispatch_noc = NOC::NOC_0,
+    .upstream_noc = NOC::NOC_0,
+    .downstream_noc = NOC::NOC_0,
+};
+
+// Quasar only has a single NOC
+constexpr noc_selection_t k_quasar_noc = {
+    .non_dispatch_noc = NOC::NOC_0,
+    .upstream_noc = NOC::NOC_0,
+    .downstream_noc = NOC::NOC_0,
 };
 
 // clang-format off
@@ -151,6 +144,22 @@ static const std::vector<DispatchKernelNode> single_chip_arch_2cq_dispatch_s = {
     {3, 0, 0, 1, DISPATCH_HD, {2, x, x, x}, {5, x, x, x}, k_dispatcher_noc},
     {4, 0, 0, 0, DISPATCH_S, {0, x, x, x}, {1, x, x, x}, k_dispatcher_s_noc},
     {5, 0, 0, 1, DISPATCH_S, {2, x, x, x}, {3, x, x, x}, k_dispatcher_s_noc},
+};
+
+static const std::vector<DispatchKernelNode> quasar_single_chip_1cq = {
+    {0, 0, 0, 0, PREFETCH_HD, {x, x, x, x}, {1, 2, x, x}, k_quasar_noc},
+    {1, 0, 0, 0, DISPATCH_HD, {0, x, x, x}, {2, x, x, x}, k_quasar_noc},
+    {2, 0, 0, 0, DISPATCH_S, {0, x, x, x}, {1, x, x, x}, k_quasar_noc},
+};
+
+static const std::vector<DispatchKernelNode> quasar_single_chip_2cq = {
+    {0, 0, 0, 0, PREFETCH_HD, {x, x, x, x}, {1, 2, x, x}, k_quasar_noc},
+    {1, 0, 0, 0, DISPATCH_HD, {0, x, x, x}, {2, x, x, x}, k_quasar_noc},
+    {2, 0, 0, 0, DISPATCH_S, {0, x, x, x}, {1, x, x, x}, k_quasar_noc},
+
+    {3, 0, 0, 1, PREFETCH_HD, {x, x, x, x}, {4, 5, x, x}, k_quasar_noc},
+    {4, 0, 0, 1, DISPATCH_HD, {3, x, x, x}, {5, x, x, x}, k_quasar_noc},
+    {5, 0, 0, 1, DISPATCH_S, {3, x, x, x}, {4, x, x, x}, k_quasar_noc},
 };
 
 static const std::vector<DispatchKernelNode> two_chip_arch_1cq_fabric = {
@@ -406,18 +415,32 @@ static const std::vector<DispatchKernelNode> galaxy_nine_chip_arch_2cq_fabric = 
 };
 // clang-format on
 
-std::vector<FDKernel*> node_id_to_kernel;
-tt::tt_metal::detail::ProgramCompileGroup command_queue_compile_group;
-std::unordered_map<chip_id_t, std::unordered_set<CoreCoord>> dispatch_cores;
-std::unordered_map<chip_id_t, std::unordered_set<CoreCoord>> routing_cores;
-std::unordered_map<chip_id_t, std::unordered_set<CoreCoord>> empty_cores;
-std::unordered_map<chip_id_t, std::unordered_set<TerminationInfo>> termination_info;
+DispatchTopology::DispatchTopology(
+    const ContextDescriptor& descriptor,
+    dispatch_core_manager& dispatch_core_manager,
+    DeviceManager* device_manager,
+    const GetControlPlaneFn& get_control_plane,
+    const GetDispatchQueryManagerFn& get_dispatch_query_manager,
+    const GetMaxNumEthCoresFn& get_max_num_eth_cores,
+    const GetReadsDispatchCoresFn& get_reads_dispatch_cores) :
+    descriptor_(descriptor),
+    dispatch_core_manager_(dispatch_core_manager),
+    device_manager_(device_manager),
+    get_control_plane_(get_control_plane),
+    get_dispatch_query_manager_(get_dispatch_query_manager),
+    get_max_num_eth_cores_(get_max_num_eth_cores),
+    get_reads_dispatch_cores_(get_reads_dispatch_cores) {
+    command_queue_compile_group_ = std::make_unique<detail::ProgramCompileGroup>();
+}
 
-// Helper function to automatically generate dispatch nodes given devices + num hw CQs + detection of card type.
-std::vector<DispatchKernelNode> generate_nodes(const std::set<chip_id_t>& device_ids, uint32_t num_hw_cqs) {
+DispatchTopology::~DispatchTopology() { reset(); }
+
+// Helper to automatically generate dispatch nodes given devices + num hw CQs + detection of card type.
+std::vector<DispatchKernelNode> DispatchTopology::generate_nodes(
+    const std::set<ChipId>& device_ids, uint32_t num_hw_cqs) const {
     // Select/generate the right input table, depends on (1) board [detected from total # of devices], and (2) number
     // of active devices. TODO: read this out of YAML instead of the structs above?
-    uint32_t total_devices = tt::tt_metal::MetalContext::instance().get_cluster().number_of_devices();
+    uint32_t total_devices = descriptor_.cluster().number_of_devices();
     TT_ASSERT(
         total_devices == 1 or total_devices == 2 or total_devices == 4 or total_devices == 8 or total_devices == 32 or
             total_devices == 36,
@@ -427,10 +450,10 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<chip_id_t>& device
     TT_ASSERT(num_devices <= total_devices);
     std::vector<DispatchKernelNode> nodes;
 
-    std::set<chip_id_t> mmio_devices;
-    std::set<chip_id_t> remote_devices;
+    std::set<ChipId> mmio_devices;
+    std::set<ChipId> remote_devices;
     for (auto id : device_ids) {
-        if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(id) == id) {
+        if (descriptor_.cluster().get_associated_mmio_device(id) == id) {
             mmio_devices.insert(id);
         } else {
             remote_devices.insert(id);
@@ -439,22 +462,23 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<chip_id_t>& device
 
     // Helper function to get nodes for single device
     auto populate_single_device = [&]() {
+        const bool is_quasar = this->descriptor_.cluster().arch() == tt::ARCH::QUASAR;
         if (num_hw_cqs == 1) {
-            return single_chip_arch_1cq;
-        } else {
-            // TODO: determine whether dispatch_s is inserted at this level, instead of inside
-            // Device::dispatch_s_enabled().
-            if (MetalContext::instance().get_dispatch_core_manager().get_dispatch_core_type() == CoreType::WORKER) {
-                return single_chip_arch_2cq_dispatch_s;
-            } else {
-                return single_chip_arch_2cq;
-            }
+            return is_quasar ? quasar_single_chip_1cq : single_chip_arch_1cq;
         }
+        if (is_quasar) {
+            return quasar_single_chip_2cq;
+        }
+        if (this->get_dispatch_query_manager_().dispatch_s_enabled()) {
+            return single_chip_arch_2cq_dispatch_s;
+        }
+        return single_chip_arch_2cq;
     };
 
     if (remote_devices.empty()) {
         // MMIO devices only, just replicate a single chip arch for each
         std::vector<DispatchKernelNode> nodes_for_one_mmio = populate_single_device();
+        nodes.reserve(mmio_devices.size() * nodes_for_one_mmio.size());
         uint32_t index_offset = 0;
         for (auto id : mmio_devices) {
             for (auto node : nodes_for_one_mmio) {
@@ -466,21 +490,22 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<chip_id_t>& device
             index_offset += nodes_for_one_mmio.size();
         }
     } else {
+        if (this->descriptor_.cluster().arch() == tt::ARCH::QUASAR) {
+            TT_THROW("Multi-chip dispatch topology is not supported on Quasar.");
+        }
         // Need to handle N300/T3000 separately from TG/TGG since they have different templates/tunnel depths
-        // If using fabric, upstream would have already initalized to the proper config for dispatch
-        const auto& rtoptions = tt::tt_metal::MetalContext::instance().rtoptions();
-        if (tt::tt_metal::MetalContext::instance().get_cluster().is_galaxy_cluster()) {
+        // If using fabric, upstream would have already initialized to the proper config for dispatch
+        if (descriptor_.cluster().is_galaxy_cluster()) {
             // For Galaxy, we always init all remote devices associated with an mmio device.
             std::vector<DispatchKernelNode> nodes_for_one_mmio =
                 (num_hw_cqs == 1) ? galaxy_nine_chip_arch_1cq_fabric : galaxy_nine_chip_arch_2cq_fabric;
+            nodes.reserve(mmio_devices.size() * nodes_for_one_mmio.size());
             uint32_t index_offset = 0;
             for (auto mmio_device_id : mmio_devices) {
                 // Need a mapping from templated device id (1-8) to actual device id (from the tunnel)
-                std::vector<chip_id_t> template_id_to_device_id;
+                std::vector<ChipId> template_id_to_device_id;
                 template_id_to_device_id.push_back(mmio_device_id);
-                for (const auto& tunnel :
-                     tt::tt_metal::MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(
-                         mmio_device_id)) {
+                for (const auto& tunnel : descriptor_.cluster().get_tunnels_from_mmio_device(mmio_device_id)) {
                     TT_ASSERT(tunnel.size() == 5, "Galaxy expected 4-deep tunnels.");
                     for (auto remote_device_id : tunnel) {
                         if (remote_device_id != mmio_device_id) {
@@ -516,21 +541,25 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<chip_id_t>& device
                 "N300/T3K expects devices in mmio/remote pairs.");
             std::vector<DispatchKernelNode> nodes_for_one_mmio =
                 (num_hw_cqs == 1) ? two_chip_arch_1cq_fabric : two_chip_arch_2cq_fabric;
+            nodes.reserve(mmio_devices.size() * nodes_for_one_mmio.size());
 
             uint32_t index_offset = 0;
             for (auto mmio_device_id : mmio_devices) {
                 // Find the corresponding remote chip
-                chip_id_t remote_device_id{};
+                ChipId remote_device_id{};
                 bool found_remote = false;
                 for (auto id : remote_devices) {
-                    if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(id) ==
-                        mmio_device_id) {
+                    if (descriptor_.cluster().get_associated_mmio_device(id) == mmio_device_id) {
                         remote_device_id = id;
                         found_remote = true;
                         break;
                     }
                 }
-                TT_ASSERT(found_remote, "Couldn't find paired remote chip for device {}", mmio_device_id);
+                TT_FATAL(
+                    found_remote,
+                    "Couldn't find paired remote chip for device {}. Potential hardware configuration "
+                    "and/or topology issue as each MMIO device should have a Remote Chip.",
+                    mmio_device_id);
 
                 // Add dispatch kernels for the mmio/remote pair
                 for (DispatchKernelNode node : nodes_for_one_mmio) {
@@ -564,46 +593,49 @@ std::vector<DispatchKernelNode> generate_nodes(const std::set<chip_id_t>& device
     return nodes;
 }
 
-// Populate node_id_to_kernel and set up kernel objects. Do this once at the beginning since they (1) don't need a valid
-// Device until fields are populated, (2) need to be connected to kernel objects for devices that aren't created yet,
-// and (3) the table to choose depends on total number of devices, not know at Device creation.
-void populate_fd_kernels(const std::vector<IDevice*>& devices, uint32_t num_hw_cqs) {
-    std::set<chip_id_t> device_ids;
+void DispatchTopology::populate_fd_kernels(const std::vector<Device*>& devices, uint32_t num_hw_cqs) {
+    std::set<ChipId> device_ids;
     for (const auto& device : devices) {
         device_ids.insert(device->id());
     }
     populate_fd_kernels(generate_nodes(device_ids, num_hw_cqs));
 }
 
-void populate_fd_kernels(const std::set<chip_id_t>& device_ids, uint32_t num_hw_cqs) {
+void DispatchTopology::populate_fd_kernels(const std::set<ChipId>& device_ids, uint32_t num_hw_cqs) {
     populate_fd_kernels(generate_nodes(device_ids, num_hw_cqs));
 }
 
-void populate_fd_kernels(const std::vector<DispatchKernelNode>& nodes) {
+void DispatchTopology::populate_fd_kernels(const std::vector<DispatchKernelNode>& nodes) {
     // If we already had nodes from a previous run, clear them (since we could have a different # of devices or CQs).
-    if (!node_id_to_kernel.empty()) {
-        for (int idx = 0; idx < node_id_to_kernel.size(); idx++) {
-            delete node_id_to_kernel[idx];
+    if (!node_id_to_kernel_.empty()) {
+        for (auto& kernel : node_id_to_kernel_) {
+            delete kernel;
         }
-        node_id_to_kernel.clear();
-        command_queue_compile_group.clear();
+        node_id_to_kernel_.clear();
+        command_queue_compile_group_->clear();
     }
 
     // Read the input table, create configs for each node + track mmio devices and number of cqs.
-    std::unordered_set<chip_id_t> mmio_device_ids;
+    std::unordered_set<ChipId> mmio_device_ids;
     std::unordered_set<uint8_t> hw_cq_ids;
+    node_id_to_kernel_.reserve(nodes.size());
     for (const auto& node : nodes) {
-        TT_ASSERT(node_id_to_kernel.size() == node.id);
-        node_id_to_kernel.push_back(FDKernel::Generate(
+        TT_ASSERT(node_id_to_kernel_.size() == node.id);
+        node_id_to_kernel_.emplace_back(FDKernel::Generate(
             node.id,
             node.device_id,
             node.servicing_device_id,
             node.cq_id,
             node.noc_selection,
             node.kernel_type,
-            node.tunnel_index));
-        if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(node.device_id) ==
-            node.device_id) {
+            descriptor_,
+            dispatch_core_manager_,
+            node.tunnel_index,
+            get_control_plane_,
+            get_dispatch_query_manager_,
+            get_max_num_eth_cores_,
+            get_reads_dispatch_cores_));
+        if (descriptor_.cluster().get_associated_mmio_device(node.device_id) == node.device_id) {
             mmio_device_ids.insert(node.device_id);
         }
         hw_cq_ids.insert(node.cq_id);
@@ -615,32 +647,30 @@ void populate_fd_kernels(const std::vector<DispatchKernelNode>& nodes) {
         for (int idx = 0; idx < node.upstream_ids.size(); idx++) {
             if (node.upstream_ids[idx] >= 0) {
                 TT_ASSERT(
-                    node.upstream_ids[idx] < node_id_to_kernel.size(),
+                    node.upstream_ids[idx] < node_id_to_kernel_.size(),
                     "Upstream kernel id {} out of bounds (max = {})",
                     node.upstream_ids[idx],
-                    node_id_to_kernel.size());
-                node_id_to_kernel.at(node.id)->AddUpstreamKernel(node_id_to_kernel.at(node.upstream_ids[idx]));
+                    node_id_to_kernel_.size());
+                node_id_to_kernel_.at(node.id)->AddUpstreamKernel(node_id_to_kernel_.at(node.upstream_ids[idx]));
             }
         }
         for (int idx = 0; idx < node.downstream_ids.size(); idx++) {
             if (node.downstream_ids[idx] >= 0) {
                 TT_ASSERT(
-                    node.downstream_ids[idx] < node_id_to_kernel.size(),
+                    node.downstream_ids[idx] < node_id_to_kernel_.size(),
                     "Downstream kernel id {} out of bounds (max = {})",
                     node.downstream_ids[idx],
-                    node_id_to_kernel.size());
-                node_id_to_kernel.at(node.id)->AddDownstreamKernel(node_id_to_kernel.at(node.downstream_ids[idx]));
+                    node_id_to_kernel_.size());
+                node_id_to_kernel_.at(node.id)->AddDownstreamKernel(node_id_to_kernel_.at(node.downstream_ids[idx]));
             }
         }
     }
 
     // For kernels on mmio chip, need to confirm which remote device each is servicing
-    std::map<chip_id_t, uint32_t> device_id_to_tunnel_stop;
-    std::map<chip_id_t, std::vector<chip_id_t>> mmio_device_id_to_serviced_devices;
-    uint32_t tunnel_depth{};
+    std::map<ChipId, uint32_t> device_id_to_tunnel_stop;
+    std::map<ChipId, std::vector<ChipId>> mmio_device_id_to_serviced_devices;
     for (auto mmio_device_id : mmio_device_ids) {
-        if (tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(mmio_device_id) !=
-            mmio_device_id) {
+        if (descriptor_.cluster().get_associated_mmio_device(mmio_device_id) != mmio_device_id) {
             continue;
         }
 
@@ -648,12 +678,10 @@ void populate_fd_kernels(const std::vector<DispatchKernelNode>& nodes) {
         for (int idx = 0; idx < num_hw_cqs; idx++) {
             mmio_device_id_to_serviced_devices[mmio_device_id].push_back(mmio_device_id);
         }
-        std::vector<chip_id_t> remote_devices;
-        for (auto tunnel :
-             tt::tt_metal::MetalContext::instance().get_cluster().get_tunnels_from_mmio_device(mmio_device_id)) {
-            tunnel_depth = tunnel.size();
+        std::vector<ChipId> remote_devices;
+        for (auto tunnel : descriptor_.cluster().get_tunnels_from_mmio_device(mmio_device_id)) {
             for (uint32_t tunnel_stop = 0; tunnel_stop < tunnel.size(); tunnel_stop++) {
-                chip_id_t remote_device_id = tunnel[tunnel_stop];
+                ChipId remote_device_id = tunnel[tunnel_stop];
                 device_id_to_tunnel_stop[remote_device_id] = tunnel_stop;
                 if (remote_device_id != mmio_device_id) {
                     for (int idx = 0; idx < num_hw_cqs; idx++) {
@@ -668,13 +696,13 @@ void populate_fd_kernels(const std::vector<DispatchKernelNode>& nodes) {
     }
 }
 
-void populate_cq_static_args(IDevice* device) {
+void DispatchTopology::populate_cq_static_args(Device* device) {
     TT_ASSERT(
-        node_id_to_kernel.size() > 0,
+        !node_id_to_kernel_.empty(),
         "Tried to populate static args on nodes without the nodes populated (need to run populate_fd_kernels()");
     // First pass, add device/program to all kernels for this device and generate static configs.
     auto cq_program_ptr = std::make_unique<Program>();
-    for (auto node_and_kernel : node_id_to_kernel) {
+    for (auto* node_and_kernel : node_id_to_kernel_) {
         // GetDeviceId() uses Id from topology as IDevice* is not present yet
         if (node_and_kernel->GetDeviceId() == device->id()) {
             node_and_kernel->AddDevice(device);
@@ -686,38 +714,34 @@ void populate_cq_static_args(IDevice* device) {
     }
 
     // Move program into the storage for later steps
-    command_queue_compile_group.add_program(device, std::move(cq_program_ptr));
+    command_queue_compile_group_->add_program(device, std::move(cq_program_ptr));
 }
 
-void create_cq_program(IDevice* device) {
+void DispatchTopology::create_cq_program(Device* device) {
     TT_FATAL(
-        command_queue_compile_group.contains(device),
+        command_queue_compile_group_->contains(device),
         "Tried to create and compile CQ program on device {} without static args populated (need to run "
         "populate_cq_static_args())",
         device->id());
-    empty_cores.clear();
-    // Third pass, populate dependent configs and create kernels for each node
-    for (auto node_and_kernel : node_id_to_kernel) {
+    // Third pass, populate dependent configs, runtime configs, and create kernels for each node
+    for (auto* node_and_kernel : node_id_to_kernel_) {
         if (node_and_kernel->GetDeviceId() == device->id()) {
             node_and_kernel->GenerateDependentConfigs();
-        }
-    }
-
-    for (auto node_and_kernel : node_id_to_kernel) {
-        if (node_and_kernel->GetDeviceId() == device->id()) {
+            node_and_kernel->InitializeRuntimeArgsValues();
             node_and_kernel->CreateKernel();
+            node_and_kernel->SetRuntimeArgs();
         }
     }
 
     // Register core coordinates for this device
-    for (auto node_and_kernel : node_id_to_kernel) {
+    for (auto* node_and_kernel : node_id_to_kernel_) {
         if (node_and_kernel->GetDeviceId() != device->id()) {
             continue;
         }
 
         switch (node_and_kernel->GetKernelType()) {
-            case FDKernelType::DISPATCH: dispatch_cores[device->id()].insert(node_and_kernel->GetVirtualCore()); break;
-            case FDKernelType::ROUTING: routing_cores[device->id()].insert(node_and_kernel->GetVirtualCore()); break;
+            case FDKernelType::DISPATCH: dispatch_cores_[device->id()].insert(node_and_kernel->GetVirtualCore()); break;
+            case FDKernelType::ROUTING: routing_cores_[device->id()].insert(node_and_kernel->GetVirtualCore()); break;
             case FDKernelType::VIRTUAL:
                 // Not a real kernel
                 break;
@@ -732,69 +756,69 @@ void create_cq_program(IDevice* device) {
     }
 
     // Register termination info
-    for (auto node_and_kernel : node_id_to_kernel) {
+    for (auto* node_and_kernel : node_id_to_kernel_) {
         if (node_and_kernel->GetDeviceId() != device->id()) {
             continue;
         }
 
         const auto& info = node_and_kernel->GetTerminationInfo();
         if (info.has_value()) {
-            termination_info[device->id()].insert(info.value());
+            termination_info_[device->id()].insert(info.value());
         }
     }
 }
 
-void compile_cq_programs() {
-    if (tt_metal::MetalContext::instance().rtoptions().get_skip_loading_fw()) {
-        detail::EnablePersistentKernelCache();
-    }
+void DispatchTopology::compile_cq_programs() {
+    command_queue_compile_group_->compile_all(/*force_slow_dispatch=*/true);
 
-    command_queue_compile_group.compile_all(/*force_slow_dispatch=*/true);
+    command_queue_compile_group_->finalize_offsets();
 
     // Write runtime args to device
-    command_queue_compile_group.write_runtime_args(/*force_slow_dispatch=*/true);
-
-    if (tt_metal::MetalContext::instance().rtoptions().get_skip_loading_fw()) {
-        detail::DisablePersistentKernelCache();
-    }
+    command_queue_compile_group_->write_runtime_args(/*force_slow_dispatch=*/true);
 }
 
-std::unique_ptr<tt::tt_metal::Program> get_compiled_cq_program(tt::tt_metal::IDevice* device) {
-    return command_queue_compile_group.remove_program(device);
+std::unique_ptr<Program> DispatchTopology::get_compiled_cq_program(Device* device) {
+    return command_queue_compile_group_->remove_program(device);
 }
 
-void configure_dispatch_cores(IDevice* device) {
+void DispatchTopology::configure_dispatch_cores(Device* device) {
     // Set up completion_queue_writer core. This doesn't actually have a kernel so keep it out of the struct and config
     // it here. TODO: should this be in the struct?
-    CoreType dispatch_core_type = MetalContext::instance().get_dispatch_core_manager().get_dispatch_core_type();
-    auto& my_dispatch_constants = MetalContext::instance().dispatch_mem_map();
-    uint32_t cq_start = my_dispatch_constants.get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED);
+    CoreType dispatch_core_type = this->dispatch_core_manager_.get_dispatch_core_type();
+    const auto& mem_map = descriptor_.metal_context().dispatch_mem_map();
+    uint32_t cq_start = mem_map.get_host_command_queue_addr(CommandQueueHostAddrType::UNRESERVED);
     uint32_t cq_size = device->sysmem_manager().get_cq_size();
     std::vector<uint32_t> zero = {0x0};
 
     // Need to set up for all devices serviced by an mmio chip
+    TT_ASSERT(device_manager_ != nullptr, "DeviceManager required for configure_dispatch_cores");
     if (device->is_mmio_capable()) {
-        for (chip_id_t serviced_device_id :
-             tt::tt_metal::MetalContext::instance().get_cluster().get_devices_controlled_by_mmio_device(device->id())) {
-            uint16_t channel = tt::tt_metal::MetalContext::instance().get_cluster().get_assigned_channel_for_device(
-                serviced_device_id);
+        for (ChipId serviced_device_id : descriptor_.cluster().get_devices_controlled_by_mmio_device(device->id())) {
+            uint16_t channel = descriptor_.cluster().get_assigned_channel_for_device(serviced_device_id);
             for (uint8_t cq_id = 0; cq_id < device->num_hw_cqs(); cq_id++) {
                 tt_cxy_pair completion_q_writer_location =
-                    MetalContext::instance().get_dispatch_core_manager().completion_queue_writer_core(
-                        serviced_device_id, channel, cq_id);
-                IDevice* mmio_device = tt::DevicePool::instance().get_active_device(completion_q_writer_location.chip);
-                uint32_t completion_q_wr_ptr =
-                    my_dispatch_constants.get_device_command_queue_addr(CommandQueueDeviceAddrType::COMPLETION_Q_WR);
-                uint32_t completion_q_rd_ptr =
-                    my_dispatch_constants.get_device_command_queue_addr(CommandQueueDeviceAddrType::COMPLETION_Q_RD);
-                uint32_t completion_q0_last_event_ptr = my_dispatch_constants.get_device_command_queue_addr(
-                    CommandQueueDeviceAddrType::COMPLETION_Q0_LAST_EVENT);
-                uint32_t completion_q1_last_event_ptr = my_dispatch_constants.get_device_command_queue_addr(
-                    CommandQueueDeviceAddrType::COMPLETION_Q1_LAST_EVENT);
+                    this->dispatch_core_manager_.completion_queue_writer_core(serviced_device_id, channel, cq_id);
+                IDevice* mmio_device = device_manager_->get_active_device(completion_q_writer_location.chip);
+                const uint32_t completion_q_wr_ptr =
+                    mem_map.get_device_command_queue_addr(CommandQueueDeviceAddrType::COMPLETION_Q_WR, cq_id);
+                const uint32_t completion_q_rd_ptr =
+                    mem_map.get_device_command_queue_addr(CommandQueueDeviceAddrType::COMPLETION_Q_RD, cq_id);
+                const uint32_t completion_q0_last_event_ptr =
+                    mem_map.get_device_command_queue_addr(CommandQueueDeviceAddrType::COMPLETION_Q0_LAST_EVENT, cq_id);
+                const uint32_t completion_q1_last_event_ptr =
+                    mem_map.get_device_command_queue_addr(CommandQueueDeviceAddrType::COMPLETION_Q1_LAST_EVENT, cq_id);
                 // Initialize completion queue write pointer and read pointer copy
                 uint32_t issue_queue_size = device->sysmem_manager().get_issue_queue_size(cq_id);
-                uint32_t completion_queue_start_addr =
-                    cq_start + issue_queue_size + get_absolute_cq_offset(channel, cq_id, cq_size);
+                uint32_t completion_queue_start_addr;
+                if (device->sysmem_manager().is_dram_backed()) {
+                    completion_queue_start_addr =
+                        cq_start + issue_queue_size +
+                        get_absolute_cq_offset(
+                            channel, cq_id, cq_size, device->sysmem_manager().get_dram_region_base_addr());
+                } else {
+                    completion_queue_start_addr =
+                        cq_start + issue_queue_size + get_absolute_cq_offset(channel, cq_id, cq_size);
+                }
                 uint32_t completion_queue_start_addr_16B = completion_queue_start_addr >> 4;
                 std::vector<uint32_t> completion_queue_wr_ptr = {completion_queue_start_addr_16B};
                 detail::WriteToDeviceL1(
@@ -817,468 +841,43 @@ void configure_dispatch_cores(IDevice* device) {
         }
     }
     // Configure cores for all nodes corresponding to this device
-    for (int idx = 0; idx < node_id_to_kernel.size(); idx++) {
-        if (node_id_to_kernel[idx]->GetDeviceId() == device->id()) {
-            node_id_to_kernel[idx]->ConfigureCore();
+    for (auto& kernel : node_id_to_kernel_) {
+        if (kernel->GetDeviceId() == device->id()) {
+            kernel->ConfigureCore();
         }
     }
 }
 
-std::pair<tt::tt_fabric::FabricEriscDatamoverType, tt::tt_fabric::FabricEriscDatamoverAxis> get_fabric_edm_type(
-    const tt::tt_fabric::ControlPlane& control_plane,
-    tt_fabric::Topology topology,
-    tt::tt_fabric::MeshId mesh_id,
-    chip_id_t chip0,
-    chip_id_t chip1,
-    bool wrap_around_mesh) {
-    if (topology != tt_fabric::Topology::Ring) {
-        return {tt::tt_fabric::FabricEriscDatamoverType::Default, tt::tt_fabric::FabricEriscDatamoverAxis::Short};
+const std::unordered_set<CoreCoord>& DispatchTopology::get_virtual_dispatch_cores(ChipId dev_id) const {
+    if (!dispatch_cores_.contains(dev_id)) {
+        return this->empty_container_;
     }
-
-    auto physical_mesh_shape = control_plane.get_physical_mesh_shape(mesh_id);
-    TT_FATAL(physical_mesh_shape.dims() == 2, "Dateline routing only supported for 2D mesh");
-
-    auto mesh_num_rows = physical_mesh_shape[0];
-    auto mesh_num_columns = physical_mesh_shape[1];
-    auto fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::Default;
-    auto fabric_edm_axis = tt::tt_fabric::FabricEriscDatamoverAxis::Short;
-
-    auto smaller_chip_id = std::min(chip0, chip1);
-    auto larger_chip_id = std::max(chip0, chip1);
-
-    // Refactor this once mesh_id has row/col control
-    // wrap_around_mesh is used to fold the edm connections on the corner chips of a 2D mesh to form an outer ring of
-    // devices on the mesh.
-    if (wrap_around_mesh) {
-        // Wrap around dateline
-        if (smaller_chip_id == 0 && larger_chip_id == mesh_num_columns) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::Dateline;
-        } else if ((chip0 == 0 || chip0 == mesh_num_columns) && chip1 == chip0 + 1) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstream;
-        } else if ((chip1 == 0 || chip1 == mesh_num_columns) && chip0 == chip1 + 1) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstreamAdjacentDevice;
-        } else if ((chip0 == 1 || chip0 == mesh_num_columns + 1) && (chip1 == chip0 + 1)) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstreamAdjacentDeviceUpstream;
-        }
-        // check if edm is on the longer axis
-        if ((mesh_num_rows * mesh_num_columns) >=
-            tt::tt_fabric::FabricEriscDatamoverConfig::MESH_LONG_AXIS_OPTIMIZATION_THRESHOLD) {
-            fabric_edm_axis = tt::tt_fabric::FabricEriscDatamoverAxis::Long;
-        }
-    } else {
-        bool is_dateline_edm_along_column =
-            smaller_chip_id % mesh_num_columns == 0 && larger_chip_id == (smaller_chip_id + mesh_num_columns - 1);
-        bool is_dateline_edm_along_row = smaller_chip_id < mesh_num_columns &&
-                                         larger_chip_id >= (mesh_num_columns * (mesh_num_rows - 1)) &&
-                                         smaller_chip_id == larger_chip_id % mesh_num_columns;
-        bool is_dateline_upstream_edm_along_column =
-            (chip0 % mesh_num_columns == 0 && chip1 == chip0 + 1) ||
-            (chip0 % mesh_num_columns == mesh_num_columns - 1 && chip1 == chip0 - 1);
-        bool is_dateline_upstream_edm_along_row =
-            (chip0 < mesh_num_columns && chip1 == chip0 + mesh_num_columns) ||
-            (chip0 >= (mesh_num_columns * (mesh_num_rows - 1)) && chip1 == chip0 - mesh_num_columns);
-        bool is_dateline_upstream_adjacent_edm_along_column =
-            (chip1 % mesh_num_columns == 0 && chip0 == chip1 + 1) ||
-            (chip1 % mesh_num_columns == mesh_num_columns - 1 && chip0 == chip1 - 1);
-        bool is_dateline_upstream_adjacent_edm_along_row =
-            (chip1 < mesh_num_columns && chip0 == chip1 + mesh_num_columns) ||
-            (chip1 >= (mesh_num_columns * (mesh_num_rows - 1)) && chip0 == chip1 - mesh_num_columns);
-        bool is_dateline_upstream_adjacent_upstream_edm_along_column =
-            (chip0 % mesh_num_columns == 1 && chip1 == chip0 + 1) ||
-            (chip0 % mesh_num_columns == mesh_num_columns - 2 && chip1 == chip0 - 1);
-        bool is_dateline_upstream_adjacent_upstream_edm_along_row =
-            (chip0 >= mesh_num_columns && chip0 < (2 * mesh_num_columns) && chip1 == chip0 + mesh_num_columns) ||
-            (chip0 >= (mesh_num_columns * (mesh_num_rows - 2)) && chip0 < (mesh_num_columns * (mesh_num_rows - 1)) &&
-             chip1 == chip0 - mesh_num_columns);
-        bool is_edm_along_row = ((larger_chip_id - smaller_chip_id) == mesh_num_columns) ||
-                                (smaller_chip_id == larger_chip_id % mesh_num_columns);
-        // Column dateline
-        if (is_dateline_edm_along_column) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::Dateline;
-        }
-        // Row dateline
-        else if (is_dateline_edm_along_row) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::Dateline;
-        }
-        // Column dateline upstream
-        else if (is_dateline_upstream_edm_along_column) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstream;
-        }
-        // Row dateline upstream
-        else if (is_dateline_upstream_edm_along_row) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstream;
-        }
-        // Column dateline upstream adjacent
-        else if (is_dateline_upstream_adjacent_edm_along_column) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstreamAdjacentDevice;
-        }
-        // Row dateline upstream adjacent
-        else if (is_dateline_upstream_adjacent_edm_along_row) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstreamAdjacentDevice;
-        }
-        // Column dateline upstream adjacent device upstream
-        else if (is_dateline_upstream_adjacent_upstream_edm_along_column) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstreamAdjacentDeviceUpstream;
-        }
-        // Row dateline upstream adjacent device upstream
-        else if (is_dateline_upstream_adjacent_upstream_edm_along_row) {
-            fabric_edm_type = tt::tt_fabric::FabricEriscDatamoverType::DatelineUpstreamAdjacentDeviceUpstream;
-        }
-
-        // check if edm is on the longer axis
-        if ((mesh_num_columns >= tt::tt_fabric::FabricEriscDatamoverConfig::MESH_LONG_AXIS_OPTIMIZATION_THRESHOLD &&
-             !is_edm_along_row) ||
-            (mesh_num_rows >= tt::tt_fabric::FabricEriscDatamoverConfig::MESH_LONG_AXIS_OPTIMIZATION_THRESHOLD &&
-             is_edm_along_row)) {
-            fabric_edm_axis = tt::tt_fabric::FabricEriscDatamoverAxis::Long;
-        }
-    }
-
-    return {fabric_edm_type, fabric_edm_axis};
+    return dispatch_cores_.at(dev_id);
 }
 
-void build_tt_fabric_program(
-    IDevice* device,
-    Program* fabric_program_ptr,
-    std::unordered_map<tt::tt_fabric::chan_id_t, tt::tt_fabric::FabricEriscDatamoverBuilder>& edm_builders) {
-    using namespace tt_fabric;
-    const auto& control_plane= tt::tt_metal::MetalContext::instance().get_control_plane();
-    auto fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(device->id());
-    const bool is_TG =
-        (tt::tt_metal::MetalContext::instance().get_cluster().get_cluster_type() == tt::tt_metal::ClusterType::TG);
-    auto soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device->id());
-    const auto& fabric_context = control_plane.get_fabric_context();
-    const auto& edm_config = fabric_context.get_fabric_router_config();
-    const auto configure_edm_builder_for_dispatch = [&](tt::tt_fabric::FabricEriscDatamoverBuilder& edm_builder) {
-        constexpr uint32_t k_DispatchFabricRouterContextSwitchInterval = 16;
-        // Dispatch requires a higher context switching freq to service slow dispatch / UMD / debug tools
-        edm_builder.set_firmware_context_switch_interval(k_DispatchFabricRouterContextSwitchInterval);
-        edm_builder.set_firmware_context_switch_type(FabricEriscDatamoverContextSwitchType::INTERVAL);
-    };
-
-    if (is_TG && device->is_mmio_capable()) {
-        auto router_chans_and_direction = control_plane.get_active_fabric_eth_channels(fabric_node_id);
-        for (const auto& [eth_chan, eth_direction] : router_chans_and_direction) {
-            // remote_fabric_node_id is only used to determine the handshake master, no functional impact
-            // for now treat the mmio chips as the handshake master
-            auto eth_logical_core = soc_desc.get_eth_core_for_channel(eth_chan, CoordSystem::LOGICAL);
-            auto edm_builder = tt::tt_fabric::FabricEriscDatamoverBuilder::build(
-                device,
-                *fabric_program_ptr,
-                eth_logical_core,
-                fabric_node_id,
-                FabricNodeId{fabric_node_id.mesh_id, fabric_node_id.chip_id + 1},
-                edm_config,
-                false, /* build_in_worker_connection_mode */
-                false, /* is_dateline */
-                eth_direction);
-            // Both links used by dispatch on TG Gateway (mmio device)
-            // TODO: https://github.com/tenstorrent/tt-metal/issues/24413
-            configure_edm_builder_for_dispatch(edm_builder);
-            edm_builders.insert({eth_chan, edm_builder});
-        }
-
-        return;
+const std::unordered_set<CoreCoord>& DispatchTopology::get_virtual_dispatch_routing_cores(ChipId dev_id) const {
+    if (!routing_cores_.contains(dev_id)) {
+        return this->empty_container_;
     }
-
-    std::unordered_map<RoutingDirection, std::vector<chan_id_t>> active_fabric_eth_channels;
-    std::unordered_map<RoutingDirection, FabricNodeId> chip_neighbors;
-    uint32_t num_intra_chip_neighbors = 0;
-    const auto topology = fabric_context.get_fabric_topology();
-    const bool is_2D_routing = topology == Topology::Mesh;
-
-    const auto device_has_dispatch_tunnel = [&]() -> bool {
-        auto mmio_device_id =
-            tt::tt_metal::MetalContext::instance().get_cluster().get_associated_mmio_device(device->id());
-        auto tunnels_from_mmio =
-            tt::tt_metal::MetalContext::instance().get_cluster().get_devices_controlled_by_mmio_device(mmio_device_id);
-        // results are inclusive of the mmio_device_id so they will never be zero
-        TT_ASSERT(tunnels_from_mmio.size() > 0);
-        return (tunnels_from_mmio.size() - 1) > 0;
-    }();
-
-    for (const auto& direction : tt::tt_fabric::FabricContext::routing_directions) {
-        auto active_eth_chans =
-            control_plane.get_active_fabric_eth_routing_planes_in_direction(fabric_node_id, direction);
-        if (active_eth_chans.empty()) {
-            continue;
-        }
-        auto neighbors = control_plane.get_chip_neighbors(fabric_node_id, direction);
-        auto intra_chip_neighbors = neighbors.find(fabric_node_id.mesh_id);
-        if (intra_chip_neighbors != neighbors.end()) {
-            // only count the number of unique intra chip neighbors
-            // we assume that all neighbors in a direction are the same
-            num_intra_chip_neighbors++;
-        }
-        // assume same neighbor per direction
-        TT_FATAL(neighbors.size() == 1, "Multiple neighbor meshes per direction is unsupported");
-        TT_FATAL(
-            std::set<chip_id_t>(neighbors.begin()->second.begin(), neighbors.begin()->second.end()).size() == 1,
-            "Multiple neighbors per direction is currently unsupported");
-
-        // 1D fabric only supports intramesh connections apart from TG gateways
-        if (!is_2D_routing) {
-            uint32_t has_inter_mesh_connections = intra_chip_neighbors == neighbors.end();
-            if (is_TG && has_inter_mesh_connections) {
-                // if active eth channels are found but no neighbor on the same mesh, then the neighbor should be the
-                // gateway
-                TT_FATAL(
-                    active_eth_chans.size() == 1, "Found more than one active eth link b/w mmio and remote chip on TG");
-            } else {
-                TT_FATAL(!has_inter_mesh_connections, "1D routing does not support intermesh connections");
-            }
-        }
-
-        FabricNodeId neighbor_fabric_node_id = FabricNodeId(neighbors.begin()->first, neighbors.begin()->second[0]);
-        chip_neighbors.emplace(direction, neighbor_fabric_node_id);
-
-        active_fabric_eth_channels.insert({direction, active_eth_chans});
-        log_debug(
-            tt::LogMetal,
-            "Building fabric router -> device (phys): {}, (logical): {}, direction: {}, active_eth_chans: {}",
-            device->id(),
-            control_plane.get_fabric_node_id_from_physical_chip_id(device->id()).chip_id,
-            direction,
-            active_eth_chans.size());
-    }
-
-    if (active_fabric_eth_channels.empty()) {
-        // Need at least 1 active fabric eth channel in at least 1 direction with a neighbor
-        return;
-    }
-
-    const bool wrap_around_mesh = fabric_context.is_wrap_around_mesh(fabric_node_id.mesh_id);
-
-    for (const auto& [direction, remote_fabric_node_id] : chip_neighbors) {
-        const auto& [fabric_edm_type, fabric_edm_axis] = get_fabric_edm_type(
-            control_plane,
-            topology,
-            fabric_node_id.mesh_id,
-            fabric_node_id.chip_id,
-            remote_fabric_node_id.chip_id,
-            wrap_around_mesh);
-
-        bool is_dateline = remote_fabric_node_id.mesh_id == fabric_node_id.mesh_id &&
-                           fabric_edm_type == tt::tt_fabric::FabricEriscDatamoverType::Dateline;
-
-        const auto& curr_edm_config = fabric_context.get_fabric_router_config(fabric_edm_type, fabric_edm_axis);
-        for (const auto& eth_chan : active_fabric_eth_channels[direction]) {
-            auto eth_logical_core = soc_desc.get_eth_core_for_channel(eth_chan, CoordSystem::LOGICAL);
-            auto edm_builder = tt::tt_fabric::FabricEriscDatamoverBuilder::build(
-                device,
-                *fabric_program_ptr,
-                eth_logical_core,
-                fabric_node_id,
-                remote_fabric_node_id,
-                curr_edm_config,
-                false, /* build_in_worker_connection_mode */
-                is_dateline,
-                control_plane.routing_direction_to_eth_direction(direction));
-            edm_builders.insert({eth_chan, edm_builder});
-        }
-
-        // Last link may be used by dispatch if there is tunneling
-        // TODO: https://github.com/tenstorrent/tt-metal/issues/24413
-        if (!active_fabric_eth_channels[direction].empty() && device_has_dispatch_tunnel) {
-            const auto dispatch_eth_chan = active_fabric_eth_channels[direction].back();
-            configure_edm_builder_for_dispatch(edm_builders.at(dispatch_eth_chan));
-        }
-    }
-
-    const bool is_galaxy =
-        tt::tt_metal::MetalContext::instance().get_cluster().get_cluster_type() == tt::tt_metal::ClusterType::GALAXY;
-
-    auto connect_downstream_builders = [&](RoutingDirection dir1, RoutingDirection dir2) {
-        bool can_connect =
-            (chip_neighbors.find(dir1) != chip_neighbors.end()) && (chip_neighbors.find(dir2) != chip_neighbors.end());
-        if (can_connect) {
-            auto eth_chans_dir1 = active_fabric_eth_channels.at(dir1);
-            auto eth_chans_dir2 = active_fabric_eth_channels.at(dir2);
-
-            // Hack for TG to connect the last routing plane correctly for dispatch
-            // TODO: https://github.com/tenstorrent/tt-metal/issues/24413
-            if (is_TG && (eth_chans_dir1.size() != eth_chans_dir2.size())) {
-                log_trace(tt::LogMetal, "applying hack for chip: {}", device->id());
-                std::reverse(eth_chans_dir1.begin(), eth_chans_dir1.end());
-                std::reverse(eth_chans_dir2.begin(), eth_chans_dir2.end());
-            }
-
-            // since tunneling cores are not guaraneteed to be reserved on the same routing plane, iterate through
-            // the ordered eth channels in both directions
-            uint32_t num_links = std::min(eth_chans_dir1.size(), eth_chans_dir2.size());
-            for (uint32_t link = 0; link < num_links; link++) {
-                auto eth_chan_dir1 = eth_chans_dir1[link];
-                auto eth_chan_dir2 = eth_chans_dir2[link];
-
-                auto& edm_builder1 = edm_builders.at(eth_chan_dir1);
-                auto& edm_builder2 = edm_builders.at(eth_chan_dir2);
-                edm_builder1.connect_to_downstream_edm(edm_builder2);
-                edm_builder2.connect_to_downstream_edm(edm_builder1);
-
-                // select VC based on the current link
-                auto edm_noc_vc = edm_builder1.config.DEFAULT_NOC_VC + (link % edm_builder1.config.NUM_EDM_NOC_VCS);
-                edm_builder1.config.edm_noc_vc = edm_noc_vc;
-                edm_builder2.config.edm_noc_vc = edm_noc_vc;
-
-                if (is_galaxy) {
-                    get_optimal_noc_for_edm(edm_builder1, edm_builder2, num_links, topology);
-                }
-            }
-        }
-    };
-
-    if (is_2D_routing) {
-        // 2D Routing
-        connect_downstream_builders(RoutingDirection::N, RoutingDirection::S);
-        connect_downstream_builders(RoutingDirection::E, RoutingDirection::W);
-        connect_downstream_builders(RoutingDirection::N, RoutingDirection::E);
-        connect_downstream_builders(RoutingDirection::N, RoutingDirection::W);
-        connect_downstream_builders(RoutingDirection::S, RoutingDirection::E);
-        connect_downstream_builders(RoutingDirection::S, RoutingDirection::W);
-    } else if (wrap_around_mesh && num_intra_chip_neighbors == 2) {
-        // 1D Routing wrap the corner chips, fold the internal connections
-        auto it = chip_neighbors.begin();
-        auto dir1 = it->first;
-        it++;
-        auto dir2 = it->first;
-        connect_downstream_builders(dir1, dir2);
-    } else {
-        // 1D Routing
-        connect_downstream_builders(RoutingDirection::N, RoutingDirection::S);
-        connect_downstream_builders(RoutingDirection::E, RoutingDirection::W);
-    }
-
-    return;
+    return routing_cores_.at(dev_id);
 }
 
-std::unique_ptr<Program> create_and_compile_tt_fabric_program(IDevice* device) {
-    std::unique_ptr<Program> fabric_program_ptr = std::make_unique<Program>();
-    std::unordered_map<tt::tt_fabric::chan_id_t, tt::tt_fabric::FabricEriscDatamoverBuilder> edm_builders;
-
-    const auto& control_plane= tt::tt_metal::MetalContext::instance().get_control_plane();
-    auto& fabric_context = control_plane.get_fabric_context();
-
-    build_tt_fabric_program(device, fabric_program_ptr.get(), edm_builders);
-    fabric_context.set_num_fabric_initialized_routers(device->id(), edm_builders.size());
-    if (edm_builders.empty()) {
-        return nullptr;
+const std::unordered_set<TerminationInfo>& DispatchTopology::get_registered_termination_cores(ChipId dev_id) const {
+    if (!termination_info_.contains(dev_id)) {
+        return this->empty_termination_info_container_;
     }
-
-    // for now it doesnt matter which channel is the master, so just pick the 1st in the map
-    auto master_router_chan = edm_builders.begin()->first;
-    fabric_context.set_fabric_master_router_chan(device->id(), master_router_chan);
-
-    uint32_t router_channels_mask = 0;
-    for (const auto& [router_chan, _] : edm_builders) {
-        router_channels_mask += 0x1 << (uint32_t)router_chan;
-    }
-
-    std::map<std::string, std::string> defines = {};
-    const auto topology = fabric_context.get_fabric_topology();
-    if (topology == tt::tt_fabric::Topology::Mesh) {
-        defines["FABRIC_2D"] = "";
-    }
-
-    auto soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device->id());
-    const auto num_enabled_eth_cores = edm_builders.size();
-    const auto num_enabled_risc_cores =
-        edm_builders.begin()->second.get_configured_risc_count();  // same across all eth cores
-    size_t num_local_fabric_routers = num_enabled_eth_cores;
-    for (auto& [eth_chan, edm_builder] : edm_builders) {
-        edm_builder.set_wait_for_host_signal(true);
-        const std::vector<uint32_t> rt_args = edm_builder.get_runtime_args();
-        for (uint32_t risc_id = 0; risc_id < num_enabled_risc_cores; risc_id++) {
-            std::vector<uint32_t> ct_args = edm_builder.get_compile_time_args(risc_id);
-
-            const auto is_master_risc_core = eth_chan == master_router_chan && (risc_id == 0);
-            ct_args.push_back(is_master_risc_core);
-            ct_args.push_back(master_router_chan);
-            ct_args.push_back(num_local_fabric_routers);
-            ct_args.push_back(router_channels_mask);
-
-            auto eth_logical_core = soc_desc.get_eth_core_for_channel(eth_chan, CoordSystem::LOGICAL);
-            auto kernel = tt::tt_metal::CreateKernel(
-                *fabric_program_ptr,
-                "tt_metal/fabric/impl/kernels/edm_fabric/fabric_erisc_datamover.cpp",
-                eth_logical_core,
-                tt::tt_metal::EthernetConfig{
-                    .noc = edm_builder.config.risc_configs[risc_id].get_configured_noc(),
-                    .processor = static_cast<DataMovementProcessor>(risc_id),
-                    .compile_args = ct_args,
-                    .defines = defines,
-                    .opt_level = tt::tt_metal::KernelBuildOptLevel::O3});
-
-            tt::tt_metal::SetRuntimeArgs(*fabric_program_ptr, kernel, eth_logical_core, rt_args);
-        }
-
-        log_debug(
-            tt::LogMetal,
-            "Building fabric router -> device (phys): {}, (logical): {}, channel: {}, num_local_fabric_routers: {}",
-            device->id(),
-            control_plane.get_fabric_node_id_from_physical_chip_id(device->id()).chip_id,
-            eth_chan,
-            num_local_fabric_routers);
-    }
-
-    detail::CompileProgram(device, *fabric_program_ptr, /*force_slow_dispatch=*/device->using_fast_dispatch());
-    return fabric_program_ptr;
+    return termination_info_.at(dev_id);
 }
 
-std::unique_ptr<Program> create_and_compile_fabric_program(IDevice* device) {
-    auto fabric_config = tt::tt_metal::MetalContext::instance().get_fabric_config();
-    if (tt_fabric::is_tt_fabric_config(fabric_config)) {
-        return create_and_compile_tt_fabric_program(device);
+void DispatchTopology::reset() {
+    for (auto& kernel : node_id_to_kernel_) {
+        delete kernel;
     }
-    return nullptr;
-}
-
-void configure_fabric_cores(IDevice* device) {
-    std::vector<uint32_t> router_zero_buf(1, 0);
-    auto soc_desc = tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device->id());
-    const auto& control_plane= tt::tt_metal::MetalContext::instance().get_control_plane();
-    const auto fabric_node_id = control_plane.get_fabric_node_id_from_physical_chip_id(device->id());
-    const auto router_chans_and_direction = control_plane.get_active_fabric_eth_channels(fabric_node_id);
-    const auto addresses_to_clear = control_plane.get_fabric_context().get_fabric_router_addresses_to_clear();
-    for (const auto& [router_chan, _] : router_chans_and_direction) {
-        auto router_logical_core = soc_desc.get_eth_core_for_channel(router_chan, CoordSystem::LOGICAL);
-        for (const auto& address : addresses_to_clear) {
-            tt::tt_metal::detail::WriteToDeviceL1(device, router_logical_core, address, router_zero_buf, CoreType::ETH);
-        }
-    }
-}
-
-const std::unordered_set<CoreCoord>& get_virtual_dispatch_cores(chip_id_t dev_id) {
-    if (!dispatch_cores.contains(dev_id)) {
-        return empty_cores[dev_id];
-    }
-    return dispatch_cores[dev_id];
-}
-
-const std::unordered_set<CoreCoord>& get_virtual_dispatch_routing_cores(chip_id_t dev_id) {
-    if (!routing_cores.contains(dev_id)) {
-        return empty_cores[dev_id];
-    }
-    return routing_cores[dev_id];
-}
-
-const std::unordered_set<TerminationInfo>& get_registered_termination_cores(chip_id_t dev_id) {
-    if (!termination_info.contains(dev_id)) {
-        termination_info[dev_id] = {};
-    }
-    return termination_info.at(dev_id);
-}
-
-void reset_topology_state() {
-    // TODO: https://github.com/tenstorrent/tt-metal/issues/24439
-    for (int idx = 0; idx < node_id_to_kernel.size(); idx++) {
-        delete node_id_to_kernel[idx];
-    }
-    node_id_to_kernel.clear();
-    command_queue_compile_group.clear();
-    dispatch_cores.clear();
-    routing_cores.clear();
-    empty_cores.clear();
-    termination_info.clear();
+    node_id_to_kernel_.clear();
+    command_queue_compile_group_->clear();
+    dispatch_cores_.clear();
+    routing_cores_.clear();
+    termination_info_.clear();
 }
 
 }  // namespace tt::tt_metal

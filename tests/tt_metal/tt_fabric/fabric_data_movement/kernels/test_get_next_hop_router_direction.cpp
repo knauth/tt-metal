@@ -1,8 +1,8 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 #include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
 
 using namespace tt::tt_fabric;
@@ -22,7 +22,12 @@ void kernel_main() {
         eth_chan_directions direction = get_next_hop_router_direction(dst_mesh_id, dst_fabric_dev_id);
         result_ptr[dst_idx] = static_cast<uint32_t>(direction);
 
-        DPRINT << "Routing: [" << src_mesh_id << "/" << src_fabric_dev_id << "] -> [" << dst_mesh_id << "/"
-               << dst_fabric_dev_id << "] direction:" << static_cast<uint32_t>(direction) << "\n";
+        DPRINT(
+            "Routing: [{}/{}] -> [{}/{}] direction:{}\n",
+            src_mesh_id,
+            src_fabric_dev_id,
+            dst_mesh_id,
+            dst_fabric_dev_id,
+            static_cast<uint32_t>(direction));
     }
 }

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -19,7 +19,7 @@ from tests.ttnn.utils_for_testing import (
     start_measuring_time,
     stop_measuring_time,
 )
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 from tests.sweep_framework.sweep_utils.roofline_utils import get_run_return
 
 TIMEOUT = 5
@@ -88,12 +88,14 @@ def run_matmul(
     assert input_a_memory_config == ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
     # TODO: row_wise=False and ROW_MAJOR shard orientation gives bad PCC
     # TODO: COL_MAJOR shard orientation doesn't work for get_matmul_program_config
-    input_a_memory_config = input_a_memory_config.with_shard_spec(
+    input_a_memory_config = ttnn.MemoryConfig(
+        input_a_memory_config.memory_layout,
+        input_a_memory_config.buffer_type,
         ttnn.ShardSpec(
             ttnn.num_cores_to_corerangeset(num_cores_height, core_grid, row_wise=True),
             (per_core_height, k_size),
             ttnn.ShardOrientation.ROW_MAJOR,
-        )
+        ),
     )
 
     input_shape_a = (*batch_sizes, m_size, k_size)

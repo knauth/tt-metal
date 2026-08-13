@@ -1,10 +1,13 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/circular_buffer.h"
+#include "api/tensor/noc_traits.h"
 #include "ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/fill_tile_utils.hpp"
 
 void kernel_main() {
@@ -25,11 +28,26 @@ void kernel_main() {
     constexpr auto cb_id_dst = tt::CBIndex::c_2;
     constexpr uint32_t onetile = 1;
 
-#if !DST_SHARDED
-    constexpr auto dst_args = TensorAccessorArgs<0>();
-    const uint32_t dst_tile_bytes = get_tile_size(cb_id_dst);
-    const auto dst = TensorAccessor(dst_args, dst_addr, dst_tile_bytes);
+    Noc noc;
+    CircularBuffer cb_src(cb_id_src);
+    CircularBuffer cb_dst(cb_id_dst);
+
+    // we only need to fill a tile with the scalar value once
+    cb_src.reserve_back(onetile);
+#ifdef FILL_WITH_VALUE_FLOAT
+    const auto float_ptr = reinterpret_cast<const float*>(&packed_scalar);
+    FILL_WITH_VALUE_FLOAT(cb_src.get_write_ptr(), *float_ptr);
 #endif
+#ifdef FILL_WITH_VALUE
+    FILL_WITH_VALUE(cb_src.get_write_ptr(), packed_scalar);
+#endif
+    cb_src.push_back(onetile);
+
+#if !DST_SHARDED
+    constexpr auto dst_args = TensorAccessorArgs<0, 0>();
+    const uint32_t dst_tile_bytes = cb_dst.get_tile_size();
+    const auto dst = TensorAccessor(dst_args, dst_addr);
+    constexpr bool has_sharding = get_compile_time_arg_val(dst_args.next_compile_time_args_offset()) == 1;
 
     const uint32_t tiles_per_n = C * HtWt;
     const uint32_t tiles_per_d = N * tiles_per_n;
@@ -37,37 +55,39 @@ void kernel_main() {
     const uint32_t offset_nd = start_tile_id % tiles_per_nd;
     const uint32_t offset_d = offset_nd % tiles_per_d;
     const uint32_t offset_n = offset_d % tiles_per_n;
+    const uint32_t offset_c = offset_n % HtWt;
     uint32_t start_nd = start_tile_id / tiles_per_nd;
     uint32_t start_d = offset_nd / tiles_per_d;
     uint32_t start_n = offset_d / tiles_per_n;
     uint32_t start_c = offset_n / HtWt;
-    uint32_t start_t = offset_n % HtWt;
+    uint32_t start_th = offset_c / Wt;
+    uint32_t start_tw = offset_c % Wt;
+    uint32_t end_tw = has_sharding ? start_tw + dst_shard_width : Wt;
 
-    // we only need to fill a tile with the scalar value once
-    cb_reserve_back(cb_id_src, onetile);
-#ifdef FILL_WITH_VALUE_FLOAT
-    const auto float_ptr = reinterpret_cast<const float*>(&packed_scalar);
-    FILL_WITH_VALUE_FLOAT(cb_id_src, *float_ptr);
-#endif
-#ifdef FILL_WITH_VALUE
-    FILL_WITH_VALUE(cb_id_src, packed_scalar);
-#endif
-    cb_push_back(cb_id_src, onetile);
-
-#if !DST_SHARDED
     uint32_t num_tiles_written = 0;
+    uint32_t dst_tile_offset = start_tile_id;
+
     for (uint32_t nd = start_nd; nd < cND && num_tiles_written < dst_num_tiles; ++nd, start_d = 0) {
         for (uint32_t d = start_d; d < D && num_tiles_written < dst_num_tiles; ++d, start_n = 0) {
             for (uint32_t n = start_n; n < N && num_tiles_written < dst_num_tiles; ++n, start_c = 0) {
-                for (uint32_t c = start_c; c < C && num_tiles_written < dst_num_tiles; ++c, start_t = 0) {
-                    for (uint32_t t = start_t; t < HtWt && num_tiles_written < dst_num_tiles;
-                         ++t, ++num_tiles_written) {
-                        // write a tile to dst, since the dst shape is full, the tile offset simply grows linearly
-                        cb_wait_front(cb_id_dst, onetile);
-                        uint32_t l1_read_addr = get_read_ptr(cb_id_dst);
-                        noc_async_write_tile(start_tile_id + num_tiles_written, dst, l1_read_addr);
-                        noc_async_write_barrier();
-                        cb_pop_front(cb_id_dst, onetile);
+                for (uint32_t c = start_c; c < C && num_tiles_written < dst_num_tiles; ++c, start_th = 0) {
+                    for (uint32_t th = start_th; th < Ht && num_tiles_written < dst_num_tiles; ++th) {
+                        for (uint32_t tw = start_tw; tw < end_tw && num_tiles_written < dst_num_tiles;
+                             ++tw, ++num_tiles_written) {
+                            // write a tile to dst
+                            cb_dst.wait_front(onetile);
+                            noc.async_write(
+                                cb_dst, dst, dst_tile_bytes, {}, {.page_id = dst_tile_offset + num_tiles_written});
+                            noc.async_write_barrier();
+                            cb_dst.pop_front(onetile);
+                        }
+                        if constexpr (has_sharding) {
+                            // adjust the output tile offset since we had to skip parts of the row
+                            dst_tile_offset += (Wt - dst_shard_width);
+                        } else {
+                            // otherwise, next row of tiles should start at the first column
+                            start_tw = 0;
+                        }
                     }
                 }
             }

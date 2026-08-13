@@ -1,9 +1,16 @@
-cmake_minimum_required(VERSION 3.24...3.30)
+cmake_minimum_required(VERSION 3.24...4.2)
 
-# Sanity check, forgetting to clone submodules is a common omission and results in a poor error message
+# Forgetting to clone submodules is a common omission and results in a poor error message
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tt_metal/third_party/umd/CMakeLists.txt")
     message(FATAL_ERROR "Missing submodules.  Run: git submodule update --init --recursive")
 endif()
+
+# Clear any compile options that may have been set by consuming projects that have leaked.
+set_directory_properties(
+    PROPERTIES
+        COMPILE_OPTIONS
+            ""
+)
 
 ############################################
 # Project setup
@@ -28,15 +35,33 @@ project(
         CXX
 )
 message(STATUS "Metalium version: ${PROJECT_VERSION}")
-message(STATUS "Building Unified Library for all architectures, thanks to blozano-tt")
-
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-# FIXME: Why are we setting these ourselves?
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -DDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g -DDEBUG")
 
-# Defining build types is the pervue of the top-level project
+# Augment CMake's built-in per-config flags rather than replacing them wholesale.
+# Using set(CMAKE_CXX_FLAGS_<CONFIG> ...) overwrites the variable entirely, silently
+# discarding toolchain-file settings and CMake defaults.  add_compile_options() with
+# config generators appends cleanly and composes correctly with toolchain files
+#
+# Flags already provided by CMake defaults and therefore omitted here:
+#   Debug:          -O0 -g
+#   RelWithDebInfo: -O2 -g -DNDEBUG  (we keep -O3 below to preserve existing behaviour)
+add_compile_options(
+    # Richer debug info: include macro definitions and use GNU pubnames for faster GDB lookup
+    "$<$<CONFIG:Debug,RelWithDebInfo>:-g3>"
+    "$<$<CONFIG:Debug,RelWithDebInfo>:-ggnu-pubnames>"
+    # Keep frame pointers for profiling and stack unwinding in non-Release builds
+    "$<$<CONFIG:Debug,RelWithDebInfo>:-fno-omit-frame-pointer>"
+    # Non-standard DEBUG macro (CMake convention is absence of NDEBUG, but this preserves
+    # existing behaviour for code that gates on #ifdef DEBUG).
+    # Restricted to CXX: the original set(CMAKE_CXX_FLAGS_DEBUG …) never applied to C, and
+    # some C sources in third_party redefine DEBUG as a function-like macro which would
+    # conflict with -DDEBUG=1 and produce a -Wmacro-redefined error.
+    "$<$<AND:$<CONFIG:Debug,RelWithDebInfo>,$<COMPILE_LANGUAGE:CXX>>:-DDEBUG>"
+    # RelWithDebInfo: restore -O3 to match previous behaviour (CMake default is -O2)
+    "$<$<CONFIG:RelWithDebInfo>:-O3>"
+)
+
+# Defining build types is the purview of the top-level project
 if(PROJECT_IS_TOP_LEVEL)
     include(sanitizers)
 endif()
@@ -92,14 +117,16 @@ endif()
 include(compilers)
 CHECK_COMPILERS()
 
-# TODO(afuller): Re-enable this after we sort out compatibility with old tools.
-# include(linking)
+include(linking)
 
 # We're not currently using C++20 modules, so don't bother scanning for them
 set(CMAKE_CXX_SCAN_FOR_MODULES FALSE)
 
 # Promote all IMPORTED targets discovered by find_package() to a GLOBAL scope
 set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL TRUE)
+
+# Suppress all "-- Installing:" messages during install steps (e.g. cmake --install / target install)
+set(CMAKE_INSTALL_MESSAGE NEVER)
 
 ############################################################################################################################
 # Project Options
@@ -142,10 +169,17 @@ else()
     add_subdirectory(tt_metal/third_party SYSTEM)
 endif()
 
+option(TT_METAL_SKIP_LINKING "Replace the linker with a no-op touch for clang-tidy builds" OFF)
+if(TT_METAL_SKIP_LINKING)
+    set(CMAKE_CXX_LINK_EXECUTABLE "cmake -E touch <TARGET>")
+    set(CMAKE_C_LINK_EXECUTABLE "cmake -E touch <TARGET>")
+    set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+endif()
+
 ############################################################################################################################
 # Constructing interface libs for common compiler flags, header directories, and libraries
 #   These interface libs are linked with PUBLIC scope at lowest common target (tt_metal/common) and at tt_metal_libs level
-#   in order to propogate to the rest of tt_metal, tt_eager, etc.
+#   in order to propagate to the rest of tt_metal, tt_eager, etc.
 ############################################################################################################################
 add_library(metal_common_libs INTERFACE)
 target_link_libraries(
@@ -153,52 +187,37 @@ target_link_libraries(
     INTERFACE
         dl
         pthread
-        atomic
         hwloc
         numa
 )
 
+# Enable all warnings and treat them as errors by default
+if(NOT DEFINED CMAKE_COMPILE_WARNING_AS_ERROR)
+    set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
+endif()
+
 add_compile_options(
     "$<$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>:-march=x86-64-v3>"
     -fPIC
+    -pipe # use pipes instead of tmp files
     -fvisibility-inlines-hidden
     -Wall
-    -Werror
     "$<$<CXX_COMPILER_ID:Clang>:-Wconditional-uninitialized>"
     # The following list is not indicative of what we _desire_ only the status quo to build.
     -Wno-deprecated-declarations
-    # Vars that are used only in Asserts will appear as dead stores in builds
-    # where the preprocessor has stripped away the assert.
-    -Wno-unused-but-set-variable
-    -Wno-unused-function
-    -Wno-unused-variable
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-c++11-narrowing>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-deprecated-volatile>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-for-loop-analysis>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-logical-op-parentheses>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-mismatched-tags>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-reorder-ctor>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-unused-lambda-capture>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-unused-private-field>"
-    "$<$<CXX_COMPILER_ID:Clang>:-Wno-unknown-pragmas>"
     "$<$<CXX_COMPILER_ID:Clang>:SHELL:-Xclang -fno-pch-timestamp>" # ccache-friendly PCH flag
     "$<$<CXX_COMPILER_ID:GNU>:-fpch-preprocess>" # ccache-friendly PCH flag
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-array-bounds>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-deprecated>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-int-in-bool-context>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-maybe-uninitialized>"
-    "$<$<CXX_COMPILER_ID:GNU>:-Wno-narrowing>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-non-template-friend>"
-    "$<$<CXX_COMPILER_ID:GNU>:-Wno-parentheses>"
-    "$<$<CXX_COMPILER_ID:GNU>:-Wno-pragmas>"
-    "$<$<CXX_COMPILER_ID:GNU>:-Wno-reorder>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-restrict>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-sign-compare>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-strict-aliasing>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overflow>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-stringop-overread>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-unused-local-typedefs>"
-    "$<$<CXX_COMPILER_ID:GNU>:-Wno-volatile>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-pessimizing-move>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-dangling-reference>"
     "$<$<CXX_COMPILER_ID:GNU>:-Wno-overloaded-virtual>"
@@ -236,7 +255,18 @@ string(REPLACE ${PROJECT_NAME} ${PROJECT_NAME_LOWER} CMAKE_INSTALL_DOCDIR ${CMAK
 if(ENABLE_CODE_TIMERS)
     add_compile_definitions(TT_ENABLE_CODE_TIMERS)
 endif()
-include(tracy)
+
+# Descriptor cache-hit fast-path parity check: on every fast-path hit, rebuild the descriptor and
+# assert the patched runtime args + CB addresses match a full rebuild. A debug/CI regression net for
+# incomplete in-place re-application (SDXL silu / MorehAdamW). OFF by default (per-hit rebuild cost).
+# The check is compiled only in ttnn (mesh_device_operation_adapter.hpp), so the
+# TT_DESCRIPTOR_PATCHING_PARITY_CHECK definition is scoped to the ttnn target in ttnn/CMakeLists.txt
+# rather than applied globally.
+option(
+    ENABLE_DESCRIPTOR_PATCHING_PARITY_CHECK
+    "Assert descriptor cache-hit fast-path parity against a full rebuild (debug/CI)."
+    OFF
+)
 
 add_library(metal_common_pch STATIC)
 add_library(TT::CommonPCH ALIAS metal_common_pch)
@@ -267,22 +297,26 @@ target_link_libraries(
         nlohmann_json::nlohmann_json
         fmt::fmt-header-only
 )
+if(COMMAND tt_disable_ccache_for_pch)
+    tt_disable_ccache_for_pch(metal_common_pch)
+endif()
 
 ############################################################################################################################
 # Build subdirectories
 ############################################################################################################################
 
+include(helper_functions)
 add_subdirectory(tt_stl)
+
+add_subdirectory(tools)
 add_subdirectory(tt_metal)
 add_subdirectory(ttnn)
-
 if(TT_METAL_BUILD_TESTS OR TTNN_BUILD_TESTS)
     add_subdirectory(${PROJECT_SOURCE_DIR}/tests)
 endif()
 
 ############################################################################################################################
-# Install targets for build artifacts and pybinds
-#   If built with Tracy, cannot install 'all' since it will pick up install targets from Tracy
+# Install targets for build artifacts and nanobinds
 # For top level install: cmake --build build --target install  or  make/ninja install -C build
 ############################################################################################################################
 # Install for build artifacts that will upload build/lib
@@ -296,14 +330,16 @@ install(
         COMPONENT tar
 )
 
-# FIXME(17578): figure out what bits we actually need to ship and omit the rest
-install(
-    DIRECTORY
-        runtime/sfpi
-    DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/runtime
-    USE_SOURCE_PERMISSIONS
-    COMPONENT jit-build
-)
+if(NOT TT_USE_SYSTEM_SFPI)
+    # FIXME(17578): figure out what bits we actually need to ship and omit the rest
+    install(
+        DIRECTORY
+            runtime/sfpi
+        DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/runtime
+        USE_SOURCE_PERMISSIONS
+        COMPONENT jit-build
+    )
+endif()
 
 # Custom clean target for `built` folder for when new kernel changes are pulled
 add_custom_target(

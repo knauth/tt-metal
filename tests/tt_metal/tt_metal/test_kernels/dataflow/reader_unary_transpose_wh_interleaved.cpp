@@ -1,39 +1,47 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "experimental/kernel_args.h"
+#include "api/core_local_mem.h"
+#include "api/dataflow/endpoints.h"
+#include "api/dataflow/noc.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
-    uint32_t src_addr = get_arg_val<uint32_t>(0);
-    uint32_t N = get_arg_val<uint32_t>(1);
-    uint32_t Ht = get_arg_val<uint32_t>(2);
-    uint32_t Wt = get_arg_val<uint32_t>(3);
-    uint32_t HtWt = get_arg_val<uint32_t>(4);
+    uint32_t N = get_arg(args::N);
+    uint32_t Ht = get_arg(args::Ht);
+    uint32_t Wt = get_arg(args::Wt);
+    uint32_t HtWt = get_arg(args::HtWt);
 
-    constexpr bool src_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr uint32_t cb_id_in0 = 0;
+    Noc noc;
+    DataflowBuffer dfb0(dfb::out_data);
+    const uint32_t tile_bytes = dfb0.get_entry_size();
 
     // ublocks size defined in tiles
     constexpr uint32_t onetile = 1;
-    const uint32_t tile_bytes = get_tile_size(cb_id_in0);
-    const DataFormat data_format = get_dataformat(cb_id_in0);
 
 #ifdef REDUCE_SCALER
-    constexpr uint32_t cb_id_in2 = 2;
-    constexpr uint32_t scaler = get_compile_time_arg_val(1);
-    cb_reserve_back(cb_id_in2, 1);
-    constexpr uint32_t num_zeros_reads = 2048 / MEM_ZEROS_SIZE;
-    uint64_t zeros_noc_addr = get_noc_addr(MEM_ZEROS_BASE);
-    uint32_t write_addr = get_write_ptr(cb_id_in2);
-    // Fill tile with zeros
-    for (uint32_t i = 0; i < num_zeros_reads; ++i) {
-        noc_async_read(zeros_noc_addr, write_addr, MEM_ZEROS_SIZE);
-        write_addr += MEM_ZEROS_SIZE;
-    }
-    noc_async_read_barrier();
-    volatile tt_l1_ptr uint32_t* ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_id_in2));
+    DataflowBuffer dfb1(dfb::out_scaler);
+    dfb1.reserve_back(1);
+    constexpr uint32_t scaler = get_arg(args::scaler);
+
+    noc.async_write_zeros(dfb1, 2048);
+    noc.write_zeros_l1_barrier();
+
+    // On Quasar, dfb.get_write_ptr() returns a cacheable-alias L1 address; the noncacheable
+    // alias (required for NOC-port writes to be visible) is reached by adding
+    // MEMORY_PORT_NONCACHEABLE_MEM_PORT_MEM_BASE_ADDR. On Gen1 the returned pointer is already
+    // usable; the macro doesn't exist there.
+    volatile tt_l1_ptr uint32_t* ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+#ifdef ARCH_QUASAR
+        dfb1.get_write_ptr() + MEMORY_PORT_NONCACHEABLE_MEM_PORT_MEM_BASE_ADDR);
+#else
+        dfb1.get_write_ptr());
+#endif
     uint32_t idx = 0;
     for (uint32_t k = 0; k < 4; ++k) {
         uint32_t curr_idx = idx;
@@ -43,26 +51,23 @@ void kernel_main() {
         }
         idx += 128;
     }
-    cb_push_back(cb_id_in2, 1);
+    dfb1.push_back(onetile);
 #endif
 
     uint32_t i_tile_N = 0;  // first tile in current batch
     uint32_t i_tile = 0;
 
-    const InterleavedAddrGenFast<src_is_dram> s = {
-        .bank_base_address = src_addr, .page_size = tile_bytes, .data_format = data_format};
+    const auto s = TensorAccessor(tensor::src_tensor);
 
     // this reader will read a NHW tensor in NWH order
     for (uint32_t n = 0; n < N; n++) {
         i_tile = i_tile_N;
         for (uint32_t w = 0; w < Wt; w++) {
             for (uint32_t h = 0; h < Ht; h++) {
-                cb_reserve_back(cb_id_in0, onetile);
-                uint32_t l1_write_addr = get_write_ptr(cb_id_in0);
-                noc_async_read_tile(i_tile, s, l1_write_addr);
-                noc_async_read_barrier();
-
-                cb_push_back(cb_id_in0, onetile);
+                dfb0.reserve_back(onetile);
+                noc.async_read(s, dfb0, tile_bytes, {.page_id = i_tile}, {});
+                noc.async_read_barrier();
+                dfb0.push_back(onetile);
                 i_tile += Wt;  // stride in H
             }  // Ht
             i_tile -= HtWt;  // go back to H=0

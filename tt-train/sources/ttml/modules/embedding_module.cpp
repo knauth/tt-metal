@@ -1,10 +1,9 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "embedding_module.hpp"
 
-#include <core/ttnn_all_includes.hpp>
 #include <stdexcept>
 
 #include "autograd/auto_context.hpp"
@@ -14,8 +13,9 @@
 
 namespace ttml::modules {
 
+using namespace tt::constants;
+
 void Embedding::initialize_tensors(uint32_t num_embeddings, uint32_t embedding_dim) {
-    auto* device = &autograd::ctx().get_device();
     m_weight = autograd::create_tensor();
     init::normal_init(m_weight, ttnn::Shape({1, 1, num_embeddings, embedding_dim}), /* normal params */ {0.F, 1.F});
 }

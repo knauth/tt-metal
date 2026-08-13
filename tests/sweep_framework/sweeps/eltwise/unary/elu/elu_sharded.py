@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -19,7 +19,7 @@ from tests.sweep_framework.sweep_utils.sharding_utils import (
 from tests.tt_eager.python_api_testing.sweep_tests.generation_funcs import gen_func_with_cast_tt
 
 from tests.ttnn.utils_for_testing import check_with_pcc, start_measuring_time, stop_measuring_time
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 
 # Override the default timeout in seconds for hang detection.
 TIMEOUT = 120
@@ -107,7 +107,7 @@ def run(
     )
 
     start_time = start_measuring_time()
-    output_tensor = ttnn.elu(input_tensor_a, alpha, memory_config=sharded_config)
+    output_tensor = ttnn.elu(input_tensor_a, alpha=alpha, memory_config=sharded_config)
     e2e_perf = stop_measuring_time(start_time)
     output_tensor = ttnn.to_torch(output_tensor)
 

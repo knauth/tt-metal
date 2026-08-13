@@ -1,14 +1,15 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "compute_kernel_api/matmul.h"
-#include "compute_kernel_api/tile_move_copy.h"
+#include "api/compute/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/dataflow/dataflow_buffer.h"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t in0_block_w = get_compile_time_arg_val(0);              // inner block size in tiles
     uint32_t in0_num_subblocks = get_compile_time_arg_val(1);        // outer row block size (in inner row blocks)
     uint32_t in0_block_num_tiles = get_compile_time_arg_val(2);      // out_subblock_h*in0_block_w*in0_num_subblocks;
@@ -22,7 +23,18 @@ void MAIN {
     uint32_t out_subblock_num_tiles = get_compile_time_arg_val(10);  // out_subblock_h * out_subblock_w;
     uint32_t batch = get_compile_time_arg_val(11);                   // batch dim
 
-    mm_init(tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_24);
+    constexpr uint32_t dfb_in0 = get_named_compile_time_arg_val("cb_in0");
+    constexpr uint32_t dfb_in1 = get_named_compile_time_arg_val("cb_in1");
+    constexpr uint32_t dfb_out = get_named_compile_time_arg_val("cb_out");
+    constexpr uint32_t dfb_intermed0 = get_named_compile_time_arg_val("cb_intermed0");
+
+    DataflowBuffer in0_dfb(dfb_in0);
+    DataflowBuffer in1_dfb(dfb_in1);
+    DataflowBuffer out_dfb(dfb_out);
+    DataflowBuffer intermed0_dfb(dfb_intermed0);
+
+    compute_kernel_hw_startup<SrcOrder::Reverse>(dfb_in0, dfb_in1, dfb_intermed0);
+    matmul_init(dfb_in0, dfb_in1);
 
     for (uint32_t b = 0; b < batch; b++) {
         bool spill = num_blocks > 1;
@@ -32,22 +44,23 @@ void MAIN {
         for (uint32_t block = 0; block < num_blocks; block++) {
             bool last_out = block == (num_blocks - 1);
 
-            cb_wait_front(tt::CBIndex::c_0, in0_block_num_tiles);
-            cb_wait_front(tt::CBIndex::c_1, in1_block_num_tiles);
+            in0_dfb.wait_front(in0_block_num_tiles);
+            in1_dfb.wait_front(in1_block_num_tiles);
             int in0_index_subblock_offset = 0;
             for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
                 int in1_index_subblock_offset = 0;
                 for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
-                    acquire_dst();
+                    tile_regs_acquire();
 
                     if (enable_reload) {
-                        copy_tile_to_dst_init_short_with_dt(tt::CBIndex::c_1, tt::CBIndex::c_24);
-                        cb_wait_front(tt::CBIndex::c_24, out_subblock_num_tiles);
+                        copy_tile_to_dst_init_short_with_dt(dfb_in1, dfb_intermed0);
+                        intermed0_dfb.wait_front(out_subblock_num_tiles);
                         for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
-                            copy_tile(tt::CBIndex::c_24, i, i);
+                            copy_tile(dfb_intermed0, i, i);
                         }
-                        cb_pop_front(tt::CBIndex::c_24, out_subblock_num_tiles);
-                        mm_init_short_with_dt(tt::CBIndex::c_0, tt::CBIndex::c_1, tt::CBIndex::c_24);
+                        intermed0_dfb.pop_front(out_subblock_num_tiles);
+                        reconfig_data_format_srca(dfb_intermed0, dfb_in1);
+                        matmul_init(dfb_in0, dfb_in1);
                     }
 
                     // Compute output sub-block from in0_subblock x in1_subblock
@@ -59,13 +72,7 @@ void MAIN {
                             for (uint32_t inner_dim = 0; inner_dim < in0_block_w; inner_dim++) {
                                 int in0_index = in0_index_subblock_offset + in0_index_h_offset + inner_dim;
                                 int in1_index = in1_index_subblock_offset + in1_index_inner_dim_offset + w;
-                                matmul_tiles(
-                                    tt::CBIndex::c_0,
-                                    tt::CBIndex::c_1,
-                                    in0_index,
-                                    in1_index,
-                                    dst_index,
-                                    false /* transpose */);
+                                matmul_tiles(dfb_in0, dfb_in1, in0_index, in1_index, dst_index);
                                 in1_index_inner_dim_offset += in1_per_core_w;
                             }
                             dst_index++;
@@ -73,28 +80,38 @@ void MAIN {
                         in0_index_h_offset += in0_block_w;
                     }
 
+                    tile_regs_commit();
+
                     if (last_out) {
                         // Pack out to output buffer
-                        cb_reserve_back(tt::CBIndex::c_16, out_subblock_num_tiles);
-                        for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
-                            pack_tile(i, tt::CBIndex::c_16);
-                        }
-                        cb_push_back(tt::CBIndex::c_16, out_subblock_num_tiles);
+                        out_dfb.reserve_back(out_subblock_num_tiles);
                     } else {
                         // Wait for tiles in output buffer to be written out since interm and output share memory
                         if (block == 0) {
-                            cb_reserve_back(tt::CBIndex::c_16, out_num_tiles_to_wait);
+                            out_dfb.reserve_back(out_num_tiles_to_wait);
                             out_num_tiles_to_wait += out_subblock_num_tiles;
                         }
                         // Move partial result to interm buffer
-                        cb_reserve_back(tt::CBIndex::c_24, out_subblock_num_tiles);
-                        for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
-                            pack_tile(i, tt::CBIndex::c_24);
-                        }
-                        cb_push_back(tt::CBIndex::c_24, out_subblock_num_tiles);
+                        intermed0_dfb.reserve_back(out_subblock_num_tiles);
                     }
 
-                    release_dst();
+                    tile_regs_wait();
+                    if (last_out) {
+                        for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
+                            pack_tile(i, dfb_out);
+                        }
+                    } else {
+                        for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
+                            pack_tile(i, dfb_intermed0);
+                        }
+                    }
+                    tile_regs_release();
+
+                    if (last_out) {
+                        out_dfb.push_back(out_subblock_num_tiles);
+                    } else {
+                        intermed0_dfb.push_back(out_subblock_num_tiles);
+                    }
                     in1_index_subblock_offset += out_subblock_w;
                 }
                 in0_index_subblock_offset += in0_subblock_num_tiles;
@@ -104,9 +121,8 @@ void MAIN {
                 enable_reload = true;
             }
 
-            cb_pop_front(tt::CBIndex::c_0, in0_block_num_tiles);
-            cb_pop_front(tt::CBIndex::c_1, in1_block_num_tiles);
+            in0_dfb.pop_front(in0_block_num_tiles);
+            in1_dfb.pop_front(in1_block_num_tiles);
         }
     }
 }
-}  // namespace NAMESPACE

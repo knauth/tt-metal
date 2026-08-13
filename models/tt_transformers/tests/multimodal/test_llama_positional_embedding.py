@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,57 +7,19 @@ import os
 
 import pytest
 import torch
-import torch.nn as nn
 from loguru import logger
+from transformers import AutoConfig, AutoModelForImageTextToText
+from transformers.models.mllama.image_processing_mllama import convert_aspect_ratios_to_ids
+from transformers.models.mllama.modeling_mllama import MllamaPrecomputedPositionEmbedding
 
 import ttnn
+from models.common.utility_functions import comp_allclose, comp_pcc
+from models.tt_transformers.tests.multimodal.utils import load_partial_weights
 from models.tt_transformers.tt.model_config import ModelArgs
 from models.tt_transformers.tt.multimodal.llama_positional_embedding import TtLlamaPositionalEmbedding
-from models.utility_functions import comp_allclose, comp_pcc, skip_for_grayskull
 from ttnn import ConcatMeshToTensor, ReplicateTensorToMesh
 
 
-##### Torch op #####
-class PositionalEmbedding(nn.Module):
-    def __init__(self, image_size, patch_size, max_num_tiles, width):
-        super().__init__()
-
-        self.grid_size = (
-            image_size[0] // patch_size[0],
-            image_size[1] // patch_size[1],
-        )
-
-        scale = width**-0.5
-        self.positional_embedding = nn.Parameter(scale * torch.randn(self.grid_size[0] * self.grid_size[1] + 1, width))
-
-        self.gated_positional_embedding = nn.Parameter(
-            scale
-            * torch.randn(
-                max_num_tiles,
-                max_num_tiles,
-                self.grid_size[0] * self.grid_size[1] + 1,
-                width,
-            )
-        )
-        self.gated_positional_embedding_gate = nn.Parameter(torch.randn(1))
-
-    def forward(self, x, ar):
-        assert x.shape[2] == (self.grid_size[0] * self.grid_size[1] + 1), "Input tensor shape is not correct!"
-        # apply regular position embedding
-        bsz, num_chunks, num_tokens, dim = x.shape
-        x = x.view(bsz * num_chunks, num_tokens, dim)
-
-        x = x + self.positional_embedding * (1 - self.gated_positional_embedding_gate.tanh())
-        x = x.view(bsz, num_chunks, num_tokens, dim)
-
-        for idx, arx in enumerate(ar):
-            _pos_embed = self.gated_positional_embedding[: arx[0], : arx[1]]
-            _pos_embed = _pos_embed.reshape(arx[0] * arx[1], *_pos_embed.shape[2:])
-            x[idx, : arx[0] * arx[1]] += _pos_embed * self.gated_positional_embedding_gate.tanh()
-        return x
-
-
-@skip_for_grayskull("Requires wormhole_b0 to run")
 @pytest.mark.parametrize(
     "mesh_device",
     [
@@ -87,14 +49,9 @@ def test_positional_embedding_inference(
     model_args = ModelArgs(mesh_device)
     state_dict = model_args.load_state_dict()
     first_layer_prefix = "vision_model.vision_encoder."
-    partial_state_dict = {
-        k[len(first_layer_prefix) :]: v for k, v in state_dict.items() if (k.startswith(first_layer_prefix))
-    }
 
     ntok = model_args.vision_chunk_ntok
     dim = model_args.vision_dim
-    image_size = (model_args.vision_chunk_size, model_args.vision_chunk_size)
-    patch_size = (model_args.vision_patch_size, model_args.vision_patch_size)
 
     ##### Check parms #####
     max_num_tiles = model_args.vision_max_num_chunks
@@ -131,15 +88,21 @@ def test_positional_embedding_inference(
 
     tt_aspect_ratios = aspect_ratios.tolist()
 
-    ##### Perform the torch ops #####
-    reference_model = PositionalEmbedding(
-        image_size=image_size,
-        patch_size=patch_size,
-        max_num_tiles=max_num_tiles,
-        width=dim,
+    # config contains parameters for the whole multimodal network the subeset of vision branch is chosen instead
+    model_repo_name = os.getenv("HF_MODEL")
+    config = AutoConfig.from_pretrained(model_repo_name)
+    reference_model = MllamaPrecomputedPositionEmbedding(config.vision_config)
+    # partial loading of HF safetensors to match model graph expected dimensionality of the loaded weights
+    partial_state_dict = load_partial_weights(
+        AutoModelForImageTextToText, model_repo_name, "model.vision_model.gated_positional_embedding."
     )
-    reference_model.load_state_dict(partial_state_dict, strict=False)
-    reference_output = reference_model(input_tensor, aspect_ratios)
+    reference_model.load_state_dict(partial_state_dict)
+    # HF tricky part the aspect ratios are mapped to integer values and these are used to draw the correct embedding vector.
+    # transformers 5.x convert_aspect_ratios_to_ids returns a torch.Tensor (4.x returned np.ndarray), so only
+    # wrap with torch.from_numpy when it's still an ndarray.
+    _aspect_ratios_id = convert_aspect_ratios_to_ids(aspect_ratios.unsqueeze(0), max_num_tiles)
+    aspect_ratios_id = _aspect_ratios_id if torch.is_tensor(_aspect_ratios_id) else torch.from_numpy(_aspect_ratios_id)
+    reference_output = reference_model(input_tensor, aspect_ratios_id)
 
     ##### Perform the TT ops #####
     tt_model = TtLlamaPositionalEmbedding(

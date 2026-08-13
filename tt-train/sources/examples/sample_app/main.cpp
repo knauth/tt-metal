@@ -1,37 +1,37 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include <core/ttnn_all_includes.hpp>
 #include <iostream>
 
+#include "tt-metalium/bfloat16.hpp"
+#include "tt-metalium/host_api.hpp"
 #include "ttml.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/tensor/host_buffer/functions.hpp"
+#include "ttnn/tensor/tensor.hpp"
 
 std::shared_ptr<tt::tt_metal::distributed::MeshDevice> device;
 
-void print_tensor(const tt::tt_metal::Tensor& tensor) {
+void print_tensor(const ttnn::Tensor& tensor) {
     // IMPORTANT. This function prints the tensor data assuming the tensor is in ROW_MAJOR layout
     // but we are using TILE layout. The printed format WILL NOT be correct. But good enough for a demo
 
     // Get the shape of the tensor
     auto shape = tensor.logical_shape();
-    // compyte the size of the tensor
-    size_t size = 1;
-    for (size_t i = 0; i < shape.size(); i++) size *= shape[i];
 
-    // prepare a buffer to copy the tensor data to the host
-    std::vector<bfloat16> data(size);
-    tt::tt_metal::memcpy(device->mesh_command_queue(), data.data(), tensor);
+    // Move tensor to host and get data as a span
+    auto host_tensor = tensor.cpu();
+    auto data = tt::tt_metal::host_buffer::get_as<bfloat16>(host_tensor);
 
     // print the data
     for (size_t dim0 = 0; dim0 < shape[0]; dim0++) {
         for (size_t dim1 = 0; dim1 < shape[1]; dim1++) {
             for (size_t dim2 = 0; dim2 < shape[2]; dim2++) {
                 for (size_t dim3 = 0; dim3 < shape[3]; dim3++) {
-                    std::cout << data
-                                     [dim0 * shape[1] * shape[2] * shape[3] + dim1 * shape[2] * shape[3] +
-                                      dim2 * shape[3] + dim3]
-                                         .to_float()
+                    std::cout << static_cast<float>(data
+                                                        [dim0 * shape[1] * shape[2] * shape[3] +
+                                                         dim1 * shape[2] * shape[3] + dim2 * shape[3] + dim3])
                               << " ";
                 }
                 std::cout << std::endl;
@@ -47,7 +47,6 @@ int main() {
     const size_t tensor_height = 32;
 
     // tell TTNN that we want to use the first device available
-    tt::ARCH arch_ = {};
     size_t num_devices_ = 0;
 
     std::srand(0);
@@ -69,7 +68,7 @@ int main() {
         42,
         -1));
     // Now we create a tensor with the buffer we just created
-    auto x = tt::tt_metal::Tensor(
+    auto x = ttnn::Tensor(
         // Let the tensor take ownership of the buffer
         std::move(buffer),
         // IMPORTANT: SHAPE MUST BE 4D ELSE EVERYTHING WILL BREAK during the PAD operation

@@ -1,11 +1,11 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "data_format.hpp"
 
-#include <assert.hpp>      // for tt_throw, TT_FATAL
-#include <base_types.hpp>  // for UnpackToDestMode
+#include <tt_stl/assert.hpp>  // for tt_throw, TT_FATAL
+#include <base_types.hpp>     // for tt::tt_metal::UnpackToDestMode
 #include <circular_buffer_constants.h>
 #include <functional>
 #include <iostream>       // for basic_ostream
@@ -19,7 +19,9 @@ static const std::set<DataFormat> ALL_VALID_FORMATS = {
     DataFormat::Bfp8,      DataFormat::Bfp8_b,   DataFormat::Bfp4,      DataFormat::Bfp4_b,  DataFormat::Bfp2,
     DataFormat::Bfp2_b,    DataFormat::Float16,  DataFormat::Float16_b, DataFormat::Float32, DataFormat::RawUInt32,
     DataFormat::RawUInt16, DataFormat::RawUInt8, DataFormat::Tf32,      DataFormat::Lf8,     DataFormat::Fp8_e4m3,
-    DataFormat::Int8,      DataFormat::Int32,    DataFormat::UInt8,     DataFormat::UInt32,  DataFormat::UInt16,
+    DataFormat::MxFp4,     DataFormat::MxFp6P,   DataFormat::MxFp6R,    DataFormat::MxFp8R,  DataFormat::MxFp8P,
+    DataFormat::MxInt8,    DataFormat::MxInt4,   DataFormat::MxInt2,    DataFormat::Int8,    DataFormat::Int16,
+    DataFormat::Int32,     DataFormat::UInt8,    DataFormat::UInt32,    DataFormat::UInt16,
 };
 
 static const std::unordered_map<DataFormat, DataFormat> CONVERT_EXP_WIDTH = {
@@ -40,78 +42,90 @@ bool is_bfp_format(DataFormat data_format) {
         (data_format == DataFormat::Bfp2_b) || (data_format == DataFormat::Bfp2));
 }
 
+bool is_mx_format(DataFormat data_format) {
+    return (
+        (data_format == DataFormat::MxFp4) || (data_format == DataFormat::MxFp6P) ||
+        (data_format == DataFormat::MxFp6R) || (data_format == DataFormat::MxFp8R) ||
+        (data_format == DataFormat::MxFp8P) || (data_format == DataFormat::MxInt8) ||
+        (data_format == DataFormat::MxInt4) || (data_format == DataFormat::MxInt2));
+}
+
 bool is_exp_b_format(DataFormat data_format) {
     return (
         (data_format == DataFormat::Tf32 || data_format == DataFormat::Float16_b) ||
         (data_format == DataFormat::Bfp8_b) || (data_format == DataFormat::Bfp4_b) ||
-        (data_format == DataFormat::Bfp2_b));
+        (data_format == DataFormat::Bfp2_b) || (data_format == DataFormat::MxFp4) ||
+        (data_format == DataFormat::MxFp6P) || (data_format == DataFormat::MxFp6R) ||
+        (data_format == DataFormat::MxFp8R) || (data_format == DataFormat::MxFp8P) ||
+        (data_format == DataFormat::MxInt8) || (data_format == DataFormat::MxInt4) ||
+        (data_format == DataFormat::MxInt2));
 }
 
 ExpPrecision get_exp_precision(DataFormat data_format) {
     return (is_exp_b_format(data_format) ? ExpPrecision::B : ExpPrecision::A);
 }
 
-void dump_data_formats(DataFormat data_format[NUM_CIRCULAR_BUFFERS]) {
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
-        std::cout << "Operand idx " << i << ": " << data_format[i] << "," << std::endl;
-    }
-}
-
-DataFormat check_consistent_format_across_buffers(DataFormat data_format[NUM_CIRCULAR_BUFFERS]) {
+DataFormat check_consistent_format_across_buffers(std::span<const DataFormat> data_format) {
     DataFormat last_valid_format = DataFormat::Invalid;
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
+    for (const auto& format : data_format) {
         // Special case where Float32 can pair with any exponent precision, skip checking
-        if ((data_format[i] == DataFormat::Float32) || (data_format[i] == DataFormat::RawUInt32) ||
-            (data_format[i] == DataFormat::UInt32) || (data_format[i] == DataFormat::RawUInt16) ||
-            (data_format[i] == DataFormat::RawUInt8) || (data_format[i] == DataFormat::UInt16) ||
-            (data_format[i] == DataFormat::UInt8) || (data_format[i] == DataFormat::Int32)) {
+        if ((format == DataFormat::Float32) || (format == DataFormat::RawUInt32) || (format == DataFormat::UInt32) ||
+            (format == DataFormat::RawUInt16) || (format == DataFormat::RawUInt8) || (format == DataFormat::UInt16) ||
+            (format == DataFormat::UInt8) || (format == DataFormat::Int32)) {
             continue;
         }
 
-        if (data_format[i] != DataFormat::Invalid) {
-            TT_FATAL(
-                ALL_VALID_FORMATS.find(data_format[i]) != ALL_VALID_FORMATS.end(),
-                "Format = {} not supported",
-                data_format[i]);
+        // Special case where Fp8_e4m3 can be used with any format
+        if (format == DataFormat::Fp8_e4m3) {
+            continue;
+        }
+
+        if (format != DataFormat::Invalid) {
+            TT_FATAL(ALL_VALID_FORMATS.contains(format), "Format = {} not supported", format);
 
             if (last_valid_format != DataFormat::Invalid) {
                 TT_FATAL(
-                    is_exp_b_format(data_format[i]) == is_exp_b_format(last_valid_format),
+                    is_exp_b_format(format) == is_exp_b_format(last_valid_format),
                     "All input data-formats must have the same exponent format.");
                 // dump_data_formats(data_format);
-                last_valid_format = data_format[i];
+                last_valid_format = format;
 
             } else {
-                last_valid_format = data_format[i];
+                last_valid_format = format;
             }
         }
     }
     return last_valid_format;
 }
 
-DataFormat check_valid_formats_in_out_data_formats(DataFormat data_format[NUM_CIRCULAR_BUFFERS]) {
+DataFormat check_valid_formats_in_out_data_formats(std::span<const DataFormat> data_format) {
     DataFormat last_valid_format = DataFormat::Invalid;
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
-        if (data_format[i] != DataFormat::Invalid) {
-            TT_FATAL(
-                ALL_VALID_FORMATS.find(data_format[i]) != ALL_VALID_FORMATS.end(),
-                "Format = {} not supported",
-                data_format[i]);
-            last_valid_format = data_format[i];
+    for (const auto& format : data_format) {
+        if (format != DataFormat::Invalid) {
+            TT_FATAL(ALL_VALID_FORMATS.contains(format), "Format = {} not supported", format);
+            last_valid_format = format;
         }
     }
     return last_valid_format;
 }
 
-ExpPrecision get_data_exp_precision(DataFormat data_formats[NUM_CIRCULAR_BUFFERS]) {
+ExpPrecision get_data_exp_precision(std::span<const DataFormat> data_formats) {
     DataFormat last_valid_format = check_consistent_format_across_buffers(data_formats);
+    if (last_valid_format == DataFormat::Invalid) {
+        // No valid format found (e.g. all CBs are Float32 or integer formats, which
+        // check_consistent_format_across_buffers skips). tt-metal does not ship A-family
+        // floats (Float16/Bfp8/Bfp4/Bfp2), so default to B so the conditional unpack-dst
+        // selection picks Float16_b instead of Float16. Float16 has a 5-bit exponent that
+        // would silently cap fp32 magnitudes when paired with fp32 src (issue #43229).
+        return ExpPrecision::B;
+    }
     return get_exp_precision(last_valid_format);
 }
 
-std::vector<DataFormat> get_unpack_src_formats(DataFormat data_formats[NUM_CIRCULAR_BUFFERS]) {
+std::vector<DataFormat> get_unpack_src_formats(std::span<const DataFormat> data_formats) {
     std::vector<DataFormat> unpack_src_format;
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
-        DataFormat src_format = data_formats[i];
+    unpack_src_format.reserve(data_formats.size());
+    for (auto src_format : data_formats) {
         if (src_format == DataFormat::RawUInt32 || src_format == DataFormat::RawUInt16 ||
             src_format == DataFormat::RawUInt8) {
             switch (src_format) {
@@ -126,7 +140,14 @@ std::vector<DataFormat> get_unpack_src_formats(DataFormat data_formats[NUM_CIRCU
 }
 
 DataFormat get_single_unpack_dst_format(
-    const DataFormat src_format, const DataFormat /*pack_format*/, const DataFormat unpack_conditional_dst_format) {
+    const DataFormat src_format,
+    const DataFormat /*pack_format*/,
+    const DataFormat unpack_conditional_dst_format,
+    const bool enable_2x_src_format) {
+    // NOTE: DataFormat::UInt8 is intentionally not remapped to Int8 here. The unpacker's 4-bit
+    // OutDataFormat register field has no UInt8 encoding; the LLK applies masked_data_format()
+    // at the register-write site so UInt8 (=30) lands as INT8 (=14) in the bitfield. We preserve
+    // UInt8 in the dst format because downstream LLK paths (e.g. math-MOP selection) key off the original dtype value.
     DataFormat dst_format = src_format;
     if (src_format == DataFormat::Float32) {
         TT_FATAL(
@@ -134,18 +155,24 @@ DataFormat get_single_unpack_dst_format(
                 (unpack_conditional_dst_format == DataFormat::Float16_b) ||
                 (unpack_conditional_dst_format == DataFormat::Tf32) ||
                 (unpack_conditional_dst_format == DataFormat::Float32),
-            "fp32 conditional format can only be fp16a/b or fp32");
+            "fp32 conditional format can only be fp16a/b, tf32, or fp32");
         dst_format = unpack_conditional_dst_format;
-    } else if (is_bfp_format(src_format)) {
-        dst_format = is_exp_b_format(src_format) ? DataFormat::Bfp8_b : DataFormat::Bfp8;
+    }
+
+    if (is_mx_format(src_format)) {
+        if (enable_2x_src_format && src_format == DataFormat::MxFp4) {
+            dst_format = DataFormat::MxFp4_2x_B;
+        } else {
+            dst_format = DataFormat::Float16_b;  // Default: MX formats unpack-expand to Float16_b in src regs.
+        }
     }
 
     return dst_format;
 }
 
-bool is_all_fp32_formats(const DataFormat data_format[NUM_CIRCULAR_BUFFERS]) {
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
-        if (data_format[i] != DataFormat::Invalid && data_format[i] != DataFormat::Float32) {
+bool is_all_fp32_formats(std::span<const DataFormat> data_format) {
+    for (const auto& format : data_format) {
+        if (format != DataFormat::Invalid && format != DataFormat::Float32) {
             return false;
         }
     }
@@ -153,19 +180,26 @@ bool is_all_fp32_formats(const DataFormat data_format[NUM_CIRCULAR_BUFFERS]) {
 }
 
 std::vector<DataFormat> get_unpack_dst_formats(
-    DataFormat buf_formats[NUM_CIRCULAR_BUFFERS],
+    std::span<const DataFormat> buf_formats,
     DataFormat unpack_conditional_dst_format,
     bool /*fp32_dest_acc_en*/,
-    std::vector<UnpackToDestMode> unpack_to_dest_mode,
-    bool int_fpu_en) {
+    std::vector<tt::tt_metal::UnpackToDestMode> unpack_to_dest_mode,
+    bool int_fpu_en,
+    bool enable_2x_src_format) {
     if (!unpack_to_dest_mode.empty()) {
         TT_FATAL(
-            unpack_to_dest_mode.size() == NUM_CIRCULAR_BUFFERS, "unpack_to_dest_mode vector must have 32 elements");
+            // Allow size >= buf_formats.size() to support host-side allocations sized for
+            // maximum CB count across all architectures. buf_formats.size() is arch-specific.
+            // We only access the first buf_formats.size() elements
+            unpack_to_dest_mode.size() >= buf_formats.size(),
+            "unpack_to_dest_mode vector must have {} elements",
+            buf_formats.size());
     }
 
     std::vector<DataFormat> unpack_dst_format;
+    unpack_dst_format.reserve(buf_formats.size());
 
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
+    for (size_t i = 0; i < buf_formats.size(); i++) {
         DataFormat src_format = buf_formats[i];
         if (src_format == DataFormat::RawUInt32 || src_format == DataFormat::RawUInt16 ||
             src_format == DataFormat::RawUInt8) {
@@ -178,17 +212,26 @@ std::vector<DataFormat> get_unpack_dst_formats(
         } else if (int_fpu_en) {
             unpack_dst_format.push_back(src_format);
         } else {
-            if (buf_formats[i] == DataFormat::Float32 && !unpack_to_dest_mode.empty() &&
-                unpack_to_dest_mode[i] != UnpackToDestMode::Default) {
-                unpack_dst_format.push_back(
-                    get_single_unpack_dst_format(src_format, DataFormat::Invalid, DataFormat::Float32));
+            if (src_format == DataFormat::Float32 && !unpack_to_dest_mode.empty() &&
+                unpack_to_dest_mode[i] != tt::tt_metal::UnpackToDestMode::Default) {
+                unpack_dst_format.push_back(get_single_unpack_dst_format(
+                    src_format, DataFormat::Invalid, DataFormat::Float32, enable_2x_src_format));
             } else {
-                unpack_dst_format.push_back(
-                    get_single_unpack_dst_format(src_format, DataFormat::Invalid, unpack_conditional_dst_format));
+                unpack_dst_format.push_back(get_single_unpack_dst_format(
+                    src_format, DataFormat::Invalid, unpack_conditional_dst_format, enable_2x_src_format));
             }
         }
     }
     return unpack_dst_format;
+}
+
+bool any_unpack_to_dest(const std::vector<tt::tt_metal::UnpackToDestMode>& unpack_to_dest_mode) {
+    for (const auto mode : unpack_to_dest_mode) {
+        if (mode != tt::tt_metal::UnpackToDestMode::Default) {
+            return true;
+        }
+    }
+    return false;
 }
 
 DataFormat get_single_pack_src_format(
@@ -218,17 +261,22 @@ DataFormat get_single_pack_src_format(
             case DataFormat::RawUInt16: pack_src_format = DataFormat::Float16; break;
             default: pack_src_format = DataFormat::Lf8; break;
         }
+        // NOLINTNEXTLINE(bugprone-branch-clone)
     } else if (data_format == DataFormat::UInt16) {
         pack_src_format = data_format;
     } else if (data_format == DataFormat::Invalid) {
         pack_src_format = DataFormat::Invalid;
     } else if (data_format == DataFormat::Fp8_e4m3) {
-        pack_src_format = DataFormat::Float16;
+        pack_src_format = is_exp_b_format(unpack_conditional_dst_format) ? DataFormat::Float16_b : DataFormat::Float16;
     } else if (fp32_dest_acc_en) {
-        if (is_bfp_format(data_format)) {
-            pack_src_format = bfp8_pack_precise
-                                  ? DataFormat::Float32
-                                  : (is_exp_b_format(data_format) ? DataFormat::Bfp8_b : DataFormat::Bfp8);
+        if (arch == tt::ARCH::QUASAR && !tt::is_integer_format(data_format)) {
+            pack_src_format = DataFormat::Float32;
+        } else if (is_bfp_format(data_format)) {
+            if (bfp8_pack_precise) {
+                pack_src_format = DataFormat::Float32;
+            } else {
+                pack_src_format = is_exp_b_format(data_format) ? DataFormat::Bfp8_b : DataFormat::Bfp8;
+            }
         } else if (is_exp_b_format(data_format) || (data_format == DataFormat::Float32)) {
             pack_src_format = data_format;
         } else if (data_format == DataFormat::Float16) {
@@ -241,13 +289,15 @@ DataFormat get_single_pack_src_format(
             pack_src_format = DataFormat::UInt16;
         } else if (data_format == DataFormat::UInt8) {
             pack_src_format = DataFormat::UInt8;
+        } else if (data_format == DataFormat::Int8) {
+            pack_src_format = DataFormat::Int8;
         } else {
             TT_THROW("No valid conversion from fp32 dest to output format = {}", data_format);
         }
     } else if (int_fpu_en) {
         TT_THROW("Integer math is not supported");
         // If output is integer, then pack_src_format is integer as conversion in packer is not supported
-        // If output if float, then pack_src_format is Float32 as sfpu outut if Float32
+        // If output if float, then pack_src_format is Float32 as sfpu output if Float32
         if (tt::is_integer_format(data_format)) {
             pack_src_format = data_format;
         } else {
@@ -274,9 +324,14 @@ DataFormat get_single_pack_src_format(
             }
             pack_src_format = unpack_conditional_dst_format;
         } else if (is_bfp_format(data_format)) {
-            pack_src_format = bfp8_pack_precise
-                                  ? (is_exp_b_format(data_format) ? DataFormat::Float16_b : DataFormat::Float16)
-                                  : (is_exp_b_format(data_format) ? DataFormat::Bfp8_b : DataFormat::Bfp8);
+            if (bfp8_pack_precise) {
+                pack_src_format = is_exp_b_format(data_format) ? DataFormat::Float16_b : DataFormat::Float16;
+            } else {
+                pack_src_format = is_exp_b_format(data_format) ? DataFormat::Bfp8_b : DataFormat::Bfp8;
+            }
+        } else if (is_mx_format(data_format)) {
+            pack_src_format =
+                is_exp_b_format(unpack_conditional_dst_format) ? DataFormat::Float16_b : DataFormat::Float16;
         } else {
             pack_src_format = data_format;
         }
@@ -287,9 +342,16 @@ DataFormat get_single_pack_src_format(
         DataFormat pack_src_format_tmp = data_format;
 
         if (is_bfp_format(data_format)) {
-            pack_src_format_tmp = bfp8_pack_precise
-                                      ? (is_exp_b_format(data_format) ? DataFormat::Float16_b : DataFormat::Float16)
-                                      : (is_exp_b_format(data_format) ? DataFormat::Bfp8_b : DataFormat::Bfp8);
+            if (bfp8_pack_precise) {
+                pack_src_format_tmp = is_exp_b_format(data_format) ? DataFormat::Float16_b : DataFormat::Float16;
+            } else {
+                pack_src_format_tmp = is_exp_b_format(data_format) ? DataFormat::Bfp8_b : DataFormat::Bfp8;
+            }
+        }
+
+        if (is_mx_format(data_format)) {
+            pack_src_format_tmp =
+                is_exp_b_format(unpack_conditional_dst_format) ? DataFormat::Float16_b : DataFormat::Float16;
         }
 
         if (pack_src_format_tmp != DataFormat::Float32) {
@@ -309,27 +371,28 @@ DataFormat get_single_pack_src_format(
 }
 
 std::vector<DataFormat> get_pack_src_formats(
-    DataFormat data_formats[NUM_CIRCULAR_BUFFERS],
+    std::span<const DataFormat> data_formats,
     DataFormat unpack_conditional_dst_format,
     bool fp32_dest_acc_en,
     bool bfp8_pack_precise,
     bool int_fpu_en,
     tt::ARCH arch) {
     std::vector<DataFormat> pack_src_formats;
+    pack_src_formats.reserve(data_formats.size());
     DataFormat pack_src_format;
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
+    for (auto src_format : data_formats) {
         pack_src_format = get_single_pack_src_format(
-            data_formats[i], unpack_conditional_dst_format, fp32_dest_acc_en, bfp8_pack_precise, int_fpu_en, arch);
+            src_format, unpack_conditional_dst_format, fp32_dest_acc_en, bfp8_pack_precise, int_fpu_en, arch);
         pack_src_formats.push_back(pack_src_format);
     }
 
     return pack_src_formats;
 }
 
-std::vector<DataFormat> get_pack_dst_formats(DataFormat buf_formats[NUM_CIRCULAR_BUFFERS]) {
+std::vector<DataFormat> get_pack_dst_formats(std::span<const DataFormat> buf_formats) {
     std::vector<DataFormat> pack_dst_format;
-    for (int i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
-        DataFormat dst_format = buf_formats[i];
+    pack_dst_format.reserve(buf_formats.size());
+    for (auto dst_format : buf_formats) {
         if (dst_format == DataFormat::RawUInt32 || dst_format == DataFormat::RawUInt16 ||
             dst_format == DataFormat::RawUInt8) {
             switch (dst_format) {

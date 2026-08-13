@@ -1,44 +1,25 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "scatter_program_factory.hpp"
 
-#include "scatter_device_operation_types.hpp"
-#include "tt-metalium/device.hpp"
+#include "scatter_common.hpp"
 
 #include <tt-metalium/host_api.hpp>
-#include <tt-metalium/constants.hpp>
-#include <tt-metalium/util.hpp>
-#include <tt-metalium/tensor_accessor_args.hpp>
+#include <tt-metalium/work_split.hpp>
+#include <tt-metalium/experimental/metal2_host_api/program_spec.hpp>
+#include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
 
-namespace ttnn::operations::data_movement::scatter {
+#include "ttnn/operations/core/data_movement_kernel/datamovement_kernel_config.hpp"
 
-namespace {
-constexpr uint32_t BIT_MASK_32 = 32 - 1;
+namespace ttnn::prim {
 
-uint64_t ceil32(const uint64_t& number) {
-    return ((number & BIT_MASK_32) == 0) ? number : ((number | BIT_MASK_32) + 1);
-}
+using namespace tt::tt_metal;
+using namespace tt::tt_metal::experimental;
 
-bool is_pow2_min32(const uint64_t& number) { return ((number & (number - 1)) == 0) && number >= 32; }
-}  // namespace
-
-// maximal input/index/source/output chunk size, divisible by 32, calculated as follows:
-// BH available L1 mem size of nearly 1.5 MB...
-// ... divided by 4 to be able to allocate four equally long row chunks (coming from input/index/source/output
-// tensors)
-// ... divided by 4 to account for 4-byte datum sizes of each tensor (fp32, int32)
-// ... minimized by ~20% to account for reserved memory
-uint32_t calculate_optimal_chunk_size(IDevice* device) { return ceil32(device->l1_size_per_core() / 4 / 4 * 0.8 - 32); }
-
-ScatterProgramFactory::cached_program_t ScatterProgramFactory::create(
-    const operation_attributes_t& args, const tensor_args_t& tensor_args, tensor_return_value_t& output_tensor) {
-    using namespace tt::tt_metal;
-    using namespace tt::constants;
-
-    Program program{};
-
+ttnn::device_operation::ProgramArtifacts ScatterProgramFactory::create_program_artifacts(
+    const ScatterParams& args, const ScatterInputs& tensor_args, Tensor& output_tensor) {
     const auto& input_tensor{tensor_args.input_tensor};
     const auto& input_shape{input_tensor.logical_shape()};
     const auto& index_tensor{tensor_args.index_tensor};
@@ -47,54 +28,35 @@ ScatterProgramFactory::cached_program_t ScatterProgramFactory::create(
     const auto& src_shape{src_tensor.logical_shape()};
     const auto& output_shape{output_tensor.logical_shape()};
 
-    auto input_buffer = input_tensor.buffer();
-    auto index_buffer = index_tensor.buffer();
-    auto src_buffer = src_tensor.buffer();
-    auto output_buffer = output_tensor.buffer();
-
-    const uint32_t input_tensor_is_dram = input_buffer->buffer_type() == BufferType::DRAM;
-    const uint32_t index_tensor_is_dram = index_buffer->buffer_type() == BufferType::DRAM;
-    const uint32_t src_tensor_is_dram = src_buffer->buffer_type() == BufferType::DRAM;
-    const uint32_t output_tensor_is_dram = output_buffer->buffer_type() == BufferType::DRAM;
-
-    auto device = input_tensor.device();
-    const auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
-
-    const uint32_t& input_stick_size = input_shape[-1];
-    const uint32_t& index_stick_size = index_shape[-1];
-    const uint32_t& source_stick_size = src_shape[-1];
-    const uint32_t& output_stick_size = output_shape[-1];
-
-    const uint32_t work_units = input_tensor.logical_volume() / input_stick_size;
-    const auto
-        [num_cores, all_cores, core_group_1, core_group_2, num_sticks_per_core_group_1, num_sticks_per_core_group_2] =
-            tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, work_units);
+    const uint32_t input_stick_size = input_shape[-1];
+    const uint32_t index_stick_size = index_shape[-1];
+    const uint32_t source_stick_size = src_shape[-1];
+    const uint32_t output_stick_size = output_shape[-1];
 
     // input dtype byte sizes
-    const uint32_t& input_datum_size = input_tensor.element_size();
-    const uint32_t& index_datum_size = index_tensor.element_size();
-    const uint32_t& source_datum_size = src_tensor.element_size();
-    const uint32_t& output_datum_size = output_tensor.element_size();
+    const uint32_t input_datum_size = input_tensor.element_size();
+    const uint32_t index_datum_size = index_tensor.element_size();
+    const uint32_t source_datum_size = src_tensor.element_size();
+    const uint32_t output_datum_size = output_tensor.element_size();
 
-    // input row byte sizes
-    const uint32_t& input_stick_size_bytes = input_stick_size * input_datum_size;
-    const uint32_t& index_stick_size_bytes = index_stick_size * index_datum_size;
-    const uint32_t& source_stick_size_bytes = source_stick_size * source_datum_size;
-    const uint32_t& output_stick_size_bytes = output_stick_size * output_datum_size;
+    // output row byte size (the writer walks each output stick in chunks of this many bytes)
+    const uint32_t output_stick_size_bytes = output_stick_size * output_datum_size;
 
     // maximal input/index/source/output chunk size, divisible by 32, calculated as follows:
     // BH available L1 mem size of nearly 1.5 MB...
+    // ... minimized by the amount of memory reserved by a model...
     // ... divided by 4 to be able to allocate four equally long row chunks (coming from input/index/source/output
     // tensors)
     // ... divided by 4 to account for 4-byte datum sizes of each tensor (fp32, int32)
-    // ... minimized by ~20% to account for reserved memory
-    const uint32_t input_and_output_max_chunk_size = calculate_optimal_chunk_size(input_tensor.device());
-    const uint32_t index_and_source_max_chunk_size = input_and_output_max_chunk_size;
+    // ... minimized by ~10% to account for reserved memory
+    const uint32_t input_and_output_max_chunk_size = calculate_optimal_chunk_size(input_tensor);
+    const uint32_t index_and_source_max_chunk_size = calculate_optimal_chunk_size(index_tensor);
     const uint32_t input_and_output_chunk_size = std::min(input_stick_size, input_and_output_max_chunk_size);
-    const uint32_t index_and_source_chunk_size = std::min(index_stick_size, index_and_source_max_chunk_size);
+    const uint32_t index_chunk_size = std::min(index_stick_size, index_and_source_max_chunk_size);
+    const uint32_t source_chunk_size = std::min(source_stick_size, index_and_source_max_chunk_size);
     const uint32_t input_and_output_chunk_size_bytes = input_and_output_chunk_size * input_datum_size;
-    const uint32_t index_chunk_size_bytes = index_and_source_chunk_size * index_datum_size;
-    const uint32_t source_chunk_size_bytes = index_and_source_chunk_size * source_datum_size;
+    const uint32_t index_chunk_size_bytes = index_chunk_size * index_datum_size;
+    const uint32_t source_chunk_size_bytes = source_chunk_size * source_datum_size;
 
     // pad pages to 32
     const uint32_t input_page_size_bytes = ceil32(input_and_output_chunk_size_bytes);
@@ -102,133 +64,215 @@ ScatterProgramFactory::cached_program_t ScatterProgramFactory::create(
     const uint32_t source_page_size_bytes = ceil32(source_chunk_size_bytes);
     const uint32_t output_page_size_bytes = ceil32(input_and_output_chunk_size_bytes);
 
-    create_cb(program, input_tensor.dtype(), ScatterCB::INPUT, all_cores, input_page_size_bytes);
-    create_cb(program, index_tensor.dtype(), ScatterCB::INDEX, all_cores, index_page_size_bytes);
-    create_cb(program, src_tensor.dtype(), ScatterCB::SRC, all_cores, source_page_size_bytes);
-    create_cb(program, output_tensor.dtype(), ScatterCB::DST, all_cores, output_page_size_bytes);
-
     constexpr const char* reader_kernel_path =
         "ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/reader_scatter.cpp";
     constexpr const char* writer_kernel_path =
         "ttnn/cpp/ttnn/operations/data_movement/scatter/device/kernels/dataflow/writer_scatter.cpp";
 
-    std::vector<uint32_t> compile_time_args{
-        input_tensor.buffer()->address(),
-        index_tensor.buffer()->address(),
-        src_tensor.buffer()->address(),
-        output_tensor.buffer()->address(),
-        static_cast<uint32_t>(ScatterCB::INPUT),
-        static_cast<uint32_t>(ScatterCB::INDEX),
-        static_cast<uint32_t>(ScatterCB::SRC),
-        static_cast<uint32_t>(ScatterCB::DST),
-        input_stick_size,
-        index_stick_size,
-        source_stick_size,
-        output_stick_size,
-        input_stick_size_bytes,
-        index_stick_size_bytes,
-        source_stick_size_bytes,
-        output_stick_size_bytes};
-    tt::tt_metal::TensorAccessorArgs(*input_buffer).append_to(compile_time_args);
-    tt::tt_metal::TensorAccessorArgs(*index_buffer).append_to(compile_time_args);
-    tt::tt_metal::TensorAccessorArgs(*src_buffer).append_to(compile_time_args);
-    tt::tt_metal::TensorAccessorArgs(*output_buffer).append_to(compile_time_args);
+    auto* device = input_tensor.device();
+    const auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
+    const uint32_t work_units = input_tensor.logical_volume() / input_stick_size;
+    const auto
+        [num_cores, all_cores, core_group_1, core_group_2, num_sticks_per_core_group_1, num_sticks_per_core_group_2] =
+            args.sub_core_grid.has_value()
+                ? tt::tt_metal::split_work_to_cores(*args.sub_core_grid, work_units)
+                : tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, work_units);
 
-    auto reader_kernel =
-        create_kernel(program, reader_kernel_path, all_cores, ReaderDataMovementConfig{compile_time_args});
-    auto writer_kernel =
-        create_kernel(program, writer_kernel_path, all_cores, WriterDataMovementConfig{compile_time_args});
+    const auto farthest_x_y =
+        args.sub_core_grid.has_value() ? args.sub_core_grid->bounding_box().end_coord : compute_with_storage_grid_size;
+    const uint32_t all_cores_in_bounding_box = (farthest_x_y.x + 1) * (farthest_x_y.y + 1);
 
-    const uint32_t& num_cores_x = compute_with_storage_grid_size.x;
-    const uint32_t& num_cores_y = compute_with_storage_grid_size.y;
-    auto cores = grid_to_cores(num_cores, num_cores_x, num_cores_y);
+    // Metal 2.0 resource names. Declared local (not at namespace scope) so the sibling factory in
+    // the same unity-build translation unit can reuse the same identifiers without collision.
+    const DFBSpecName INPUT_DFB{"input"};
+    const DFBSpecName INDEX_DFB{"index"};
+    const DFBSpecName SRC_DFB{"source"};
+    const DFBSpecName DST_DFB{"output"};
+    const TensorParamName INPUT_TENSOR{"input"};
+    const TensorParamName INDEX_TENSOR{"index"};
+    const TensorParamName SRC_TENSOR{"source"};
+    const TensorParamName OUTPUT_TENSOR{"output"};
+    const KernelSpecName READER{"reader"};
+    const KernelSpecName WRITER{"writer"};
+
+    // Each scatter DFB holds exactly one chunk page (num_entries = 1; entry_size is the 32-aligned
+    // chunk byte size). The data format is set even though these are data-movement-only DFBs,
+    // because the kernels select their C++ element type at compile time via get_dataformat(dfb::name).
+    auto make_dfb = [](const DFBSpecName& name, DataType dtype, uint32_t page_size_bytes) {
+        return DataflowBufferSpec{
+            .unique_id = name,
+            .entry_size = page_size_bytes,
+            .num_entries = 1,
+            .data_format_metadata = datatype_to_dataformat_converter(dtype),
+        };
+    };
+
+    Group<DataflowBufferSpec> dataflow_buffers{
+        make_dfb(INPUT_DFB, input_tensor.dtype(), input_page_size_bytes),
+        make_dfb(INDEX_DFB, index_tensor.dtype(), index_page_size_bytes),
+        make_dfb(SRC_DFB, src_tensor.dtype(), source_page_size_bytes),
+        make_dfb(DST_DFB, output_tensor.dtype(), output_page_size_bytes),
+    };
+
+    // The reader alone fills and drains INPUT/INDEX/SRC (self-loop: bound PRODUCER + CONSUMER); it
+    // produces DST, which the writer consumes.
+    KernelSpec reader{
+        .unique_id = READER,
+        .source = reader_kernel_path,
+        .dfb_bindings =
+            {
+                DFBBinding{
+                    .dfb_spec_name = INPUT_DFB, .accessor_name = "input", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{
+                    .dfb_spec_name = INPUT_DFB, .accessor_name = "input", .endpoint_type = DFBEndpointType::CONSUMER},
+                DFBBinding{
+                    .dfb_spec_name = INDEX_DFB, .accessor_name = "index", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{
+                    .dfb_spec_name = INDEX_DFB, .accessor_name = "index", .endpoint_type = DFBEndpointType::CONSUMER},
+                DFBBinding{
+                    .dfb_spec_name = SRC_DFB, .accessor_name = "source", .endpoint_type = DFBEndpointType::PRODUCER},
+                DFBBinding{
+                    .dfb_spec_name = SRC_DFB, .accessor_name = "source", .endpoint_type = DFBEndpointType::CONSUMER},
+                DFBBinding{
+                    .dfb_spec_name = DST_DFB, .accessor_name = "output", .endpoint_type = DFBEndpointType::PRODUCER},
+            },
+        .tensor_bindings =
+            {
+                TensorBinding{.tensor_parameter_name = INPUT_TENSOR, .accessor_name = "input"},
+                TensorBinding{.tensor_parameter_name = INDEX_TENSOR, .accessor_name = "index"},
+                TensorBinding{.tensor_parameter_name = SRC_TENSOR, .accessor_name = "source"},
+            },
+        .compile_time_args =
+            {
+                {"input_stick_size", input_stick_size},
+                {"index_stick_size", index_stick_size},
+                {"source_stick_size", source_stick_size},
+                {"input_rank", static_cast<uint32_t>(input_shape.rank())},
+            },
+        .runtime_arg_schema =
+            {
+                .runtime_arg_names =
+                    {"start_stick_id",
+                     "sticks_for_core",
+                     "input_and_output_chunk_size",
+                     "index_chunk_size",
+                     "source_chunk_size",
+                     "scatter_reduction_type"},
+            },
+        .hw_config = ttnn::create_reader_datamovement_config(device->arch()),
+        // Per-dimension shape extents (input dims then index dims). N = rank-1 per tensor; the
+        // count varies with rank across instantiations, so these are delivered as runtime varargs.
+        .advanced_options =
+            {.num_runtime_varargs = static_cast<uint32_t>((input_shape.rank() - 1) + (index_shape.rank() - 1))},
+    };
+
+    KernelSpec writer{
+        .unique_id = WRITER,
+        .source = writer_kernel_path,
+        .dfb_bindings =
+            {
+                DFBBinding{
+                    .dfb_spec_name = DST_DFB, .accessor_name = "output", .endpoint_type = DFBEndpointType::CONSUMER},
+            },
+        .tensor_bindings =
+            {
+                TensorBinding{.tensor_parameter_name = OUTPUT_TENSOR, .accessor_name = "output"},
+            },
+        .compile_time_args =
+            {
+                {"output_stick_size_bytes", output_stick_size_bytes},
+            },
+        .runtime_arg_schema =
+            {
+                .runtime_arg_names = {"start_stick_id", "sticks_for_core", "input_and_output_chunk_size"},
+            },
+        .hw_config = ttnn::create_writer_datamovement_config(device->arch()),
+    };
+
+    // Per-dimension shape extents are the same on every node; build once and bind per node.
+    std::vector<uint32_t> shape_varargs;
+    shape_varargs.reserve((input_shape.rank() - 1) + (index_shape.rank() - 1));
+    for (const auto* it = input_shape.cbegin(); it != input_shape.cend() - 1; ++it) {
+        shape_varargs.push_back(static_cast<uint32_t>(*it));
+    }
+    for (const auto* it = index_shape.cbegin(); it != index_shape.cend() - 1; ++it) {
+        shape_varargs.push_back(static_cast<uint32_t>(*it));
+    }
+
+    KernelRunArgs::RuntimeArgValues reader_node_args;
+    KernelRunArgs::RuntimeArgValues writer_node_args;
+    AdvancedKernelRunArgs reader_run_advanced;
+
     uint32_t stick_offset = 0;
-    for (uint32_t i = 0; i < num_cores; ++i) {
-        CoreCoord core{i / num_cores_y, i % num_cores_y};
-
+    for (uint32_t i = 0; i < all_cores_in_bounding_box; ++i) {
+        const CoreCoord core{i / (farthest_x_y.y + 1), i % (farthest_x_y.y + 1)};
         uint32_t sticks_per_core;
         if (core_group_1.contains(core)) {
             sticks_per_core = num_sticks_per_core_group_1;
         } else if (core_group_2.contains(core)) {
             sticks_per_core = num_sticks_per_core_group_2;
         } else {
-            TT_THROW("Core not in any predefined core range.");
+            continue;
         }
 
-        SetRuntimeArgs(
-            program,
-            reader_kernel,
+        AddRuntimeArgsForNode(
+            reader_node_args,
             core,
-            {input_buffer->address(),
-             index_buffer->address(),
-             src_buffer->address(),
-             stick_offset,
-             sticks_per_core,
-             input_and_output_chunk_size,
-             index_and_source_chunk_size});
+            {{"start_stick_id", stick_offset},
+             {"sticks_for_core", sticks_per_core},
+             {"input_and_output_chunk_size", input_and_output_chunk_size},
+             {"index_chunk_size", index_chunk_size},
+             {"source_chunk_size", source_chunk_size},
+             {"scatter_reduction_type", static_cast<uint32_t>(args.opt_reduction)}});
+        reader_run_advanced.runtime_varargs.emplace(core, shape_varargs);
 
-        SetRuntimeArgs(
-            program,
-            writer_kernel,
+        AddRuntimeArgsForNode(
+            writer_node_args,
             core,
-            {output_buffer->address(), stick_offset, sticks_per_core, input_and_output_chunk_size});
+            {{"start_stick_id", stick_offset},
+             {"sticks_for_core", sticks_per_core},
+             {"input_and_output_chunk_size", input_and_output_chunk_size}});
 
         stick_offset += sticks_per_core;
     }
 
-    return {std::move(program), {reader_kernel, writer_kernel, cores}};
+    ProgramSpec spec;
+    spec.name = "scatter";
+    spec.kernels = {reader, writer};
+    spec.dataflow_buffers = std::move(dataflow_buffers);
+    spec.tensor_parameters = {
+        TensorParameter{.unique_id = INPUT_TENSOR, .spec = input_tensor.tensor_spec()},
+        TensorParameter{.unique_id = INDEX_TENSOR, .spec = index_tensor.tensor_spec()},
+        TensorParameter{.unique_id = SRC_TENSOR, .spec = src_tensor.tensor_spec()},
+        TensorParameter{.unique_id = OUTPUT_TENSOR, .spec = output_tensor.tensor_spec()},
+    };
+    spec.work_units = {WorkUnitSpec{
+        .name = "scatter",
+        .kernels = {READER, WRITER},
+        .target_nodes = all_cores,
+    }};
+
+    ProgramRunArgs run_args;
+    run_args.kernel_run_args = {
+        KernelRunArgs{
+            .kernel = READER,
+            .runtime_arg_values = std::move(reader_node_args),
+            .advanced_options = std::move(reader_run_advanced),
+        },
+        KernelRunArgs{
+            .kernel = WRITER,
+            .runtime_arg_values = std::move(writer_node_args),
+        },
+    };
+    run_args.tensor_args.emplace(INPUT_TENSOR, input_tensor.mesh_tensor());
+    run_args.tensor_args.emplace(INDEX_TENSOR, index_tensor.mesh_tensor());
+    run_args.tensor_args.emplace(SRC_TENSOR, src_tensor.mesh_tensor());
+    run_args.tensor_args.emplace(OUTPUT_TENSOR, output_tensor.mesh_tensor());
+
+    return ttnn::device_operation::ProgramArtifacts{
+        .spec = std::move(spec),
+        .run_params = std::move(run_args),
+    };
 }
 
-void ScatterProgramFactory::override_runtime_arguments(
-    cached_program_t& cached_program,
-    const operation_attributes_t& args,
-    const tensor_args_t& tensor_args,
-    tensor_return_value_t& output_tensor) {
-    const auto& program = cached_program.program;
-    const auto& reader_kernel_id = cached_program.shared_variables.reader_kernel_id;
-    const auto& writer_kernel_id = cached_program.shared_variables.writer_kernel_id;
-    const auto& cores = cached_program.shared_variables.cores;
-
-    auto input_buffer_address = tensor_args.input_tensor.buffer()->address();
-    auto index_buffer_address = tensor_args.index_tensor.buffer()->address();
-    auto source_buffer_address = tensor_args.src_tensor.buffer()->address();
-    auto output_buffer_address = output_tensor.buffer()->address();
-    for (const auto& core : cores) {
-        auto& reader_runtime_args = GetRuntimeArgs(program, reader_kernel_id, core);
-        auto& writer_runtime_args = GetRuntimeArgs(program, writer_kernel_id, core);
-        reader_runtime_args[0] = input_buffer_address;
-        reader_runtime_args[1] = index_buffer_address;
-        reader_runtime_args[2] = source_buffer_address;
-        writer_runtime_args[0] = output_buffer_address;
-    }
-}
-
-CBHandle ScatterProgramFactory::create_cb(
-    Program& program,
-    const DataType& dtype,
-    const ScatterCB& scatter_cb,
-    const CoreRangeSet& core_range_set,
-    const uint32_t& page_size_bytes) {
-    const uint32_t cb_id{static_cast<uint32_t>(scatter_cb)};
-    const auto cb_data_format{datatype_to_dataformat_converter(dtype)};
-    const auto cb_config{
-        CircularBufferConfig{page_size_bytes, {{cb_id, cb_data_format}}}.set_page_size(cb_id, page_size_bytes)};
-    return CreateCircularBuffer(program, core_range_set, cb_config);
-}
-
-KernelHandle ScatterProgramFactory::create_kernel(
-    Program& program,
-    const char* kernel_path,
-    const CoreRangeSet& core_range_set,
-    const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config,
-    const std::vector<uint32_t>& runtime_args) {
-    auto kernel_id{CreateKernel(program, kernel_path, core_range_set, config)};
-
-    if (!runtime_args.empty()) {
-        SetRuntimeArgs(program, kernel_id, core_range_set, runtime_args);
-    }
-
-    return kernel_id;
-}
-
-}  // namespace ttnn::operations::data_movement::scatter
+}  // namespace ttnn::prim

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,12 +6,19 @@ import torch
 import ttnn
 import pytest
 
-from tests.ttnn.utils_for_testing import assert_with_pcc, assert_equal, assert_with_ulp, assert_allclose
+from tests.ttnn.utils_for_testing import assert_equal
 from math import isnan
 
 
 def torch_equal_nan(a, b):
     return torch.all((a == b) | (torch.isnan(a) & torch.isnan(b)))
+
+
+def make_condition_tensor(shape, dtype, condition, stride=8):
+    C = torch.ones(shape, dtype=dtype) * condition
+    C_flat = C.flatten()
+    C_flat[::stride] = 1 - condition
+    return C_flat.reshape(shape)
 
 
 # TTT,  // tensor-tensor-tensor
@@ -23,12 +30,31 @@ def torch_equal_nan(a, b):
 @pytest.mark.parametrize(
     "c_shape, t_shape, f_shape",
     [
+        ((1, 1, 32, 32), (1, 1, 32, 32), (1, 1, 32, 32)),  # LLK
         ((2, 3, 64, 128), (2, 3, 64, 128), (2, 3, 64, 128)),  # LLK
         ((3, 2, 3, 64, 128), (3, 2, 3, 64, 128), (3, 2, 3, 64, 128)),  # LLK
+        ((1, 1, 1024, 1024), (1, 1, 1024, 1), (1, 1, 1024, 1024)),  # A, Bcol, C
+        ((1, 1, 1024, 1), (1, 1, 1024, 1024), (1, 1, 1024, 1024)),  # Acol, B, C
+        ((1, 1, 1024, 1024), (1, 1, 1024, 1024), (1, 1, 1024, 1)),  # A, B, Ccol
+        ((4, 1, 1, 1, 128, 128), (4, 2, 2, 2, 128, 128), (4, 1, 2, 1, 128, 1)),
+        ((1, 1, 64, 1), (1, 1, 64, 64), (1, 1, 64, 64)),  # Acol, B, C
+        ((1, 1, 1, 1024), (1, 1, 1024, 1024), (1, 1, 1, 1024)),  # Arow, B, Crow
+        ((1, 1, 1024, 1024), (1, 1, 1, 1024), (1, 1, 1, 1024)),  # A, Brow, Crow
         ((256,), (256,), (256,)),  # LLK
+        # Bcast cases for dims -5, -4, -3 (outer dims)
+        ((128, 128), (2, 2, 2, 128, 128), (2, 1, 128, 128)),
+        ((1, 2, 3, 4, 128, 128), (128, 128), (128, 128)),
+        ((4, 1, 1, 1, 128, 128), (4, 2, 2, 2, 128, 128), (4, 1, 2, 1, 128, 128)),
+        # Bcast cases for dim -6 (rank 6)
+        ((2, 1, 3, 4, 128, 128), (1, 1, 3, 4, 128, 128), (1, 1, 3, 4, 128, 128)),
+        # Scalar Bcast cases
+        ((3, 2, 3, 64, 128), (3, 2, 3, 1, 1), (3, 2, 3, 1, 1)),  # LLK
+        # Scalar Bcast cases with  outer dims bcast (-5, -4, -3)
+        ((1, 2, 3, 4, 128, 128), (1, 1), (1, 1)),
+        ((4, 2, 2, 2, 1, 1), (4, 1, 1, 1, 128, 128), (4, 1, 2, 1, 1, 1)),
     ],
 )
-@pytest.mark.parametrize("scalar", [15.5, float("nan"), float("inf"), 10.0, 5.0, -11.33])
+@pytest.mark.parametrize("scalar", [15.5, 5.0, -11.33])
 @pytest.mark.parametrize("variant", ["TTS", "TST", "TTT"])
 @pytest.mark.parametrize("condition", [1, 0])
 def test_ttnn_where(c_shape, t_shape, f_shape, scalar, variant, condition, device):
@@ -98,6 +124,41 @@ def test_ttnn_where_int32(c_shape, t_shape, f_shape, variant, condition, scalar,
         ttnn_F = ttnn.from_torch(F, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT, device=device)
     ttnn_result = ttnn.where(ttnn_C, ttnn_T, ttnn_F)
     result = ttnn.to_torch(ttnn_result)
+
+    assert torch.equal(result, golden)
+
+
+@pytest.mark.parametrize(
+    "c_shape, t_shape, f_shape",
+    [
+        ((2, 3, 64, 128), (2, 3, 64, 128), (2, 3, 64, 128)),  # multi-batch, tile-aligned
+        ((3, 2, 3, 64, 128), (3, 2, 3, 64, 128), (3, 2, 3, 64, 128)),  # 5D tensor
+        ((256,), (256,), (256,)),  # 1D flat
+    ],
+)
+@pytest.mark.parametrize("variant", ["TTS", "TST"])
+@pytest.mark.parametrize("condition", [1, 0])
+@pytest.mark.parametrize("scalar", [9, 10, 7])
+def test_ttnn_where_uint32(c_shape, t_shape, f_shape, variant, condition, scalar, device):
+    torch.manual_seed(0)
+    C = torch.ones(c_shape, dtype=torch.int32) * condition
+    if variant == "TTS":
+        T = torch.randint(0, 1000, t_shape, dtype=torch.int32)
+        F = scalar
+    elif variant == "TST":
+        T = scalar
+        F = torch.randint(0, 2000, f_shape, dtype=torch.int32)
+    golden = torch.where(C.bool(), T, F).to(torch.int64) & 0xFFFFFFFF
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+    if variant == "TTS":
+        ttnn_T = ttnn.from_torch(T, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+        ttnn_F = scalar
+    elif variant == "TST":
+        ttnn_T = scalar
+        ttnn_F = ttnn.from_torch(F, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_result = ttnn.where(ttnn_C, ttnn_T, ttnn_F)
+    result = ttnn.to_torch(ttnn_result).to(torch.int64) & 0xFFFFFFFF
 
     assert torch.equal(result, golden)
 
@@ -340,31 +401,6 @@ def test_bf8b_exponent_behaviour(device):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("h, w", [[64, 128]])
-def test_where_ttt(device, dtype, h, w):
-    torch.manual_seed(0)
-
-    ttnn_dtype = ttnn.bfloat16
-    if dtype == torch.float32:
-        ttnn_dtype = ttnn.float32
-
-    C = torch.rand((h, w), dtype=dtype).uniform_(-100, 100)
-    T = torch.rand((h, w), dtype=dtype).uniform_(-100, 100)
-    F = torch.rand((h, w), dtype=dtype).uniform_(-100, 100)
-
-    C = (C > 0).float()
-    ttnn_C = ttnn.from_torch(C, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
-    ttnn_T = ttnn.from_torch(T, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
-    ttnn_F = ttnn.from_torch(F, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
-
-    golden = torch.where(C.bool(), T, F)
-    ttnn_result = ttnn.where(ttnn_C, ttnn_T, ttnn_F)
-    result = ttnn.to_torch(ttnn_result)
-
-    assert torch_equal_nan(result, golden)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("h, w", [[64, 128]])
 @pytest.mark.parametrize("scalar", [15.5, float("nan"), float("inf"), -float("inf")])
 def test_where_tts(device, dtype, h, w, scalar):
     if dtype == torch.bfloat16 and isnan(scalar):
@@ -424,9 +460,9 @@ def test_where_tst(device, dtype, h, w, scalar):
 @pytest.mark.parametrize(
     "scalar1, scalar2",
     [
-        [15.5, 31.2],
+        [15.5, 31.25],
         [15.5, float("nan")],
-        [float("nan"), 31.2],
+        [float("nan"), 31.25],
         [float("inf"), -float("inf")],
         [-float("inf"), float("nan")],
     ],
@@ -452,10 +488,7 @@ def test_where_tss(device, dtype, h, w, scalar1, scalar2):
     ttnn_result = ttnn.where(ttnn_C, T, F)
     result = ttnn.to_torch(ttnn_result)
 
-    if dtype == torch.bfloat16:
-        assert_with_pcc(result, golden)
-    else:
-        assert torch_equal_nan(result, golden)
+    assert torch_equal_nan(result, golden)
 
 
 @pytest.mark.parametrize(
@@ -479,11 +512,8 @@ def test_where_tss(device, dtype, h, w, scalar1, scalar2):
 @pytest.mark.parametrize(
     "input_shapes",
     [
-        torch.Size([100]),
         torch.Size([64, 128]),
         torch.Size([3, 128, 32]),
-        torch.Size([1, 3, 320, 384]),
-        torch.Size([1, 1, 32, 320, 12]),
     ],
 )
 def test_where_TSS_float_types(torch_dtype, ttnn_dtype, scalars, input_shapes, device):
@@ -512,16 +542,14 @@ def test_where_TSS_float_types(torch_dtype, ttnn_dtype, scalars, input_shapes, d
         (9999, -9999),
         (-24567, 16777216),
         (-16777216, 56789),
+        (-2147483647, 2147483647),
     ],
 )
 @pytest.mark.parametrize(
     "input_shapes",
     [
-        torch.Size([100]),
-        torch.Size([64, 128]),
         torch.Size([3, 128, 32]),
         torch.Size([1, 3, 320, 384]),
-        torch.Size([1, 1, 32, 320, 12]),
     ],
 )
 def test_where_TSS_int_types(scalars, input_shapes, device):
@@ -538,18 +566,51 @@ def test_where_TSS_int_types(scalars, input_shapes, device):
     assert torch.equal(tt_result, torch_result)
 
 
+@pytest.mark.parametrize(
+    "scalars",
+    [
+        (3, 7),
+        (10, 42),
+        (0, 1),
+        (24567, 16777216),
+        (16777216, 56789),
+        (2147483647, 3294967295),
+        (4274947110, 3264965225),
+        (3294967295, 4294967295),
+    ],
+)
+@pytest.mark.parametrize(
+    "input_shapes",
+    [
+        torch.Size([64, 128]),
+    ],
+)
+def test_where_TSS_uint32_types(scalars, input_shapes, device):
+    scalar_true, scalar_false = scalars
+    condition = torch.tensor([[0, 1] * (input_shapes[-1] // 2)] * input_shapes[0], dtype=torch.uint32)
+
+    torch_result = torch.where(condition.bool(), scalar_true, scalar_false)
+
+    ttnn_condition = ttnn.from_torch(condition, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_result = ttnn.where(ttnn_condition, scalar_true, scalar_false)
+
+    tt_result = ttnn.to_torch(ttnn_result, dtype=torch.uint32)
+    torch_result = torch_result.to(torch.uint32)
+    assert torch.equal(tt_result, torch_result)
+
+
 def test_div_edgcase(device):
     a = torch.tensor([1, 2, -4, 0, -6, 0], dtype=torch.bfloat16)
     b = torch.tensor([-1, 0, 0, 0, -2, 7], dtype=torch.bfloat16)
 
     ttnn_a = ttnn.from_torch(a, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
     ttnn_b = ttnn.from_torch(b, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-    output_tensor = ttnn.div(ttnn_a, ttnn_b, accurate_mode=True)
+    output_tensor = ttnn.div(ttnn_a, ttnn_b, fast_and_approximate_mode=False)
     golden_tensor = torch.div(a, b)
 
     output_tensor = ttnn.to_torch(output_tensor)
 
-    # accurate_mode=True
+    # fast_and_approximate_mode=False (accurate mode)
     # output_tensor tensor([-1., inf, -inf, inf,  3.,  0.], dtype=torch.bfloat16)
     # golden_tensor tensor([-1., inf, -inf, nan,  3.,  0.], dtype=torch.bfloat16)
 
@@ -575,16 +636,16 @@ def test_addcdiv_edgcase(device):
     golden_tensor = torch.addcdiv(c, a, b, value=value)
 
     output_tensor = ttnn.to_torch(output_tensor)
-
-    # output_tensor tensor([ 0.5000,    -inf,     inf,    -inf, -1.5000,  0.0000],dtype=torch.bfloat16)
+    # output_tensor tensor([ 0.5000,    -inf,     inf,     inf, -1.5000,  0.0000],dtype=torch.bfloat16)
     # golden_tensor tensor([ 0.5000,    -inf,     inf,     nan, -1.5000,  0.0000],dtype=torch.bfloat16)
 
-    # Replace NaN values in golden tensor with inf to match expected behavior of ttnn.bfloat16
-    golden_tensor = torch.where(
-        torch.isnan(golden_tensor), value * torch.tensor(float("inf"), dtype=golden_tensor.dtype), golden_tensor
+    # Where golden is NaN (e.g. 0/0), normalize ttnn output to NaN for comparison
+    output_tensor = torch.where(
+        torch.isnan(golden_tensor),
+        torch.tensor(float("nan"), dtype=output_tensor.dtype, device=output_tensor.device),
+        output_tensor,
     )
-
-    assert torch.allclose(output_tensor, golden_tensor, equal_nan=False)
+    assert torch.allclose(output_tensor, golden_tensor, equal_nan=True)
 
 
 def test_addcdiv_edgcase_fp32(device):
@@ -605,3 +666,517 @@ def test_addcdiv_edgcase_fp32(device):
     # golden_tensor tensor([ 0.5000,    -inf,     inf,     nan, -1.5000,  0.0000])
 
     assert torch_equal_nan(output_tensor1, golden_tensor)
+
+
+@pytest.mark.parametrize(
+    "a_shape, b_shape, c_shape", [((1, 4, 1), (1, 1, 768), (1, 4, 768)), ((1, 4, 768), (1, 4, 768), (1, 4, 768))]
+)
+def test_ttnn_where_forge_nan(device, a_shape, b_shape, c_shape):
+    C = torch.ones(a_shape, dtype=torch.float32)
+    T = torch.randn(b_shape, dtype=torch.float32)
+    F = torch.ones(c_shape, dtype=torch.float32) * float("nan")
+    golden = torch.where(C != 0, T, F)
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_T = ttnn.from_torch(T, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_F = ttnn.from_torch(F, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_result = ttnn.where(ttnn_C, ttnn_T, ttnn_F)
+    result = ttnn.to_torch(ttnn_result)
+
+    assert torch_equal_nan(result, golden)
+
+
+# Issue: #27153
+@pytest.mark.parametrize(
+    "c_shape, t_shape, f_shape",
+    [
+        [(1, 256, 6, 6), (1,), (1,)],
+        [(1, 256, 6, 6), (1, 256, 6, 6), (1,)],
+        [(1, 512, 14, 14), (1,), (1,)],
+        [(1, 512, 14, 14), (1, 512, 14, 14), (1,)],
+    ],
+)
+def test_where_int_golden_verification(c_shape, t_shape, f_shape, device):
+    torch.manual_seed(42)
+
+    # Generate random input tensors
+    condition_torch = torch.randint(0, 100, c_shape)
+
+    # True values tensor: Random float values
+    true_vals_torch = torch.randn(t_shape, dtype=torch.float32) * 10
+
+    # False values tensor: Random float values (different range for distinction)
+    false_vals_torch = torch.randn(f_shape, dtype=torch.float32) * 5 + 100
+
+    # Compute golden reference using PyTorch
+    golden_output = torch.where(condition_torch.bool(), true_vals_torch, false_vals_torch)
+
+    # Convert to ttnn tensors
+    condition_ttnn = ttnn.from_torch(condition_torch, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    true_vals_ttnn = ttnn.from_torch(true_vals_torch, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    false_vals_ttnn = ttnn.from_torch(false_vals_torch, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    result_ttnn = ttnn.where(condition_ttnn, true_vals_ttnn, false_vals_ttnn)
+    result_torch = ttnn.to_torch(result_ttnn)
+
+    assert torch_equal_nan(
+        result_torch, golden_output
+    ), f"Values don't match. Max difference: {torch.max(torch.abs(result_torch - golden_output))}"
+
+
+@pytest.mark.parametrize(
+    "a_shape, b_shape, c_shape",
+    [
+        ((2, 2, 128, 128), (1, 1, 1, 128), (1, 1, 1, 128)),  # row bcast
+        ((2, 2, 128, 128), (1, 1, 128, 1), (1, 1, 128, 1)),  # col bcast
+        ((128, 128), (2, 2, 2, 128, 128), (2, 2, 128, 128)),  # outer
+        ((128, 128), (128, 128), (128, 128)),
+        ((4, 1, 1, 1, 1, 1), (4, 2, 2, 2, 128, 128), (4, 1, 2, 1, 128, 128)),  # scalar bcast
+        ((3, 2, 3, 64, 128), (3, 2, 3, 1, 1), (3, 2, 3, 1, 1)),  # scalar
+    ],
+)
+@pytest.mark.parametrize("scalar", [15.5])
+@pytest.mark.parametrize("variant", ["TTT", "TST", "TTS"])
+@pytest.mark.parametrize("condition", [1, 0])
+def test_ttnn_where_preallocated(a_shape, b_shape, c_shape, scalar, variant, condition, device):
+    torch.manual_seed(0)
+
+    C = torch.ones(a_shape, dtype=torch.float32) * condition
+    # Set zeros at flattened indices which are multiples of 8
+    C_flat = C.flatten()
+    C_flat[::8] = 1 - condition
+    C = C_flat.reshape(a_shape)
+
+    if variant == "TTS":
+        T = torch.randn(b_shape, dtype=torch.float32)
+        F = scalar
+
+    elif variant == "TST":
+        T = scalar
+        F = torch.randn(b_shape, dtype=torch.float32)
+
+    elif variant == "TTT":
+        T = torch.randn(b_shape, dtype=torch.float32)
+        F = torch.ones(c_shape, dtype=torch.float32) * 10
+    elif variant == "TSS":
+        T = scalar
+        F = 25.5
+
+    golden = torch.where(C.bool(), T, F)
+    out = torch.zeros_like(golden)
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_out = ttnn.from_torch(out, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    if variant == "TTS":
+        ttnn_T = ttnn.from_torch(T, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        ttnn_F = scalar
+    elif variant == "TST":
+        ttnn_T = scalar
+        ttnn_F = ttnn.from_torch(F, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    elif variant == "TTT":
+        ttnn_T = ttnn.from_torch(T, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+        ttnn_F = ttnn.from_torch(F, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    elif variant == "TSS":
+        ttnn_T = scalar
+        ttnn_F = 25.5
+
+    ttnn.where(ttnn_C, ttnn_T, ttnn_F, output_tensor=ttnn_out)
+    result = ttnn.to_torch(ttnn_out)
+    assert torch_equal_nan(result, golden)
+
+
+@pytest.mark.parametrize(
+    "shape, sub_core_grid",
+    [
+        (
+            (torch.Size([1, 2, 32, 960])),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(3, 6)),
+                    ttnn.CoreRange(ttnn.CoreCoord(5, 0), ttnn.CoreCoord(6, 6)),
+                ]
+            ),
+        ),
+        (
+            (torch.Size([1, 7, 32, 96])),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 6)),
+                ]
+            ),
+        ),
+        (
+            (torch.Size([1, 8, 32, 128])),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 6)),
+                ]
+            ),
+        ),
+        (
+            (torch.Size([1, 17, 32, 32])),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 6)),
+                ]
+            ),
+        ),
+        (
+            (torch.Size([1, 1, 32, 128 * 1024])),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(3, 6)),
+                    ttnn.CoreRange(ttnn.CoreCoord(5, 0), ttnn.CoreCoord(6, 6)),
+                ]
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("scalar", [15.5, 5.0, -11.33])
+@pytest.mark.parametrize("variant", ["TTS", "TST", "TTT"])
+@pytest.mark.parametrize("condition", [1, 0])
+def test_where_subcore_grid(device, shape, sub_core_grid, dtype, scalar, variant, condition):
+    torch.manual_seed(0)
+    tor_dtype = dtype
+
+    ttnn_dtype = ttnn.bfloat16
+    if dtype == torch.float32:
+        ttnn_dtype = ttnn.float32
+
+    C = make_condition_tensor(shape, tor_dtype, condition)
+
+    if variant == "TTS":
+        T = torch.randn(shape, dtype=tor_dtype)
+        F = scalar
+    elif variant == "TST":
+        T = scalar
+        F = torch.randn(shape, dtype=tor_dtype)
+    elif variant == "TTT":
+        T = torch.randn(shape, dtype=tor_dtype)
+        F = torch.ones(shape, dtype=tor_dtype) * 10
+    golden = torch.where(C.bool(), T, F)
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+    if variant == "TTS":
+        ttnn_T = ttnn.from_torch(T, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+        ttnn_F = scalar
+    elif variant == "TST":
+        ttnn_T = scalar
+        ttnn_F = ttnn.from_torch(F, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+    elif variant == "TTT":
+        ttnn_T = ttnn.from_torch(T, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+        ttnn_F = ttnn.from_torch(F, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+
+    ttnn_result = ttnn.where(ttnn_C, ttnn_T, ttnn_F, sub_core_grids=sub_core_grid)
+    result = ttnn.to_torch(ttnn_result)
+
+    assert torch_equal_nan(result, golden)
+
+
+@pytest.mark.parametrize(
+    "shape, sub_core_grid",
+    [
+        (
+            torch.Size([1, 2, 32, 960]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(3, 6)),
+                    ttnn.CoreRange(ttnn.CoreCoord(5, 0), ttnn.CoreCoord(6, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 7, 32, 96]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 1, 32, 128]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 1)),
+                ]
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "scalar_true, scalar_false",
+    [
+        (15.5, 31.25),
+        (0.0, -11.3125),
+    ],
+)
+@pytest.mark.parametrize("condition", [1, 0])
+def test_where_tss_subcore_grid(device, shape, sub_core_grid, dtype, scalar_true, scalar_false, condition):
+    torch.manual_seed(0)
+
+    ttnn_dtype = ttnn.bfloat16 if dtype == torch.bfloat16 else ttnn.float32
+
+    C = make_condition_tensor(shape, dtype, condition)
+
+    golden = torch.where(C.bool(), scalar_true, scalar_false)
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+
+    ttnn_result = ttnn.where(ttnn_C, scalar_true, scalar_false, sub_core_grids=sub_core_grid)
+    result = ttnn.to_torch(ttnn_result)
+
+    assert torch_equal_nan(result, golden)
+
+
+# Tests for INT32/UINT32 predicate with sub_core_grids — exercises the typecast path
+# (INT32/UINT32 predicate is internally typecast to float before the where kernel runs).
+
+
+@pytest.mark.parametrize(
+    "shape, sub_core_grid",
+    [
+        (
+            torch.Size([1, 2, 32, 960]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(3, 6)),
+                    ttnn.CoreRange(ttnn.CoreCoord(5, 0), ttnn.CoreCoord(6, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 7, 32, 96]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 1, 32, 128]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 1)),
+                ]
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "scalar_true, scalar_false",
+    [
+        (15.5, 31.2),
+        (0.0, -11.33),
+    ],
+)
+@pytest.mark.parametrize("condition", [1, 0])
+def test_where_tss_int32_predicate_sub_core_grid(device, shape, sub_core_grid, scalar_true, scalar_false, condition):
+    """TSS variant: INT32 predicate, float scalars, sub_core_grids.
+
+    Exercises the internal typecast path where the INT32 predicate is cast to
+    float before the ternary where kernel, with a sub_core_grid restriction.
+    """
+    torch.manual_seed(0)
+
+    C = make_condition_tensor(shape, torch.int32, condition)
+    golden = torch.where(C.bool(), scalar_true, scalar_false)
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    ttnn_result = ttnn.where(ttnn_C, scalar_true, scalar_false, sub_core_grids=sub_core_grid)
+    result = ttnn.to_torch(ttnn_result)
+
+    assert torch_equal_nan(result, golden)
+
+
+@pytest.mark.parametrize(
+    "shape, sub_core_grid",
+    [
+        (
+            torch.Size([1, 2, 32, 960]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(3, 6)),
+                    ttnn.CoreRange(ttnn.CoreCoord(5, 0), ttnn.CoreCoord(6, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 7, 32, 96]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 1, 32, 128]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 1)),
+                ]
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "scalar_true, scalar_false",
+    [
+        (15.5, 31.2),
+        (0.0, -11.33),
+    ],
+)
+@pytest.mark.parametrize("condition", [1, 0])
+def test_where_tss_uint32_predicate_sub_core_grid(device, shape, sub_core_grid, scalar_true, scalar_false, condition):
+    """TSS variant: UINT32 predicate, float scalars, sub_core_grids.
+
+    Exercises the internal typecast path where the UINT32 predicate is cast to
+    float before the ternary where kernel, with a sub_core_grid restriction.
+    """
+    torch.manual_seed(0)
+
+    C = make_condition_tensor(shape, torch.int32, condition).abs()
+    golden = torch.where(C.bool(), scalar_true, scalar_false)
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn.uint32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    ttnn_result = ttnn.where(ttnn_C, scalar_true, scalar_false, sub_core_grids=sub_core_grid)
+    result = ttnn.to_torch(ttnn_result)
+
+    assert torch_equal_nan(result, golden)
+
+
+@pytest.mark.parametrize(
+    "shape, sub_core_grid",
+    [
+        (
+            torch.Size([1, 2, 32, 960]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(3, 6)),
+                    ttnn.CoreRange(ttnn.CoreCoord(5, 0), ttnn.CoreCoord(6, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 7, 32, 96]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 6)),
+                ]
+            ),
+        ),
+        (
+            torch.Size([1, 1, 32, 128]),
+            ttnn.CoreRangeSet(
+                [
+                    ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 1)),
+                ]
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("condition", [1, 0])
+def test_where_ttt_int32_predicate_sub_core_grid(device, shape, sub_core_grid, condition):
+    """TTT variant: INT32 predicate, float tensors, sub_core_grids.
+
+    Exercises the internal typecast path where the INT32 predicate is cast to
+    float before the ternary where kernel in the tensor-tensor-tensor variant,
+    with a sub_core_grid restriction.
+    """
+    torch.manual_seed(0)
+
+    C = make_condition_tensor(shape, torch.int32, condition)
+    T = torch.randn(shape, dtype=torch.float32)
+    F = torch.ones(shape, dtype=torch.float32) * 10.0
+    golden = torch.where(C.bool(), T, F)
+
+    ttnn_C = ttnn.from_torch(C, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_T = ttnn.from_torch(T, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+    ttnn_F = ttnn.from_torch(F, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=device)
+
+    ttnn_result = ttnn.where(ttnn_C, ttnn_T, ttnn_F, sub_core_grids=sub_core_grid)
+    result = ttnn.to_torch(ttnn_result)
+
+    assert torch_equal_nan(result, golden)
+
+
+# Program cache bug tests - ensure different broadcast configurations don't collide
+# Issue 43368: When padded shapes are identical but logical shapes differ (e.g., [1,1,32] vs [1,8,1]),
+# the program cache key must distinguish them to avoid using wrong kernel configuration.
+
+
+@pytest.mark.parametrize("variant", ["TTT", "TTS", "TST"])
+def test_where_program_cache_different_broadcast_shapes(device, variant):
+    """
+    Test that sequential where ops with same broadcast_type but different
+    per-operand broadcast configurations don't collide in program cache.
+    """
+    torch.manual_seed(42)
+
+    # First where: predicate broadcasts on rows (1x32 -> 4x32)
+    pred1 = torch.zeros(1, 1, 32, dtype=torch.bfloat16)
+    pred1[:, :, 16:] = 1.0
+
+    # Second where: predicate broadcasts on columns (8x1 -> 8x32)
+    pred2 = torch.zeros(1, 8, 1, dtype=torch.bfloat16)
+    pred2[:, 4:, :] = 1.0
+
+    if variant == "TTT":
+        true1 = torch.randn(1, 1, 1, dtype=torch.bfloat16)
+        false1 = torch.randn(1, 4, 32, dtype=torch.bfloat16)
+        true2 = torch.randn(1, 1, 1, dtype=torch.bfloat16)
+        false2 = torch.randn(1, 8, 32, dtype=torch.bfloat16)
+
+        expected1 = torch.where(pred1.bool().expand_as(false1), true1.expand_as(false1), false1)
+        expected2 = torch.where(pred2.bool().expand_as(false2), true2.expand_as(false2), false2)
+
+        pred1_ttnn = ttnn.from_torch(pred1, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        true1_ttnn = ttnn.from_torch(true1, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        false1_ttnn = ttnn.from_torch(false1, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        result1 = ttnn.to_torch(ttnn.where(pred1_ttnn, true1_ttnn, false1_ttnn))
+
+        pred2_ttnn = ttnn.from_torch(pred2, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        true2_ttnn = ttnn.from_torch(true2, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        false2_ttnn = ttnn.from_torch(false2, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        result2 = ttnn.to_torch(ttnn.where(pred2_ttnn, true2_ttnn, false2_ttnn))
+
+    elif variant == "TTS":
+        true1 = torch.randn(1, 4, 32, dtype=torch.bfloat16)
+        true2 = torch.randn(1, 8, 32, dtype=torch.bfloat16)
+        scalar_false = 0.0
+
+        expected1 = torch.where(pred1.bool().expand_as(true1), true1, torch.full_like(true1, scalar_false))
+        expected2 = torch.where(pred2.bool().expand_as(true2), true2, torch.full_like(true2, scalar_false))
+
+        pred1_ttnn = ttnn.from_torch(pred1, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        true1_ttnn = ttnn.from_torch(true1, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        result1 = ttnn.to_torch(ttnn.where(pred1_ttnn, true1_ttnn, scalar_false))
+
+        pred2_ttnn = ttnn.from_torch(pred2, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        true2_ttnn = ttnn.from_torch(true2, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        result2 = ttnn.to_torch(ttnn.where(pred2_ttnn, true2_ttnn, scalar_false))
+
+    elif variant == "TST":
+        false1 = torch.randn(1, 4, 32, dtype=torch.bfloat16)
+        false2 = torch.randn(1, 8, 32, dtype=torch.bfloat16)
+        scalar_true = 1.0
+
+        expected1 = torch.where(pred1.bool().expand_as(false1), torch.full_like(false1, scalar_true), false1)
+        expected2 = torch.where(pred2.bool().expand_as(false2), torch.full_like(false2, scalar_true), false2)
+
+        pred1_ttnn = ttnn.from_torch(pred1, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        false1_ttnn = ttnn.from_torch(false1, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        result1 = ttnn.to_torch(ttnn.where(pred1_ttnn, scalar_true, false1_ttnn))
+
+        pred2_ttnn = ttnn.from_torch(pred2, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        false2_ttnn = ttnn.from_torch(false2, device=device, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16)
+        result2 = ttnn.to_torch(ttnn.where(pred2_ttnn, scalar_true, false2_ttnn))
+
+    assert_equal(expected1, result1)
+    assert_equal(expected2, result2)

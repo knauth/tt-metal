@@ -1,21 +1,19 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "worker_config_buffer.hpp"
 
-#include <assert.hpp>
-#include <stdint.h>
-#include <stdio.h>
+#include <tt_stl/assert.hpp>
+#include <cstdint>
+#include <cstdio>
 #include <algorithm>
 #include <utility>
 #include <vector>
 
 #include <tt-logger/tt-logger.hpp>
 
-namespace tt {
-
-namespace tt_metal {
+namespace tt::tt_metal {
 enum class HalProgrammableCoreType;
 
 constexpr uint32_t kernel_config_entry_count = 8;
@@ -44,14 +42,30 @@ void WorkerConfigBufferMgr::init_add_buffer(uint32_t base_addr, uint32_t size) {
 // To avoid allocs in a perf path, returns a reference to internal data
 std::pair<ConfigBufferSync, std::vector<ConfigBufferEntry>&> WorkerConfigBufferMgr::reserve(
     const std::vector<uint32_t>& sizes) {
-    ConfigBufferSync sync_info;
+    ConfigBufferSync sync_info{};
     sync_info.need_sync = false;
 
     size_t num_buffer_types = this->reservation_.size();
+    constexpr uint32_t active_eth_idx = static_cast<uint32_t>(HalProgrammableCoreType::ACTIVE_ETH);
     TT_ASSERT(sizes.size() == num_buffer_types);
     for (uint32_t idx = 0; idx < num_buffer_types; idx++) {
         uint32_t free_index = this->free_index_[idx];
         uint32_t alloc_index = this->alloc_index_[idx];
+
+        // Special handling for active ethernet. It's not used that much as the primary user is Fabric, and in that
+        // case it is launched once with slow dispatch only during init
+        if (idx == active_eth_idx && sizes[idx]) [[unlikely]] {
+            // Stall if another acteth kernel ran before this to ensure it's finished before we
+            // write a new binary
+            if (free_index != alloc_index) {
+                sync_info.need_sync = true;
+                sync_info.sync_count = std::max(sync_info.sync_count, this->entries_[free_index][idx].sync_count);
+            }
+            // Force allocations from the base address for deterministic allocations
+            this->reservation_[idx].addr = this->base_addrs_[idx];
+            this->reservation_[idx].size = sizes[idx];
+            continue;
+        }
 
         bool done = false;
         while (!done) {
@@ -202,26 +216,35 @@ void WorkerConfigBufferMgr::mark_completely_full(uint32_t sync) {
     }
 }
 
+std::vector<size_t> WorkerConfigBufferMgr::get_queued_entry_indices(size_t buffer_type) const {
+    std::vector<size_t> indices;
+    indices.reserve(this->entries_.size());
+    // Walk the ring buffer from the oldest freeable entry (free_index_) up to, but not including,
+    // the alloc entry (alloc_index_). Starting from alloc_index_ here would make the loop empty.
+    size_t free_index = this->free_index_[buffer_type];
+    while (free_index != this->alloc_index_[buffer_type]) {
+        indices.push_back(free_index);
+        free_index = (free_index + 1) % this->entries_.size();
+    }
+    return indices;
+}
+
 void WorkerConfigBufferMgr::PrintStatus() {
     size_t num_buffer_types = this->reservation_.size();
     for (size_t i = 0; i < num_buffer_types; i++) {
         fprintf(stderr, "Buffer type %zu\n", i);
         log_info(tt::LogTest, "Buffer type {}", i);
 
-        size_t free_index = this->alloc_index_[i];
-        while (free_index != this->alloc_index_[i]) {
+        for (size_t free_index : this->get_queued_entry_indices(i)) {
             auto& entry = this->entries_[free_index][i];
             log_info(
                 tt::LogTest, "Free index {} has values {} {} {}", free_index, entry.addr, entry.size, entry.sync_count);
-
-            free_index = (free_index + 1) % this->entries_.size();
         }
-        auto& entry = this->entries_[free_index][i];
+        size_t alloc_index = this->alloc_index_[i];
+        auto& entry = this->entries_[alloc_index][i];
         log_info(
-            tt::LogTest, "Alloc index {} has values {} {} {}", free_index, entry.addr, entry.size, entry.sync_count);
+            tt::LogTest, "Alloc index {} has values {} {} {}", alloc_index, entry.addr, entry.size, entry.sync_count);
     }
 }
 
-}  // namespace tt_metal
-
-}  // namespace tt
+}  // namespace tt::tt_metal

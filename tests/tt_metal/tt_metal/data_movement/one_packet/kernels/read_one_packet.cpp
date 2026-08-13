@@ -1,16 +1,16 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
-#include "dataflow_api.h"
-#include "debug/dprint_pages.h"
-#include "debug/dprint.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/debug/dprint_pages.h"
+#include "api/debug/dprint.h"
 
 void kernel_main() {
-    constexpr uint32_t num_packets = get_compile_time_arg_val(0);
-    constexpr uint32_t packet_size_bytes = get_compile_time_arg_val(1);
-    constexpr uint32_t test_id = get_compile_time_arg_val(2);
+    constexpr uint32_t num_packets = get_named_compile_time_arg_val("num_packets");
+    constexpr uint32_t packet_size_bytes = get_named_compile_time_arg_val("packet_size");
+    constexpr uint32_t test_id = get_named_compile_time_arg_val("test_id");
 
     uint32_t master_l1_addr = get_arg_val<uint32_t>(0);
     uint32_t subordinate_l1_addr = get_arg_val<uint32_t>(1);

@@ -1,10 +1,12 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/circular_buffer.h"
 
 void kernel_main() {
     uint32_t arg_index = 0;
@@ -22,14 +24,14 @@ void kernel_main() {
     uint32_t Ht = get_arg_val<uint32_t>(arg_index++);
     uint32_t Wt = get_arg_val<uint32_t>(arg_index++);
 
-    constexpr bool src_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr auto cb_id_src = get_compile_time_arg_val(1);
+    constexpr auto cb_id_src = get_compile_time_arg_val(0);
+    constexpr auto src_args = TensorAccessorArgs<1>();
     constexpr uint32_t onetile = 1;
 
-    const uint32_t src_tile_bytes = get_tile_size(cb_id_src);
-    const DataFormat src_data_format = get_dataformat(cb_id_src);
-    const InterleavedAddrGenFast<src_is_dram> src = {
-        .bank_base_address = src_addr, .page_size = src_tile_bytes, .data_format = src_data_format};
+    const auto src = TensorAccessor(src_args, src_addr);
+    Noc noc;
+    CircularBuffer cb_src(cb_id_src);
+    const uint32_t src_tile_bytes = cb_src.get_tile_size();
 
     uint32_t HtWt = Ht * Wt;
 
@@ -42,11 +44,10 @@ void kernel_main() {
     for (uint32_t n = start_n; n < N && num_tiles_read < num_tiles; ++n, start_c = 0) {
         for (uint32_t c = start_c; c < C && num_tiles_read < num_tiles; ++c, start_th = 0) {
             for (uint32_t th = start_th; th < Ht && num_tiles_read < num_tiles; ++th, start_tw = 0) {
-                cb_reserve_back(cb_id_src, onetile);
-                uint32_t l1_write_addr = get_write_ptr(cb_id_src);
-                noc_async_read_tile(tile_offset + th, src, l1_write_addr);
-                noc_async_read_barrier();
-                cb_push_back(cb_id_src, onetile);
+                cb_src.reserve_back(onetile);
+                noc.async_read(src, cb_src, src_tile_bytes, {.page_id = tile_offset + th}, {.offset_bytes = 0});
+                noc.async_read_barrier();
+                cb_src.push_back(onetile);
                 num_tiles_read += Wt - start_tw;
             }
             tile_offset += c_stride;

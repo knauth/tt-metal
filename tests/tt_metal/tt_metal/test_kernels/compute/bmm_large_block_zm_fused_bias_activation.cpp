@@ -1,20 +1,20 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/matmul.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
 
 #ifdef FUSE_BIAS
-#include "compute_kernel_api/bcast.h"
+#include "api/compute/bcast.h"
 #endif
 
-#include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
+#include "api/compute/eltwise_unary/sfpu_split_includes.h"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t in0_block_w = get_compile_time_arg_val(0);              // inner block size in tiles
     uint32_t in0_num_subblocks = get_compile_time_arg_val(1);        // outer row block size (in inner row blocks)
     uint32_t in0_block_num_tiles = get_compile_time_arg_val(2);      // out_subblock_h*in0_block_w*in0_num_subblocks;
@@ -35,11 +35,11 @@ void MAIN {
     uint32_t mm_bias_intermediate_cb_id = tt::CBIndex::c_25;
     uint32_t bias_cb_id = tt::CBIndex::c_3;
 
-#ifdef FUSE_BIAS
-    init_bcast<EltwiseBinaryType::ELWADD, BroadcastType::ROW>(mm_bias_intermediate_cb_id, bias_cb_id, out_cb_id);
-#endif
-
-    mm_init(in0_cb_id, in1_cb_id, out_cb_id);
+    // compute_kernel_hw_startup must be the first compute API call. The bias broadcast-add is
+    // initialized by add_bcast_rows_init right before it in the loop, so the full init_bcast
+    // here is redundant and was removed.
+    compute_kernel_hw_startup<SrcOrder::Reverse>(in0_cb_id, in1_cb_id, out_cb_id);
+    matmul_init(in0_cb_id, in1_cb_id);
 
     for (uint32_t b = 0; b < batch; b++) {
         bool spill = num_blocks > 1;
@@ -55,7 +55,7 @@ void MAIN {
             for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
                 int in1_index_subblock_offset = 0;
                 for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
-                    acquire_dst();
+                    tile_regs_acquire();
 
                     if (enable_reload) {
                         // Reconfigure input
@@ -66,7 +66,8 @@ void MAIN {
                         }
                         cb_pop_front(mm_partials_cb_id, out_subblock_num_tiles);
                         // Reconfigure srcA back
-                        mm_init_short_with_dt(in0_cb_id, in1_cb_id, mm_partials_cb_id);
+                        reconfig_data_format_srca(mm_partials_cb_id, in1_cb_id);
+                        matmul_init(in0_cb_id, in1_cb_id);
                     }
 
                     // Compute output sub-block from in0_subblock x in1_subblock
@@ -78,8 +79,7 @@ void MAIN {
                             for (uint32_t inner_dim = 0; inner_dim < in0_block_w; inner_dim++) {
                                 int in0_index = in0_index_subblock_offset + in0_index_h_offset + inner_dim;
                                 int in1_index = in1_index_subblock_offset + in1_index_inner_dim_offset + w;
-                                matmul_tiles(
-                                    in0_cb_id, in1_cb_id, in0_index, in1_index, dst_index, false /* transpose */);
+                                matmul_tiles(in0_cb_id, in1_cb_id, in0_index, in1_index, dst_index);
                                 in1_index_inner_dim_offset += in1_per_core_w;
                             }
                             dst_index++;
@@ -90,22 +90,24 @@ void MAIN {
                     if (last_out) {
 #ifdef FUSE_BIAS
                         // Move matmul result to interm buffer
+                        tile_regs_commit();
+                        tile_regs_wait();
                         cb_reserve_back(mm_bias_intermediate_cb_id, out_subblock_num_tiles);
                         for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
                             pack_tile(i, mm_bias_intermediate_cb_id);
                         }
                         cb_push_back(mm_bias_intermediate_cb_id, out_subblock_num_tiles);
-                        release_dst();
+                        tile_regs_release();
 
                         // Redundant wait since we know data was just pushed
                         cb_wait_front(mm_bias_intermediate_cb_id, out_subblock_num_tiles);
                         cb_wait_front(bias_cb_id, in1_per_core_w);
-                        add_bcast_rows_init_short(mm_bias_intermediate_cb_id, bias_cb_id);
+                        add_bcast_rows_init(mm_bias_intermediate_cb_id, bias_cb_id);
                         // reconfigure unpacker df for src B
                         reconfig_data_format(mm_bias_intermediate_cb_id, bias_cb_id);
                         // reconfigure packer df for out
                         pack_reconfig_data_format(out_cb_id);
-                        acquire_dst();
+                        tile_regs_acquire();
                         for (uint32_t i = 0, j = 0; j < out_subblock_h; j++) {
                             uint32_t bcast_tile_idx = in1_index_subblock_offset;
                             for (uint32_t k = 0; k < out_subblock_w; k++, i++) {
@@ -115,7 +117,7 @@ void MAIN {
                         }
                         cb_pop_front(mm_bias_intermediate_cb_id, out_subblock_num_tiles);
                         // reconfigure init for matmul
-                        mm_init_short(in0_cb_id, in1_cb_id);
+                        matmul_init(in0_cb_id, in1_cb_id);
                         // reconfigure unpacker df for src B
                         reconfig_data_format(in1_cb_id, in0_cb_id);
 #endif
@@ -127,6 +129,8 @@ void MAIN {
                             SFPU_OP_FUNC_ACTIVATION
                         }
 #endif
+                        tile_regs_commit();
+                        tile_regs_wait();
                         // Pack out to output buffer
                         cb_reserve_back(out_cb_id, out_subblock_num_tiles);
                         for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
@@ -134,6 +138,8 @@ void MAIN {
                         }
                         cb_push_back(out_cb_id, out_subblock_num_tiles);
                     } else {
+                        tile_regs_commit();
+                        tile_regs_wait();
                         // Wait for tiles in output buffer to be written out since interm and output share memory
                         if (block == 0) {
                             cb_reserve_back(out_cb_id, out_num_tiles_to_wait);
@@ -147,7 +153,7 @@ void MAIN {
                         cb_push_back(mm_partials_cb_id, out_subblock_num_tiles);
                     }
 
-                    release_dst();
+                    tile_regs_release();
                     in1_index_subblock_offset += out_subblock_w;
                 }
                 in0_index_subblock_offset += in0_subblock_num_tiles;
@@ -162,4 +168,3 @@ void MAIN {
         }
     }
 }
-}  // namespace NAMESPACE

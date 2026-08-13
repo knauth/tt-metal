@@ -1,3 +1,12 @@
+# Wrapper around target_precompile_headers(REUSE_FROM) that silently no-ops when
+# CMAKE_DISABLE_PRECOMPILE_HEADERS is set, avoiding spurious CMake warnings about
+# REUSE_FROM sources that have DISABLE_PRECOMPILE_HEADERS set on them.
+function(tt_reuse_precompile_headers target pch_source)
+    if(NOT CMAKE_DISABLE_PRECOMPILE_HEADERS)
+        target_precompile_headers(${target} REUSE_FROM ${pch_source})
+    endif()
+endfunction()
+
 function(CREATE_EAGER_TEST_EXE TESTLIST)
     foreach(TEST_SRC ${TESTLIST})
         get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
@@ -18,7 +27,7 @@ function(CREATE_EAGER_TEST_EXE TESTLIST)
             ${TEST_TARGET}
             PUBLIC
                 test_eager_common_libs
-                ttnn
+                TTNN::TTNN
                 Python3::Python
         )
         target_include_directories(
@@ -27,6 +36,7 @@ function(CREATE_EAGER_TEST_EXE TESTLIST)
                 ${PROJECT_SOURCE_DIR}
                 ${PROJECT_SOURCE_DIR}/tt_metal
                 ${PROJECT_SOURCE_DIR}/ttnn/cpp
+                ${PROJECT_SOURCE_DIR}/ttnn/api
                 ${PROJECT_SOURCE_DIR}/tt_metal/common
                 ${PROJECT_SOURCE_DIR}/tests
                 ${CMAKE_CURRENT_SOURCE_DIR}
@@ -56,6 +66,10 @@ function(CREATE_PGM_EXAMPLES_EXE TESTLIST SUBDIR)
         )
 
         target_include_directories(${TEST_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+        if(TARGET TT::CommonPCH)
+            target_precompile_headers(${TEST_TARGET} REUSE_FROM TT::CommonPCH)
+        endif()
 
         set_target_properties(
             ${TEST_TARGET}

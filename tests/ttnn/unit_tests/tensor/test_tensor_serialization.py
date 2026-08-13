@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,7 +11,9 @@ import torch
 import numpy as np
 
 import ttnn
-from tests.ttnn.utils_for_testing import tt_dtype_to_torch_dtype
+from tests.ttnn.utils_for_testing import tt_dtype_to_torch_dtype, TORCH_INTEGER_DTYPES
+
+pytestmark = pytest.mark.use_module_device
 
 
 @pytest.mark.parametrize("shape", [(2, 3, 64, 96)])
@@ -31,16 +33,18 @@ def test_serialization(tmp_path, shape, tt_dtype):
 
     dtype = tt_dtype_to_torch_dtype[tt_dtype]
 
-    if dtype in {torch.int16, torch.int32}:
+    if dtype in TORCH_INTEGER_DTYPES:
         torch_tensor = torch.randint(0, 1024, shape, dtype=dtype)
     else:
         torch_tensor = torch.rand(shape, dtype=dtype)
 
     tt_tensor = ttnn.Tensor(torch_tensor, tt_dtype)
 
-    file_name = tmp_path / pathlib.Path("tensor.bin")
+    file_name = tmp_path / pathlib.Path("tensor.tensorbin")
     ttnn.dump_tensor(str(file_name), tt_tensor)
     torch_tensor_from_file = ttnn.load_tensor(str(file_name)).to_torch()
+
+    torch_tensor_from_file = torch_tensor_from_file.to(torch_tensor.dtype)
 
     assert torch_tensor.dtype == torch_tensor_from_file.dtype
     assert torch_tensor.shape == torch_tensor_from_file.shape
@@ -87,7 +91,7 @@ def test_sharded_tensor_serialization(tmp_path, device, tensor_spec):
     dtype = tt_dtype_to_torch_dtype[tensor_spec.dtype]
     py_tensor = torch.rand(list(tensor_spec.shape), dtype=dtype)
     tt_tensor = ttnn.from_torch(py_tensor, spec=tensor_spec, device=device)
-    file_name = tmp_path / pathlib.Path("tensor.bin")
+    file_name = tmp_path / pathlib.Path("tensor.tensorbin")
     ttnn.dump_tensor(str(file_name), tt_tensor)
     ttnn_tensor_from_file = ttnn.load_tensor(str(file_name), device=device)
     assert ttnn_tensor_from_file.spec == tensor_spec

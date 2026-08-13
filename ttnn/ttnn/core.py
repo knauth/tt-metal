@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -15,6 +15,9 @@ from ttnn.types import (
     TensorMemoryLayout,
     BufferType,
 )
+
+split_work_to_cores = ttnn._ttnn.operations.core.split_work_to_cores
+grid_to_cores = ttnn._ttnn.operations.core.grid_to_cores
 
 set_printoptions = ttnn._ttnn.core.set_printoptions
 
@@ -350,14 +353,12 @@ def create_sharded_memory_config_(
             raise RuntimeError("Invalid sharding scheme")
 
     if tile_layout and shard_shape[0] % 32 != 0 and shard_shape[1] % 32 != 0:
-        raise RuntimeError("Incorrent tensor shape")
+        raise RuntimeError("Incorrect tensor shape")
     shard_spec = ttnn.ShardSpec(shard_grid, shard_shape, shard_orientation)
     memory_config = MemoryConfig(tensor_memory_layout, BufferType.L1, shard_spec)
     return memory_config
 
 
-dump_memory_config = ttnn._ttnn.tensor.dump_memory_config
-load_memory_config = ttnn._ttnn.tensor.load_memory_config
-
+get_current_command_queue_id_for_thread = ttnn._ttnn.core.get_current_command_queue_id_for_thread
 
 __all__ = []

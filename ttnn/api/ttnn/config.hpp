@@ -1,18 +1,19 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
 #include <filesystem>
+#include <iosfwd>
 #include <optional>
 #include <reflect>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <vector>
 
-#include <tt-logger/tt-logger.hpp>
-#include <tt_stl/reflection.hpp>
+#include <fmt/base.h>
 
 namespace ttnn {
 
@@ -25,9 +26,13 @@ struct Config {
         std::filesystem::path tmp_dir = "/tmp/ttnn";
         bool enable_model_cache = false;
         bool enable_fast_runtime_mode = true;
+        // Validate the Metal 2.0 host-side program args: the ProgramSpec on MakeProgramFromSpec and the
+        // ProgramRunArgs on Set/UpdateProgramRunArgs. Off by default; CI turns it on.
+        bool validate_program_args = false;
         bool throw_exception_on_fallback = false;
         bool enable_logging = false;
         bool enable_graph_report = false;
+        bool enable_graph_python_stack_traces = false;
         bool enable_detailed_buffer_report = false;
         bool enable_detailed_tensor_report = false;
         bool enable_comparison_mode = false;
@@ -39,6 +44,11 @@ struct Config {
 
 private:
     attributes_t attributes;
+    mutable std::optional<std::filesystem::path> cached_report_path;
+    mutable std::optional<std::string> cached_report_name;
+
+    // Implementation helper for the report_path getter (defined in config.cpp).
+    std::optional<std::filesystem::path> get_report_path_impl() const;
 
 public:
     Config(auto&&... args) : attributes{std::forward<decltype(args)>(args)...} {}
@@ -57,11 +67,7 @@ public:
     template <reflect::fixed_string name>
         requires(name == reflect::fixed_string{"report_path"})
     std::optional<std::filesystem::path> get() const {
-        if (this->attributes.report_name.has_value()) {
-            auto hash = std::hash<std::string>{}(this->attributes.report_name.value());
-            return this->attributes.root_report_path / std::to_string(hash);
-        }
-        return std::nullopt;
+        return get_report_path_impl();
     }
 
     template <
@@ -78,57 +84,15 @@ public:
         this->validate(reflect::member_name<index>(this->attributes));
     }
 
-    void validate(std::string_view name) {
-        if (name == "enable_fast_runtime_mode" or name == "enable_logging") {
-            if (this->attributes.enable_fast_runtime_mode) {
-                if (this->attributes.enable_logging) {
-                    log_warning(
-                        tt::LogAlways,
-                        "Logging cannot be enabled in fast runtime mode. Please disable fast runtime mode if you want "
-                        "to enable logging.");
-                }
-            }
-        }
+    // Defined in config.cpp (uses tt-logger).
+    void validate(std::string_view name) const;
 
-        if (name == "enable_comparison_mode") {
-            if (this->attributes.enable_fast_runtime_mode && this->attributes.enable_comparison_mode) {
-                log_warning(
-                    tt::LogAlways,
-                    "Comparison mode is currently not supported with fast runtime mode enabled. Please disable fast "
-                    "runtime mode ('enable_fast_runtime_mode = false') to use tensor comparison mode.");
-            }
-        }
+    // Returns all config attributes as key-value pairs for Inspector.
+    // Defined in config.cpp (uses reflection for_each).
+    std::vector<std::pair<std::string, std::string>> get_config_entries() const;
 
-        if (name == "enable_fast_runtime_mode" or name == "enable_graph_report" or
-            name == "enable_detailed_buffer_report" or name == "enable_detailed_tensor_report") {
-            if (not this->attributes.enable_logging) {
-                if (this->attributes.enable_graph_report) {
-                    log_warning(tt::LogAlways, "Running without logging. Please enable logging to save graph report");
-                }
-                if (this->attributes.enable_detailed_buffer_report) {
-                    log_warning(
-                        tt::LogAlways, "Running without logging. Please enable logging to save detailed buffer report");
-                }
-                if (this->attributes.enable_detailed_tensor_report) {
-                    log_warning(
-                        tt::LogAlways, "Running without logging. Please enable logging to save detailed tensor report");
-                }
-            }
-        }
-    }
-
-    friend std::ostream& operator<<(std::ostream& os, const Config& config) {
-        os << "Config{";
-        reflect::for_each(
-            [&](auto I) {
-                os << reflect::member_name<I>(config.attributes) << "="
-                   << fmt::format("{}", reflect::get<I>(config.attributes)) << ",";
-            },
-            config.attributes);
-        os << fmt::format("{}", config.get<"report_path">());
-        os << "}";
-        return os;
-    }
+    // Defined in config.cpp (uses reflection for_each).
+    friend std::ostream& operator<<(std::ostream& os, const Config& config);
 };
 
 extern Config CONFIG;
@@ -143,9 +107,6 @@ template <>
 struct fmt::formatter<ttnn::Config> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.end(); }
 
-    auto format(const ttnn::Config& config, format_context& ctx) const -> format_context::iterator {
-        std::stringstream ss;
-        ss << config;
-        return fmt::format_to(ctx.out(), "{}", ss.str());
-    }
+    // Defined in config.cpp.
+    auto format(const ttnn::Config& config, format_context& ctx) const -> format_context::iterator;
 };

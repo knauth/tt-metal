@@ -1,11 +1,11 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import ttnn
 from loguru import logger
 from transformers import AutoTokenizer
-from models.generation_utils import run_generate
+from models.common.generation_utils import run_generate
 
 
 def run_demo_t5(t5_model_constructor):

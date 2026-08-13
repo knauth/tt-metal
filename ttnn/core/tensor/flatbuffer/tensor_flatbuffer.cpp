@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -8,13 +8,14 @@
 #include <tt-metalium/mesh_coord.hpp>
 #include <tt-metalium/host_buffer.hpp>
 #include <tt-metalium/distributed_host_buffer.hpp>
+#include <tt-metalium/experimental/distributed_tensor/distributed_tensor_apis.hpp>
 #include <flatbuffers/flatbuffers.h>
 
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/tensor/tensor_spec.hpp"
 #include "ttnn/tensor/tensor.hpp"
-#include "ttnn/distributed/distributed_tensor_config.hpp"
 #include "ttnn/distributed/types.hpp"
+#include "ttnn/distributed/tensor_topology.hpp"
 #include "ttnn/tensor/storage.hpp"
 #include "ttnn/tensor/tensor_utils.hpp"
 
@@ -23,6 +24,9 @@
 #include "tensor_generated.h"
 
 #include <vector>
+#include <cstdint>
+#include <unordered_map>
+#include <limits>
 
 namespace ttnn {
 namespace {
@@ -51,37 +55,112 @@ tt::tt_metal::distributed::MeshShape from_flatbuffer(const flatbuffer::MeshShape
 }
 
 tt::tt_metal::HostBuffer create_host_buffer_from_bytes(
-    uint64_t size_bytes, const TensorSpec& spec, tt::stl::Span<std::byte> data, tt::tt_metal::MemoryPin memory_pin) {
+    uint64_t size_bytes,
+    const tt::tt_metal::TensorSpec& spec,
+    ttsl::Span<std::byte> data,
+    const tt::tt_metal::MemoryPin& memory_pin) {
     switch (spec.data_type()) {
         case tt::tt_metal::DataType::UINT32:
         case tt::tt_metal::DataType::BFLOAT8_B:
         case tt::tt_metal::DataType::BFLOAT4_B: {
-            tt::stl::Span<uint32_t> typed_span(reinterpret_cast<uint32_t*>(data.data()), size_bytes / sizeof(uint32_t));
+            ttsl::Span<uint32_t> typed_span(reinterpret_cast<uint32_t*>(data.data()), size_bytes / sizeof(uint32_t));
             return tt::tt_metal::HostBuffer(typed_span, memory_pin);
         }
         case tt::tt_metal::DataType::INT32: {
-            tt::stl::Span<int32_t> typed_span(reinterpret_cast<int32_t*>(data.data()), size_bytes / sizeof(int32_t));
+            ttsl::Span<int32_t> typed_span(reinterpret_cast<int32_t*>(data.data()), size_bytes / sizeof(int32_t));
             return tt::tt_metal::HostBuffer(typed_span, memory_pin);
         }
+        case tt::tt_metal::DataType::INT8: {
+            ttsl::Span<int8_t> typed_span(reinterpret_cast<int8_t*>(data.data()), size_bytes / sizeof(int8_t));
+            return tt::tt_metal::HostBuffer(typed_span, memory_pin);
+        }
+        case tt::tt_metal::DataType::FP8_E4M3:
+            TT_THROW("Flatbuffer load for DataType::FP8_E4M3 is not supported during tensor deserialization.");
         case tt::tt_metal::DataType::UINT8: {
-            tt::stl::Span<uint8_t> typed_span(reinterpret_cast<uint8_t*>(data.data()), size_bytes / sizeof(uint8_t));
+            ttsl::Span<uint8_t> typed_span(reinterpret_cast<uint8_t*>(data.data()), size_bytes / sizeof(uint8_t));
             return tt::tt_metal::HostBuffer(typed_span, memory_pin);
         }
         case tt::tt_metal::DataType::UINT16: {
-            tt::stl::Span<uint16_t> typed_span(reinterpret_cast<uint16_t*>(data.data()), size_bytes / sizeof(uint16_t));
+            ttsl::Span<uint16_t> typed_span(reinterpret_cast<uint16_t*>(data.data()), size_bytes / sizeof(uint16_t));
             return tt::tt_metal::HostBuffer(typed_span, memory_pin);
         }
         case tt::tt_metal::DataType::FLOAT32: {
-            tt::stl::Span<float> typed_span(reinterpret_cast<float*>(data.data()), size_bytes / sizeof(float));
+            ttsl::Span<float> typed_span(reinterpret_cast<float*>(data.data()), size_bytes / sizeof(float));
             return tt::tt_metal::HostBuffer(typed_span, memory_pin);
         }
         case tt::tt_metal::DataType::BFLOAT16: {
-            tt::stl::Span<bfloat16> typed_span(reinterpret_cast<bfloat16*>(data.data()), size_bytes / sizeof(bfloat16));
+            ttsl::Span<bfloat16> typed_span(reinterpret_cast<bfloat16*>(data.data()), size_bytes / sizeof(bfloat16));
             return tt::tt_metal::HostBuffer(typed_span, memory_pin);
         }
         case tt::tt_metal::DataType::INVALID: TT_THROW("Unsupported DataType");
     }
     TT_THROW("Unreachable");
+}
+
+flatbuffers::Offset<ttnn::flatbuffer::TensorTopology> to_flatbuffer(
+    const tt::tt_metal::TensorTopology& topology, flatbuffers::FlatBufferBuilder& builder) {
+    auto dist_shape_offset = to_flatbuffer(topology.distribution_shape(), builder);
+
+    std::vector<flatbuffers::Offset<ttnn::flatbuffer::MeshMapperPlacement>> placement_offsets;
+    placement_offsets.reserve(topology.placements().size());
+    for (const auto& placement_variant : topology.placements()) {
+        ttnn::flatbuffer::MeshMapperPlacementType type = ttnn::flatbuffer::MeshMapperPlacementType::Replicate;
+        int32_t tensor_dim = -1;
+
+        if (std::holds_alternative<tt::tt_metal::distributed::MeshMapperConfig::Replicate>(placement_variant)) {
+            type = ttnn::flatbuffer::MeshMapperPlacementType::Replicate;
+        } else {
+            const auto& shard = std::get<tt::tt_metal::distributed::MeshMapperConfig::Shard>(placement_variant);
+            type = ttnn::flatbuffer::MeshMapperPlacementType::Shard;
+            tensor_dim = shard.dim;
+        }
+
+        placement_offsets.push_back(ttnn::flatbuffer::CreateMeshMapperPlacement(builder, type, tensor_dim));
+    }
+    auto placements_vec = builder.CreateVector(placement_offsets);
+
+    std::vector<flatbuffers::Offset<tt::tt_metal::distributed::flatbuffer::MeshCoordinate>> coord_offsets;
+    coord_offsets.reserve(topology.mesh_coords().size());
+    for (const auto& coord : topology.mesh_coords()) {
+        coord_offsets.push_back(to_flatbuffer(coord, builder));
+    }
+    auto mesh_coords_vec = builder.CreateVector(coord_offsets);
+
+    return ttnn::flatbuffer::CreateTensorTopology(builder, dist_shape_offset, placements_vec, mesh_coords_vec);
+}
+
+tt::tt_metal::TensorTopology from_flatbuffer(const ttnn::flatbuffer::TensorTopology* fb_topology) {
+    TT_FATAL(fb_topology != nullptr, "tt::tt_metal::TensorTopology flatbuffer pointer must not be null");
+
+    const auto* fb_dist_shape = fb_topology->distribution_shape();
+    TT_FATAL(fb_dist_shape != nullptr, "distribution_shape is required in tt::tt_metal::TensorTopology");
+    auto dist_shape = from_flatbuffer(fb_dist_shape);
+
+    ttsl::SmallVector<tt::tt_metal::distributed::MeshMapperConfig::Placement> placements;
+    if (const auto* fb_placements = fb_topology->placements()) {
+        placements.reserve(fb_placements->size());
+        for (const auto* p : *fb_placements) {
+            TT_FATAL(p != nullptr, "MeshMapperPlacement element must not be null");
+            if (p->type() == ttnn::flatbuffer::MeshMapperPlacementType::Replicate) {
+                placements.emplace_back(tt::tt_metal::distributed::MeshMapperConfig::Replicate{});
+            } else if (p->type() == ttnn::flatbuffer::MeshMapperPlacementType::Shard) {
+                placements.emplace_back(tt::tt_metal::distributed::MeshMapperConfig::Shard{.dim = p->tensor_dim()});
+            } else {
+                TT_THROW("Unknown MeshMapperPlacementType");
+            }
+        }
+    }
+
+    std::vector<tt::tt_metal::distributed::MeshCoordinate> mesh_coords;
+    if (const auto* fb_coords = fb_topology->mesh_coords()) {
+        mesh_coords.reserve(fb_coords->size());
+        for (const auto* c : *fb_coords) {
+            TT_FATAL(c != nullptr, "MeshCoordinate element must not be null");
+            mesh_coords.push_back(from_flatbuffer(c));
+        }
+    }
+
+    return tt::tt_metal::TensorTopology(dist_shape, placements, mesh_coords);
 }
 
 }  // namespace
@@ -95,25 +174,63 @@ flatbuffers::Offset<ttnn::flatbuffer::Tensor> to_flatbuffer(
 
     const auto& host_storage = tensor.host_storage();
 
+    // Deduplicate replicated shards: two shards are duplicates if their coordinates differ only
+    // along Replicate dimensions. The deduplication key is built from coordinates at sharded
+    // dimensions only.
+    const auto& placements = tensor.tensor_topology().placements();
+    const auto& mesh_shape = tensor.tensor_topology().distribution_shape();
+    size_t unique_keys = 1;
+    for (size_t dim = 0; dim < placements.size(); ++dim) {
+        if (std::holds_alternative<tt::tt_metal::distributed::MeshMapperConfig::Shard>(placements[dim])) {
+            unique_keys *= mesh_shape[dim];
+        }
+    }
+    std::vector<uint64_t> dedup_key_to_offset(unique_keys, std::numeric_limits<uint64_t>::max());
+
     std::vector<flatbuffers::Offset<ttnn::flatbuffer::TensorShard>> shards_vector;
+    shards_vector.reserve(mesh_shape.mesh_size());
     // Used to deduplicate buffer addresses for replicated tensor data.
     std::unordered_map<const std::byte*, uint64_t> buffer_to_offset;
+
+    const auto& topology_mesh_coords = tensor.tensor_topology().mesh_coords();
+    TT_FATAL(
+        topology_mesh_coords.size() == mesh_shape.mesh_size(),
+        "Topology mesh coords size {} should match distribution shape size {}",
+        topology_mesh_coords.size(),
+        mesh_shape.mesh_size());
+
+    // Iterate over distribution coordinates and map to physical coordinates via the topology.
     uint64_t next_buffer_offset = 0;
-    for (const auto& coord : host_storage.buffer().shard_coords()) {
-        // Iterate over local populated shards.
+    size_t dist_idx = 0;
+    for (const auto& dist_coord : tt::tt_metal::distributed::MeshCoordinateRange(mesh_shape)) {
+        const auto& coord = topology_mesh_coords[dist_idx++];
+
         if (const auto& buffer = host_storage.buffer().get_shard(coord); buffer.has_value()) {
             const auto* buffer_address = buffer->view_bytes().data();
             const std::size_t buffer_size = buffer->view_bytes().size();
 
             uint64_t shard_buffer_offset = next_buffer_offset;
-            if (auto [it, inserted] = buffer_to_offset.try_emplace(buffer_address, shard_buffer_offset); inserted) {
-                // Encountered a new buffer, add it to the buffers vector.
+
+            size_t key = 0;
+            for (size_t dim = 0; dim < placements.size(); ++dim) {
+                if (std::holds_alternative<tt::tt_metal::distributed::MeshMapperConfig::Shard>(placements[dim])) {
+                    key = key * mesh_shape[dim] + dist_coord[dim];
+                }
+            }
+
+            if (dedup_key_to_offset[key] != std::numeric_limits<uint64_t>::max()) {
+                // Shards whose coordinates differ only along replicated dimensions are identical.
+                shard_buffer_offset = dedup_key_to_offset[key];
+            } else if (auto it = buffer_to_offset.find(buffer_address); it != buffer_to_offset.end()) {
+                // If two shards share the same buffer, they are identical.
+                shard_buffer_offset = it->second;
+            } else {
                 next_buffer_offset += buffer_size;
                 buffers.push_back(*buffer);
-            } else {
-                // Point to the existing buffer.
-                shard_buffer_offset = it->second;
             }
+
+            buffer_to_offset.emplace(buffer_address, shard_buffer_offset);
+            dedup_key_to_offset[key] = shard_buffer_offset;
 
             auto inline_storage = ttnn::flatbuffer::InlineFileStorage(shard_buffer_offset, buffer_size);
             auto mesh_coord_offset = to_flatbuffer(coord, builder);
@@ -131,15 +248,18 @@ flatbuffers::Offset<ttnn::flatbuffer::Tensor> to_flatbuffer(
 
     auto mesh_shape_offset = to_flatbuffer(host_storage.buffer().shape(), builder);
 
-    auto tensor_offset = ttnn::flatbuffer::CreateTensor(builder, tensor_spec_offset, mesh_shape_offset, shards);
+    auto topology_offset = to_flatbuffer(tensor.tensor_topology(), builder);
+
+    auto tensor_offset =
+        ttnn::flatbuffer::CreateTensor(builder, tensor_spec_offset, mesh_shape_offset, shards, topology_offset);
 
     return tensor_offset;
 }
 
 Tensor from_flatbuffer(
     const ttnn::flatbuffer::Tensor* fb_tensor,
-    tt::stl::Span<std::byte> tensor_data,
-    tt::tt_metal::MemoryPin memory_pin) {
+    ttsl::Span<std::byte> tensor_data,
+    const tt::tt_metal::MemoryPin& memory_pin) {
     auto spec = ttnn::from_flatbuffer(fb_tensor->tensor_spec());
 
     const auto* mesh_shape = fb_tensor->mesh_shape();
@@ -157,7 +277,7 @@ Tensor from_flatbuffer(
         const uint64_t size = inline_storage->size();
 
         tt::tt_metal::HostBuffer host_buffer = create_host_buffer_from_bytes(
-            size, spec, tt::stl::Span<std::byte>(tensor_data.data() + offset, size), memory_pin);
+            size, spec, ttsl::Span<std::byte>(tensor_data.data() + offset, size), memory_pin);
 
         TT_FATAL(shard->mesh_coordinate() != nullptr, "Mesh coordinate is required for each shard");
         const auto coord = from_flatbuffer(shard->mesh_coordinate());
@@ -165,27 +285,15 @@ Tensor from_flatbuffer(
             coord, [host_buffer = std::move(host_buffer)]() mutable { return std::move(host_buffer); });
     }
 
-    // TODO: #24115 - `DistributedTensorConfig` will be replaced by distributed host buffer, which can be used
-    // directly in Tensor storage.
-    const auto strategy = [&]() -> tt::tt_metal::DistributedTensorConfig {
-        std::unordered_set<const std::byte*> buffer_addresses;
-        distributed_buffer.apply([&buffer_addresses](const tt::tt_metal::HostBuffer& shard) {
-            buffer_addresses.insert(shard.view_bytes().data());
-        });
-        if (buffer_addresses.size() == 1) {
-            return tt::tt_metal::ReplicateTensor();
-        } else if (ttnn_mesh_shape.dims() == 2) {
-            return tt::tt_metal::ShardTensor2D{
-                tt::tt_metal::ShardMesh{.y = ttnn_mesh_shape[0], .x = ttnn_mesh_shape[1]}};
-        } else {
-            return tt::tt_metal::AllGatherTensor{};
-        }
-    }();
+    // NOTE: Existing tensor cache files may not have a tensor topology.
+    // Create tensor topology from flatbuffer if it exists, otherwise create a fully replicated topology.
+    const auto* fb_topology = fb_tensor->tensor_topology();
+    tt::tt_metal::TensorTopology topology =
+        fb_topology != nullptr ? from_flatbuffer(fb_topology)
+                               : tt::tt_metal::TensorTopology::create_fully_replicated_tensor_topology(ttnn_mesh_shape);
 
-    tt::tt_metal::HostStorage host_storage{std::move(distributed_buffer)};
-
-    // TODO (#25340): Add TensorTopology to flatbuffer serialization and properly handle it in deserialization.
-    return Tensor(std::move(host_storage), spec, strategy, tt::tt_metal::TensorTopology{});
+    return Tensor(
+        tt::tt_metal::host_tensor_from_buffer_with_topology(std::move(distributed_buffer), spec, std::move(topology)));
 }
 
 }  // namespace ttnn

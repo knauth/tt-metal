@@ -1,41 +1,44 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
 #include <cstdint>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
 #include "cq_common.hpp"
-#include "fabric_edm_packet_header.hpp"
 #include "tt_metal/fabric/hw/inc/tt_fabric_mux.hpp"
 #include "tt_metal/fabric/hw/inc/tt_fabric_mux_interface.hpp"
 #include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
-#include "risc_attribs.h"
-#include "debug/waypoint.h"
+#include "internal/risc_attribs.h"
+#include "api/debug/waypoint.h"
 #include "noc/noc_parameters.h"
-
-#if !defined(FD_CORE_TYPE)
-#define FD_CORE_TYPE 0
-#endif
 
 #if !defined(FABRIC_2D)
 #define FABRIC_2D 0
 #endif
 
-#if !defined(FABRIC_2D_DYNAMIC)
-#define FABRIC_2D_DYNAMIC 0
-#endif
-
 template <uint32_t mux_num_buffers_per_channel, uint32_t mux_channel_buffer_size_bytes, uint32_t header_rb>
 class CQRelayClient {
 private:
-    constexpr static ProgrammableCoreType fd_core_type = static_cast<ProgrammableCoreType>(FD_CORE_TYPE);
-
     tt::tt_fabric::WorkerToFabricMuxSender<mux_num_buffers_per_channel> edm;
+
+#if ASSERT_ENABLED
+    // Pointer to the end of the last released page. Used for assertions to catch cmd_ptr/released_pages desync.
+    uint32_t watch_released_ptr_;
+#endif
 
 public:
     CQRelayClient() = default;
+
+    // Initialize cmd_ptr tracking for release_pages assertions.
+    // Call this after init() and before any release_pages() calls that use cmd_ptr tracking.
+    template <uint32_t buffer_base>
+    FORCE_INLINE void init_cmd_ptr_tracking() {
+#if ASSERT_ENABLED
+        watch_released_ptr_ = buffer_base;
+#endif
+    }
 
     template <
         uint8_t noc_index,
@@ -43,7 +46,6 @@ public:
         uint32_t mux_y,
         uint32_t mux_worker_credits_stream_id,
         uint32_t mux_channel_base_address,
-        uint32_t mux_flow_control_address,
         uint32_t mux_connection_handshake_address,
         uint32_t mux_connection_info_address,
         uint32_t mux_buffer_index_address,
@@ -52,32 +54,28 @@ public:
         uint32_t worker_buffer_index_sem,
         uint32_t mux_status_address,
         uint32_t local_mux_status_address,
-        uint32_t my_dev_id,
-        uint32_t to_dev_id,
         uint32_t to_mesh_id,
         uint32_t ew_dim,
-        uint32_t router_direction,
         uint32_t packet_header_addr,
         uint8_t num_hops,
         uint8_t downstream_cmd_buf>
-    FORCE_INLINE void init(uint64_t downstream_noc_addr) {
+    FORCE_INLINE void init(
+        uint64_t downstream_noc_addr, uint32_t my_dev_id, uint32_t to_dev_id, uint32_t router_direction) {
         WAYPOINT("FMCW");
 #if defined(FABRIC_RELAY)
-        edm.template init<fd_core_type>(
+        edm.template init<programmable_core_type>(
             true /*connected_to_persistent_fabric*/,
-            router_direction,
             mux_x,
             mux_y,
             mux_channel_base_address,
             mux_num_buffers_per_channel,
-            mux_flow_control_address,
             mux_connection_handshake_address,
             mux_connection_info_address,
             mux_channel_buffer_size_bytes,
             mux_buffer_index_address,
-            (volatile uint32_t* const)get_semaphore<fd_core_type>(worker_flow_control_sem),
-            (volatile uint32_t* const)get_semaphore<fd_core_type>(worker_teardown_sem),
-            get_semaphore<fd_core_type>(worker_buffer_index_sem),
+            (volatile uint32_t* const)get_semaphore<programmable_core_type>(worker_flow_control_sem),
+            (volatile uint32_t* const)get_semaphore<programmable_core_type>(worker_teardown_sem),
+            get_semaphore<programmable_core_type>(worker_buffer_index_sem),
             mux_worker_credits_stream_id,
             StreamId{0}  // my stream id -- As a sender I currently do NOT get acks over stream regs
         );
@@ -86,36 +84,21 @@ public:
         tt::tt_fabric::fabric_client_connect<mux_num_buffers_per_channel>(edm);
 
         if constexpr (FABRIC_2D) {
-#if (FABRIC_2D_DYNAMIC == 1)
-            tt::tt_fabric::fabric_set_unicast_route(
-                (tt::tt_fabric::MeshPacketHeader*)packet_header_addr,
-                (eth_chan_directions)edm.direction,
-                my_dev_id,
-                to_dev_id,
-                to_mesh_id,
-                ew_dim);
-#else
 #if defined(GALAXY_CLUSTER)
             tt::tt_fabric::fabric_set_route(
-                (tt::tt_fabric::LowLatencyMeshPacketHeader*)packet_header_addr,
-                (eth_chan_directions)edm.direction,
+                (tt::tt_fabric::HybridMeshPacketHeader*)packet_header_addr,
+                (eth_chan_directions)router_direction,
                 0,  // branch forward
                 0,  // start hop
                 num_hops,
                 true);
 #else
             tt::tt_fabric::fabric_set_unicast_route(
-                (tt::tt_fabric::LowLatencyMeshPacketHeader*)packet_header_addr,
-                (eth_chan_directions)edm.direction,
-                my_dev_id,
-                to_dev_id,
-                to_mesh_id,
-                ew_dim);
-#endif
+                (tt::tt_fabric::HybridMeshPacketHeader*)packet_header_addr, to_dev_id, to_mesh_id);
 #endif
         } else {
             auto header = reinterpret_cast<volatile tt_l1_ptr PACKET_HEADER_TYPE*>(packet_header_addr);
-            header->to_chip_unicast(num_hops);
+            fabric_set_unicast_route<false>((LowLatencyPacketHeader*)header, num_hops);
         }
 #else
         init_write_state_only<noc_index, downstream_cmd_buf>(downstream_noc_addr);
@@ -127,7 +110,7 @@ public:
     FORCE_INLINE void init_write_state_only(uint64_t downstream_noc_addr) {
 #if !defined(FABRIC_RELAY)
         cq_noc_async_write_init_state<CQ_NOC_sNdl, false, false, downstream_cmd_buf>(
-            0, downstream_noc_addr, 0, noc_index);
+            0, downstream_noc_addr, 0, 1, noc_index);
 #endif
     }
 
@@ -145,7 +128,7 @@ public:
 #else
         constexpr uint32_t k_PacketQueueTeardownFlag = 0x80000000;
         noc_semaphore_inc(
-            get_noc_addr_helper(noc_xy, get_semaphore<fd_core_type>(sem_id)), k_PacketQueueTeardownFlag, noc_index);
+            get_noc_addr_helper(noc_xy, get_semaphore<programmable_core_type>(sem_id)), k_PacketQueueTeardownFlag, noc_index);
 #endif
     }
 
@@ -225,20 +208,50 @@ public:
     }
 
     template <uint8_t noc_idx, uint32_t dest_noc_xy, uint32_t dest_sem_id>
-    FORCE_INLINE void release_pages(uint16_t n) {
+    FORCE_INLINE void release_pages(uint32_t n) {
 #if defined(FABRIC_RELAY)
-        auto sem_addr = get_semaphore<fd_core_type>(dest_sem_id);
+        auto sem_addr = get_semaphore<programmable_core_type>(dest_sem_id);
         uint64_t noc_dest_addr = get_noc_addr_helper(dest_noc_xy, sem_addr);
 
         auto packet_header = reinterpret_cast<volatile tt_l1_ptr PACKET_HEADER_TYPE*>(header_rb);
-        packet_header->to_noc_unicast_atomic_inc(tt::tt_fabric::NocUnicastAtomicIncCommandHeader{
-            noc_dest_addr,
-            n,
-            std::numeric_limits<uint16_t>::max(),
-        });
+        packet_header->to_noc_unicast_atomic_inc(tt::tt_fabric::NocUnicastAtomicIncCommandHeader{noc_dest_addr, n});
         tt::tt_fabric::fabric_atomic_inc<mux_num_buffers_per_channel>(edm, packet_header);
 #else
-        noc_semaphore_inc(get_noc_addr_helper(dest_noc_xy, get_semaphore<fd_core_type>(dest_sem_id)), n, noc_idx);
+        noc_semaphore_inc(get_noc_addr_helper(dest_noc_xy, get_semaphore<programmable_core_type>(dest_sem_id)), n, noc_idx);
+#endif
+    }
+
+    // Version of release_pages with cmd_ptr tracking for synchronization assertions.
+    // Template parameters specify the buffer geometry for validation.
+    template <
+        uint8_t noc_idx,
+        uint32_t dest_noc_xy,
+        uint32_t dest_sem_id,
+        uint32_t buffer_base,
+        uint32_t buffer_end,
+        uint32_t buffer_page_size>
+    FORCE_INLINE void release_pages(uint32_t n, uint32_t cmd_ptr) {
+        release_pages<noc_idx, dest_noc_xy, dest_sem_id>(n);
+
+#if ASSERT_ENABLED
+        if constexpr (buffer_page_size != 0) {
+            constexpr uint32_t buffer_size = buffer_end - buffer_base;
+            if constexpr (buffer_size != 0) {
+                if (n != 0) {
+                    // In the middle of processing, cmd_ptr may not be aligned to page size, but
+                    // must always be past the number of pages released.
+                    uint64_t bytes = n * buffer_page_size;
+                    uint32_t expected = watch_released_ptr_ + bytes;
+                    if (expected > buffer_end) {
+                        expected -= buffer_size;
+                    }
+
+                    // It's possible the cmd_ptr wrapped and the expected pointer is at the very end of the buffer
+                    ASSERT((cmd_ptr == expected) || ((expected == buffer_end) && (cmd_ptr == buffer_base)));
+                    watch_released_ptr_ = expected;
+                }
+            }
+        }
 #endif
     }
 
@@ -248,7 +261,7 @@ public:
         uint32_t downstream_sem_id,
         bool wait,
         uint8_t downstream_cmd_buf>
-    FORCE_INLINE void write_atomic_inc_any_len(uint32_t data_ptr, uint64_t dst_ptr, uint32_t length, uint16_t n) {
+    FORCE_INLINE void write_atomic_inc_any_len(uint32_t data_ptr, uint64_t dst_ptr, uint32_t length, uint32_t n) {
 #if defined(FABRIC_RELAY)
         // Writing to a HEADER only buffer is wrong. This function requires a FULL SIZE buffer
         ASSERT(mux_channel_buffer_size_bytes > sizeof(PACKET_HEADER_TYPE));
@@ -268,10 +281,7 @@ public:
 
         packet_header->to_noc_fused_unicast_write_atomic_inc(
             tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{
-                dst_ptr,
-                get_noc_addr_helper(downstream_noc_xy, get_semaphore<fd_core_type>(downstream_sem_id)),
-                n,
-                std::numeric_limits<uint16_t>::max()},
+                dst_ptr, get_noc_addr_helper(downstream_noc_xy, get_semaphore<programmable_core_type>(downstream_sem_id)), n},
             length);
 
         tt::tt_fabric::fabric_async_write<mux_num_buffers_per_channel>(edm, packet_header, data_ptr, length);

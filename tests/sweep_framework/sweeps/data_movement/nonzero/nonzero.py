@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -12,7 +12,7 @@ from tests.sweep_framework.sweep_utils.utils import gen_shapes, sanitize_shape_r
 from tests.tt_eager.python_api_testing.sweep_tests.generation_funcs import gen_func_with_cast_tt
 
 from tests.ttnn.utils_for_testing import check_with_pcc, start_measuring_time, stop_measuring_time
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 
 # Override the default timeout in seconds for hang detection.
 TIMEOUT = 30
@@ -43,10 +43,8 @@ parameters = {
 
 
 def invalidate_vector(test_vector) -> Tuple[bool, Optional[str]]:
-    if test_vector["input_layout"] == ttnn.TILE_LAYOUT:
-        return True, "Input tensor must be in row major layout"
     if test_vector["input_layout"] == ttnn.ROW_MAJOR_LAYOUT and test_vector["input_a_dtype"] == ttnn.bfloat8_b:
-        return True, "bfloat8_b is only supported on tiled layout"
+        return True, "bfloat8_b is only supported in tiled layout"
     return False, None
 
 
@@ -71,7 +69,6 @@ def run(
 
     torch_output_tensor = torch.nonzero(torch_input_tensor_a, as_tuple=False)
     torch_num_nonzero = torch_output_tensor.shape[0]
-    torch_output_tensor = torch_output_tensor[:, 3].reshape(-1, 1)
 
     input_tensor_a = ttnn.from_torch(
         torch_input_tensor_a,
@@ -85,8 +82,8 @@ def run(
     output_indices, output_tensor = ttnn.nonzero(input_tensor_a, memory_config=output_memory_config)
     e2e_perf = stop_measuring_time(start_time)
 
-    num_nonzero = ttnn.to_torch(output_indices)[0, 0, 0, 0].item()
-    output_tensor = ttnn.to_torch(output_tensor)[0, 0, 0, :num_nonzero].reshape(-1, 1)
+    num_nonzero = int(ttnn.to_torch(output_indices)[0, 0, 0, 0].item())
+    output_tensor = ttnn.to_torch(output_tensor)[0, 0, 0, : num_nonzero * 4].reshape(num_nonzero, 4)
 
     if num_nonzero != torch_num_nonzero:
         return [

@@ -1,11 +1,11 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
 
 from transformers import BloomForCausalLM
-from models.utility_functions import print_diff_argmax
+from models.common.utility_functions import print_diff_argmax
 from tests.tt_eager.python_api_testing.sweep_tests.comparison_funcs import comp_pcc
 
 from loguru import logger
@@ -15,6 +15,7 @@ import models.experimental.bloom_old.tt.bloom_mlp as bloom_mlp
 
 def run_bloom_mlp_test(device):
     # Prepare input
+    # NOTE(transformers-5.x): `torchscript=` was removed from transformers configs in 5.x; drop it (a default no-op) when running this experimental model under 5.x.
     hugging_bloom_reference_model = BloomForCausalLM.from_pretrained("bigscience/bloom-560m", torchscript=False)
     hugging_bloom_reference_model.eval()
 

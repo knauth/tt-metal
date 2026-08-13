@@ -1,13 +1,12 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/tile_move_copy.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/tile_move_copy.h"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     constexpr auto cb_in0 = tt::CBIndex::c_0;
     constexpr auto cb_in1 = tt::CBIndex::c_1;
     constexpr auto cb_out0 = tt::CBIndex::c_16;
@@ -17,8 +16,8 @@ void MAIN {
     // output circular buffer. Which is then picked up by the writer kernel and written back to DRAM.
 
     // Metalium API Calls                              Involved Cores
-    binary_op_init_common(cb_in0, cb_in1, cb_out0);  // Unpack, Math, Pack
-    add_tiles_init(cb_in0, cb_in1);                  // Unpack, Math
+    compute_kernel_hw_startup(cb_in0, cb_in1, cb_out0);  // Unpack, Math, Pack
+    add_init(cb_in0, cb_in1);                  // Unpack, Math
 
     // wait for a tile to be ready in the input CBs
     cb_wait_front(cb_in0, 1);  // Unpack
@@ -49,4 +48,3 @@ void MAIN {
 
     cb_push_back(cb_out0, 1);  // Pack
 }
-}  // namespace NAMESPACE

@@ -1,57 +1,34 @@
 #!/bin/bash
 
-run_tg_llama3_tests() {
-  # Record the start time
-  fail=0
-  start_time=$(date +%s)
-
-  echo "LOG_METAL: Running run_tg_llama3_tests"
-
-  # Llama3.3-70B
-  llama70b=/mnt/MLPerf/tt_dnn-models/llama/Llama3.3-70B-Instruct/
-
-  # Run all Llama3 tests for 8B, 1B, and 3B weights
-  # for llama_dir in "$llama1b" "$llama3b" "$llama8b" "$llama11b" "$llama70b"; do
-  for llama_dir in "$llama70b"; do
-    LLAMA_DIR=$llama_dir FAKE_DEVICE=TG pytest --timeout 1800 -n auto models/demos/llama3_70b_galaxy/tests/test_llama_model_nd.py --timeout=1800 ; fail+=$?
-    LLAMA_DIR=$llama_dir FAKE_DEVICE=TG pytest --timeout 1800 -n auto models/demos/llama3_70b_galaxy/tests/test_llama_model.py -k full --timeout=1800 ; fail+=$?
-    echo "LOG_METAL: Llama3 tests for $llama_dir completed"
-  done
-
-  # Record the end time
-  end_time=$(date +%s)
-  duration=$((end_time - start_time))
-  echo "LOG_METAL: run_tg_llama3_tests $duration seconds to complete"
-  if [[ $fail -ne 0 ]]; then
-    exit 1
-  fi
-}
-
 run_tg_tests() {
 
-  if [[ "$1" == "llama3" ]]; then
-    echo "LOG_METAL: running Llama3 run_tg_frequent_tests"
-    run_tg_llama3_tests
-
-  elif [[ "$1" == "resnet50" ]]; then
-    echo "LOG_METAL: running resnet50 run_tg_frequent_tests"
-    pytest -n auto models/demos/tg/resnet50/tests/test_resnet50_performant.py ; fail+=$?
-
-  elif [[ "$1" == "unit" ]]; then
+  if [[ "$1" == "unit" ]]; then
     echo "LOG_METAL: running unit/distributed run_tg_frequent_tests"
-    ## Force IRAM enabled because these tests mixes fabric and non-fabric ccl tests. The IRAM setting must be consistent
-    ## due to the erisc kernel wrapper being affected, and that kernel being persistent through the workload.
-    ## The jit build also has different behaviour for IRAM enabled/disabled so we enable it globally.
-    TT_METAL_ENABLE_ERISC_IRAM=1 pytest -n auto tests/ttnn/distributed/test_data_parallel_example_TG.py --timeout=900 ; fail+=$?
-    TT_METAL_ENABLE_ERISC_IRAM=1 pytest -n auto tests/ttnn/distributed/test_multidevice_TG.py --timeout=900 ; fail+=$?
-    TT_METAL_ENABLE_ERISC_IRAM=1 pytest -n auto tests/ttnn/unit_tests/test_multi_device_trace_TG.py --timeout=900 ; fail+=$?
-    TT_METAL_ENABLE_ERISC_IRAM=1 pytest -n auto tests/ttnn/unit_tests/operations/ccl/test_all_gather_TG_post_commit.py --timeout=300 ; fail+=$?
-    TT_METAL_ENABLE_ERISC_IRAM=1 pytest -n auto tests/ttnn/unit_tests/operations/ccl/test_all_to_all_dispatch_TG.py --timeout=500 ; fail+=$?
-    TT_METAL_ENABLE_ERISC_IRAM=1 pytest -n auto tests/ttnn/unit_tests/operations/ccl/test_all_to_all_combine_TG.py --timeout=500 ; fail+=$?
+    ## ERISC IRAM is always on for WH; these tests mix fabric and non-fabric CCL and rely on consistent jit/build behavior.
+    pytest tests/ttnn/distributed/test_data_parallel_example_TG.py --timeout=900 ; fail+=$?
+    pytest tests/ttnn/distributed/test_multidevice_TG.py --timeout=900 ; fail+=$?
+    pytest tests/ttnn/unit_tests/base_functionality/test_multi_device_trace_TG.py --timeout=900 ; fail+=$?
 
-  elif [[ "$1" == "sd35" ]]; then
-    echo "LOG_METAL: running stable diffusion 3.5 Large run_tg_frequent_tests"
-    pytest -n auto models/experimental/stable_diffusion_35_large/tests/test_fun_transformer_block.py -k "tg_cfg2_sp4_tp4" ; fail+=$?
+  elif [[ "$1" == "motif" ]]; then
+    echo "LOG_METAL: running Motif run_tg_frequent_tests"
+    HF_HUB_CACHE=/mnt/MLPerf/huggingface/hub pytest models/tt_dit/tests/models/motif/test_attention_motif.py::test_attention_motif -k "4x" --timeout=300; fail+=$?
+    HF_HUB_CACHE=/mnt/MLPerf/huggingface/hub pytest models/tt_dit/tests/models/motif/test_transformer_block_motif.py::test_transformer_block_motif -k "4x" --timeout=300; fail+=$?
+
+  elif [[ "$1" == "wan22" ]]; then # Wan2.2 I2V and T2V
+    echo "LOG_METAL: running Wan2.2 run_tg_frequent_tests"
+    export TT_DIT_CACHE_DIR="/tmp/TT_DIT_CACHE"
+    pytest models/tt_dit/tests/encoders/umt5/test_umt5.py -k "wh_glx" ; fail+=$?
+    pytest models/tt_dit/tests/unit/test_embeddings.py::test_wan_time_text_image_embedding  -k "wh_glx" ; fail+=$?
+
+  elif [[ "$1" == "qwenimage" ]]; then
+    echo "LOG_METAL: running QwenImage run_tg_frequent_tests"
+    pytest models/tt_dit/tests/encoders/qwen25vl/test_qwen25vl.py::test_qwen25vl_encoder_pair -k "4x8"; fail+=$?
+
+  elif [[ "$1" == "mochi" ]]; then
+    echo "LOG_METAL: running mochi run_tg_frequent_tests"
+    ARCH_NAME=wormhole_b0 FAKE_DEVICE=TG pytest models/tt_dit/tests/models/mochi/test_vae_mochi.py -k "(decoder and wh_8x4 and load_dit and large_latent) or conv3d_1x1x1 or (wh_8x4 and l768 and bf16)" --timeout=1500; fail+=$?
+    ARCH_NAME=wormhole_b0 pytest models/tt_dit/tests/models/mochi/test_attention_mochi.py -k "short_seq and 4x8"; fail+=$?
+    ARCH_NAME=wormhole_b0 pytest models/tt_dit/tests/models/mochi/test_transformer_mochi.py -k "4x8 and short_seq and not yes_load_cache and not model_caching"; fail+=$?
 
   else
     echo "LOG_METAL: Unknown model type: $1"
@@ -60,7 +37,7 @@ run_tg_tests() {
 
   if [[ $fail -ne 0 ]]; then
     echo "LOG_METAL: run_tg_frequent_tests failed"
-    # exit 1
+    exit 1
   fi
 
 }
@@ -68,11 +45,6 @@ run_tg_tests() {
 main() {
   if [[ -z "$TT_METAL_HOME" ]]; then
     echo "Must provide TT_METAL_HOME in environment" 1>&2
-    exit 1
-  fi
-
-  if [[ -z "$ARCH_NAME" ]]; then
-    echo "Must provide ARCH_NAME in environment" 1>&2
     exit 1
   fi
 

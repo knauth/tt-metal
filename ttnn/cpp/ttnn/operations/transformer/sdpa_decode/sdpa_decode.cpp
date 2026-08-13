@@ -1,18 +1,24 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "sdpa_decode.hpp"
 
+#include <cstdint>
+#include <optional>
 #include <utility>
 
-#include "device/sdpa_decode_op.hpp"
-#include "ttnn/common/queue_id.hpp"
-#include "ttnn/run_operation.hpp"
+#include <tt-logger/tt-logger.hpp>
 
+#include "device/sdpa_decode_device_operation.hpp"
+#include "ttnn/operation.hpp"
+#include "ttnn/device.hpp"
 using namespace tt::tt_metal;
 
 namespace {
+constexpr uint32_t kDefaultDecodeChunkSize = 32;
+constexpr uint32_t kDefaultMaxCoresPerHeadBatch = 1;
+
 inline uint32_t get_chunk_size(uint32_t s) {
     /*
     # find maximum power of 2 divisor of s
@@ -30,10 +36,9 @@ inline uint32_t get_chunk_size(uint32_t s) {
 }
 }  // namespace
 
-namespace ttnn::operations::transformer {
+namespace ttnn::transformer {
 
-ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
-    QueueId queue_id,
+ttnn::Tensor scaled_dot_product_attention_decode(
     const ttnn::Tensor& input_tensor_q,
     const ttnn::Tensor& input_tensor_k,
     const ttnn::Tensor& input_tensor_v,
@@ -41,13 +46,16 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
     const std::optional<const Tensor>& attn_mask,
     const std::vector<uint32_t>& cur_pos,
     const std::optional<const Tensor>& cur_pos_tensor,
+    const std::optional<const Tensor>& attention_sink,
     std::optional<float> scale,
+    std::optional<uint32_t> sliding_window_size,
     const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
-                    ? input_tensor_q.device()->arch()
-                    : ttnn::operations::experimental::auto_format::AutoFormat::GetDefaultDevice()->arch();
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+    std::optional<bool> share_cache) {
+    [[maybe_unused]] auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
+                                     ? input_tensor_q.device()->arch()
+                                     : ttnn::GetDefaultDevice()->arch();
     uint32_t s = input_tensor_k.logical_shape()[-2];
     uint32_t k_chunk_size = get_chunk_size(s);
     if (program_config.has_value() && program_config.value().k_chunk_size > 0) {
@@ -67,54 +75,30 @@ ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
 
     // get chunk size and then pass to sdpa decode as an attribute for prgm cache
     auto kernel_config_val = init_device_compute_kernel_config(
-        input_tensor_q.device()->arch(), compute_kernel_config, MathFidelity::HiFi2, true, false, false);
-
-    return operation::run(
-               ScaledDotProductAttentionDecode{
-                   .is_causal = is_causal,
-                   .cur_pos = cur_pos,
-                   .scale = scale,
-                   .output_mem_config = memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
-                   .program_config = program_config,
-                   .compute_kernel_config = kernel_config_val,
-                   .k_chunk_size = k_chunk_size,
-                   .paged_attention = false},
-               {input_tensor_q, input_tensor_k, input_tensor_v},
-               {cur_pos_tensor, std::nullopt, attn_mask},
-               {},
-               queue_id)
-        .at(0);
-}
-
-ttnn::Tensor ExecuteScaledDotProductAttentionDecode::invoke(
-    const ttnn::Tensor& input_tensor_q,
-    const ttnn::Tensor& input_tensor_k,
-    const ttnn::Tensor& input_tensor_v,
-    const bool is_causal,
-    const std::optional<const Tensor>& attn_mask,
-    const std::vector<uint32_t>& cur_pos,
-    const std::optional<const Tensor>& cur_pos_tensor,
-    std::optional<float> scale,
-    const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    return invoke(
-        DefaultQueueId,
+        input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
+    return ttnn::prim::sdpa_decode(
         input_tensor_q,
         input_tensor_k,
         input_tensor_v,
-        is_causal,
-        attn_mask,
-        cur_pos,
         cur_pos_tensor,
+        std::nullopt,
+        attn_mask,
+        attention_sink,
+        is_causal,
+        false,
+        cur_pos,
         scale,
-        memory_config,
-        std::move(program_config),
-        compute_kernel_config);
+        sliding_window_size,
+        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
+        program_config,
+        kernel_config_val,
+        k_chunk_size,
+        share_cache,
+        std::nullopt,
+        std::nullopt);
 }
 
-ttnn::Tensor ExecutePagedScaledDotProductAttentionDecode::invoke(
-    QueueId queue_id,
+ttnn::Tensor paged_scaled_dot_product_attention_decode(
     const ttnn::Tensor& input_tensor_q,
     const ttnn::Tensor& input_tensor_k,
     const ttnn::Tensor& input_tensor_v,
@@ -122,14 +106,36 @@ ttnn::Tensor ExecutePagedScaledDotProductAttentionDecode::invoke(
     const bool is_causal,
     const std::optional<const Tensor>& attn_mask,
     const std::optional<const Tensor>& cur_pos_tensor,
+    const std::optional<const Tensor>& attention_sink,
     std::optional<float> scale,
+    std::optional<uint32_t> sliding_window_size,
     const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
-                    ? input_tensor_q.device()->arch()
-                    : ttnn::operations::experimental::auto_format::AutoFormat::GetDefaultDevice()->arch();
-    uint32_t s = input_tensor_k.logical_shape()[-2];
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
+    std::optional<DeviceComputeKernelConfig> compute_kernel_config,
+    std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry,
+    std::optional<uint32_t> cache_position_modulo) {
+    [[maybe_unused]] auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
+                                     ? input_tensor_q.device()->arch()
+                                     : ttnn::GetDefaultDevice()->arch();
+
+    if (!program_config.has_value()) {
+        program_config = ttnn::operations::transformer::SDPAProgramConfig{
+            input_tensor_q.device()->compute_with_storage_grid_size(),
+            std::nullopt,
+            kDefaultDecodeChunkSize,
+            kDefaultDecodeChunkSize,
+            std::nullopt,
+            kDefaultMaxCoresPerHeadBatch};
+        log_debug(
+            tt::LogOp,
+            "Paged SDPA decode default config: grid={}x{}, q_chunk_size={}, k_chunk_size={}, "
+            "max_cores_per_head_batch={}",
+            program_config->compute_with_storage_grid_size.x,
+            program_config->compute_with_storage_grid_size.y,
+            program_config->q_chunk_size,
+            program_config->k_chunk_size,
+            program_config->max_cores_per_head_batch);
+    }
 
     // Use k_chunk_size as override; if k_chunk_size == 0, figure it out in kernels
     // uint32_t k_chunk_size = get_chunk_size(s);
@@ -146,68 +152,50 @@ ttnn::Tensor ExecutePagedScaledDotProductAttentionDecode::invoke(
 
     // get chunk size and then pass to sdpa decode as an attribute for prgm cache
     auto kernel_config_val = init_device_compute_kernel_config(
-        input_tensor_q.device()->arch(), compute_kernel_config, MathFidelity::HiFi2, true, false, false);
+        input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
-    return operation::run(
-               ScaledDotProductAttentionDecode{
-                   .is_causal = is_causal,
-                   .cur_pos = std::vector<uint32_t>(),
-                   .scale = scale,
-                   .output_mem_config = memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
-                   .program_config = program_config,
-                   .compute_kernel_config = kernel_config_val,
-                   .k_chunk_size = k_chunk_size,
-                   .paged_attention = true},
-               {input_tensor_q, input_tensor_k, input_tensor_v},
-               {cur_pos_tensor, page_table_tensor, attn_mask},
-               {},
-               queue_id)
-        .at(0);
-}
-
-ttnn::Tensor ExecutePagedScaledDotProductAttentionDecode::invoke(
-    const ttnn::Tensor& input_tensor_q,
-    const ttnn::Tensor& input_tensor_k,
-    const ttnn::Tensor& input_tensor_v,
-    const ttnn::Tensor& page_table_tensor,
-    const bool is_causal,
-    const std::optional<const Tensor>& attn_mask,
-    const std::optional<const Tensor>& cur_pos_tensor,
-    std::optional<float> scale,
-    const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    return invoke(
-        DefaultQueueId,
+    return ttnn::prim::sdpa_decode(
         input_tensor_q,
         input_tensor_k,
         input_tensor_v,
-        page_table_tensor,
-        is_causal,
-        attn_mask,
         cur_pos_tensor,
+        page_table_tensor,
+        attn_mask,
+        attention_sink,
+        is_causal,
+        true,
+        std::vector<uint32_t>(),
         scale,
-        memory_config,
-        std::move(program_config),
-        compute_kernel_config);
+        sliding_window_size,
+        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
+        program_config,
+        kernel_config_val,
+        k_chunk_size,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        paged_cache_geometry,
+        cache_position_modulo);
 }
 
-ttnn::Tensor ExecuteFlashMultiLatentAttentionDecode::invoke(
-    QueueId queue_id,
+ttnn::Tensor flash_multi_latent_attention_decode(
     const ttnn::Tensor& input_tensor_q,
     const ttnn::Tensor& input_tensor_k,
+    const std::optional<const Tensor>& input_tensor_v,
     const uint32_t head_dim_v,
     const bool is_causal,
     const std::optional<const Tensor>& attn_mask,
     const std::vector<uint32_t>& cur_pos,
     const std::optional<const Tensor>& cur_pos_tensor,
+    const std::optional<const Tensor>& attention_sink,
     std::optional<float> scale,
+    std::optional<uint32_t> sliding_window_size,
     const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
-                    ? input_tensor_q.device()->arch()
-                    : ttnn::operations::experimental::auto_format::AutoFormat::GetDefaultDevice()->arch();
+    [[maybe_unused]] auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
+                                     ? input_tensor_q.device()->arch()
+                                     : ttnn::GetDefaultDevice()->arch();
     uint32_t s = input_tensor_k.logical_shape()[-2];
     uint32_t k_chunk_size = get_chunk_size(s);
     if (program_config.has_value() && program_config.value().k_chunk_size > 0) {
@@ -225,73 +213,59 @@ ttnn::Tensor ExecuteFlashMultiLatentAttentionDecode::invoke(
             k_chunk_size);
     }
 
+    if (input_tensor_v.has_value()) {
+        TT_FATAL(
+            input_tensor_v.value().padded_shape()[-1] == head_dim_v,
+            "Head dimension of the V tensor must be equal to head_dim_v parameter value, got {} and {}",
+            input_tensor_v.value().padded_shape()[-1],
+            head_dim_v);
+    }
     // get chunk size and then pass to sdpa decode as an attribute for prgm cache
     auto kernel_config_val = init_device_compute_kernel_config(
-        input_tensor_q.device()->arch(), compute_kernel_config, MathFidelity::HiFi2, true, false, false);
+        input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
-    return operation::run(
-               ScaledDotProductAttentionDecode{
-                   .is_causal = is_causal,
-                   .cur_pos = cur_pos,
-                   .scale = scale,
-                   .output_mem_config = memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
-                   .program_config = program_config,
-                   .compute_kernel_config = kernel_config_val,
-                   .k_chunk_size = k_chunk_size,
-                   .paged_attention = false,
-                   .use_mla = true,
-                   .head_dim_v = head_dim_v},
-               {input_tensor_q, input_tensor_k},
-               {cur_pos_tensor, std::nullopt, attn_mask},
-               {},
-               queue_id)
-        .at(0);
-}
-
-ttnn::Tensor ExecuteFlashMultiLatentAttentionDecode::invoke(
-    const ttnn::Tensor& input_tensor_q,
-    const ttnn::Tensor& input_tensor_k,
-    const uint32_t head_dim_v,
-    const bool is_causal,
-    const std::optional<const Tensor>& attn_mask,
-    const std::vector<uint32_t>& cur_pos,
-    const std::optional<const Tensor>& cur_pos_tensor,
-    std::optional<float> scale,
-    const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    return invoke(
-        DefaultQueueId,
+    return ttnn::prim::sdpa_decode(
         input_tensor_q,
         input_tensor_k,
-        head_dim_v,
-        is_causal,
-        attn_mask,
-        cur_pos,
+        input_tensor_v,
         cur_pos_tensor,
+        std::nullopt,
+        attn_mask,
+        attention_sink,
+        is_causal,
+        false,
+        cur_pos,
         scale,
-        memory_config,
-        std::move(program_config),
-        compute_kernel_config);
+        sliding_window_size,
+        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
+        program_config,
+        kernel_config_val,
+        k_chunk_size,
+        std::nullopt,
+        true,
+        head_dim_v);
 }
 
-ttnn::Tensor ExecutePagedFlashMultiLatentAttentionDecode::invoke(
-    QueueId queue_id,
+ttnn::Tensor paged_flash_multi_latent_attention_decode(
     const ttnn::Tensor& input_tensor_q,
     const ttnn::Tensor& input_tensor_k,
+    const std::optional<const Tensor>& input_tensor_v,
     const uint32_t head_dim_v,
     const ttnn::Tensor& page_table_tensor,
     const bool is_causal,
     const std::optional<const Tensor>& attn_mask,
     const std::optional<const Tensor>& cur_pos_tensor,
+    const std::optional<const Tensor>& attention_sink,
     std::optional<float> scale,
+    std::optional<uint32_t> sliding_window_size,
     const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
+    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config,
     std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
-                    ? input_tensor_q.device()->arch()
-                    : ttnn::operations::experimental::auto_format::AutoFormat::GetDefaultDevice()->arch();
-    uint32_t s = input_tensor_k.logical_shape()[-2];
+    [[maybe_unused]] auto arch = input_tensor_q.storage_type() == StorageType::DEVICE
+                                     ? input_tensor_q.device()->arch()
+                                     : ttnn::GetDefaultDevice()->arch();
+    // NOTE: If V tensor is not provided, the operator assumes that V is subset of K in the hidden dimension.
+    // and V will be read from the K tensor buffer.
 
     // Use k_chunk_size as override; if k_chunk_size == 0, figure it out in kernels
     // uint32_t k_chunk_size = get_chunk_size(s);
@@ -306,54 +280,38 @@ ttnn::Tensor ExecutePagedFlashMultiLatentAttentionDecode::invoke(
         TT_FATAL(k_chunk_size % 32 == 0, "User provided k_chunk_size must be multiple of 32, got: {}", k_chunk_size);
     }
 
+    if (input_tensor_v.has_value()) {
+        TT_FATAL(
+            input_tensor_v.value().padded_shape()[-1] == head_dim_v,
+            "Head dimension of the V tensor must be equal to head_dim_v parameter value, got {} and {}",
+            input_tensor_v.value().padded_shape()[-1],
+            head_dim_v);
+    }
+
     // get chunk size and then pass to sdpa decode as an attribute for prgm cache
     auto kernel_config_val = init_device_compute_kernel_config(
-        input_tensor_q.device()->arch(), compute_kernel_config, MathFidelity::HiFi2, true, false, false);
+        input_tensor_q.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi2, true, false, false);
 
-    return operation::run(
-               ScaledDotProductAttentionDecode{
-                   .is_causal = is_causal,
-                   .cur_pos = std::vector<uint32_t>(),
-                   .scale = scale,
-                   .output_mem_config = memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
-                   .program_config = program_config,
-                   .compute_kernel_config = kernel_config_val,
-                   .k_chunk_size = k_chunk_size,
-                   .paged_attention = true,
-                   .use_mla = true,
-                   .head_dim_v = head_dim_v},
-               {input_tensor_q, input_tensor_k},
-               {cur_pos_tensor, page_table_tensor, attn_mask},
-               {},
-               queue_id)
-        .at(0);
-}
-
-ttnn::Tensor ExecutePagedFlashMultiLatentAttentionDecode::invoke(
-    const ttnn::Tensor& input_tensor_q,
-    const ttnn::Tensor& input_tensor_k,
-    const uint32_t head_dim_v,
-    const ttnn::Tensor& page_table_tensor,
-    const bool is_causal,
-    const std::optional<const Tensor>& attn_mask,
-    const std::optional<const Tensor>& cur_pos_tensor,
-    std::optional<float> scale,
-    const std::optional<MemoryConfig>& memory_config,
-    std::optional<SDPAProgramConfig> program_config,
-    std::optional<DeviceComputeKernelConfig> compute_kernel_config) {
-    return invoke(
-        DefaultQueueId,
+    return ttnn::prim::sdpa_decode(
         input_tensor_q,
         input_tensor_k,
-        head_dim_v,
-        page_table_tensor,
-        is_causal,
-        attn_mask,
+        input_tensor_v,
         cur_pos_tensor,
+        page_table_tensor,
+        attn_mask,
+        attention_sink,
+        is_causal,
+        true,
+        std::vector<uint32_t>(),
         scale,
-        memory_config,
-        std::move(program_config),
-        compute_kernel_config);
+        sliding_window_size,
+        memory_config.value_or(operation::DEFAULT_OUTPUT_MEMORY_CONFIG),
+        program_config,
+        kernel_config_val,
+        k_chunk_size,
+        std::nullopt,
+        true,
+        head_dim_v);
 }
 
-}  // namespace ttnn::operations::transformer
+}  // namespace ttnn::transformer

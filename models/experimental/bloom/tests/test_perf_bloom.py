@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,11 +6,7 @@ import torch
 from loguru import logger
 import pytest
 import ttnn
-from models.utility_functions import profiler
-from models.utility_functions import (
-    disable_persistent_kernel_cache,
-    enable_persistent_kernel_cache,
-)
+from models.common.utility_functions import profiler
 from models.perf.perf_utils import prep_perf_report
 
 from transformers import BloomForCausalLM, BloomTokenizerFast
@@ -24,7 +20,6 @@ BATCH_SIZE = 1
 
 
 def run_perf_bloom(expected_inference_time, expected_compile_time, device):
-    disable_persistent_kernel_cache()
     first_key = "first_iter"
     second_key = "second_iter"
     cpu_key = "ref_key"
@@ -32,6 +27,7 @@ def run_perf_bloom(expected_inference_time, expected_compile_time, device):
     tokenizer_name = "bigscience/bloom-560m"
     comments = "560M"
 
+    # NOTE(transformers-5.x): `torchscript=` was removed from transformers configs in 5.x; drop it (a default no-op) when running this experimental model under 5.x.
     HF_model_top = BloomForCausalLM.from_pretrained(model_name, torchscript=False)
     HF_model_top.eval()
 
@@ -60,8 +56,6 @@ def run_perf_bloom(expected_inference_time, expected_compile_time, device):
         ttnn.synchronize_device(device)
         profiler.end(first_key)
         del tt_output
-
-        enable_persistent_kernel_cache()
 
         profiler.start(second_key)
         tt_output = tt_model.forward(device, input_ids)

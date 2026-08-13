@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -39,6 +39,13 @@ enum class ClusterType : std::uint8_t {
     SIMULATOR_BLACKHOLE = 11,    // Simulator Blackhole
     N300_2x2 = 12,               // 2 N300 cards, ethernet connected to form 2x2
     P150_X8 = 13,                // 8 Blackhole single card, ethernet connected
+    P300 = 14,                   // Production P300
+    SIMULATOR_QUASAR = 15,       // Simulator Quasar
+    BLACKHOLE_GALAXY = 16,       // Blackhole Galaxy, all chips with mmio
+    P300_X2 = 17,                // 2 P300 cards
+    CUSTOM = 18,  // Custom cluster type, used boards with custom fabric mesh graph descriptor path specified
+    // NOTE:
+    // ttnn/cpp/ttnn-nanobind/cluster.cpp needs to be kept in sync with this enum class.
 };
 
 /**

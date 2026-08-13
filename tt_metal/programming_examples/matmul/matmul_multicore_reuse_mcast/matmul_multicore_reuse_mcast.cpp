@@ -1,17 +1,16 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/constants.hpp>
-#include <tt-metalium/util.hpp>
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/tilize_utils.hpp>
-#include <tt-metalium/command_queue.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/tt_metal.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
-#include <matmul_common/bmm_op.hpp>
+#include <tt-metalium/distributed.hpp>
+#include <bmm_op.hpp>
 #include <algorithm>
 #include "tt-metalium/core_coord.hpp"
 
@@ -19,6 +18,10 @@ using namespace tt::constants;
 using namespace std;
 using namespace tt;
 using namespace tt::tt_metal;
+
+#ifndef OVERRIDE_KERNEL_PREFIX
+#define OVERRIDE_KERNEL_PREFIX ""
+#endif
 
 void golden_matmul(
     std::vector<bfloat16>& a,
@@ -43,7 +46,7 @@ void golden_matmul(
             idx_b = j;
             c_f = 0;
             for (int k_m = 0; k_m < K; k_m++) {
-                float_tmp = a[idx_a].to_float() * b[idx_b].to_float();
+                float_tmp = static_cast<float>(a[idx_a]) * static_cast<float>(b[idx_b]);
                 c_f += float_tmp;
                 idx_a += 1;
                 idx_b += N;
@@ -62,20 +65,22 @@ void matmul_multicore_reuse_mcast(
     uint32_t N,
     uint32_t K,
     uint32_t B,
-    IDevice* device) {
+    std::shared_ptr<distributed::MeshDevice>& mesh_device) {
     /*
      * Setup program to execute along with its buffers and kernels to use
      * Core range is just single core
      */
-    CommandQueue& cq = device->command_queue();
+    distributed::MeshCommandQueue& cq = mesh_device->mesh_command_queue();
+    distributed::MeshWorkload workload;
+    distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
     Program program{};
 
     tt::DataFormat cb_data_format = tt::DataFormat::Float16_b;
     MathFidelity math_fidelity = MathFidelity::HiFi4;
-    uint32_t single_tile_size = detail::TileSize(cb_data_format);
+    uint32_t single_tile_size = tt::tile_size(cb_data_format);
     // uint32_t single_tile_size = 2 * 1024;
 
-    auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
+    auto compute_with_storage_grid_size = mesh_device->compute_with_storage_grid_size();
     uint32_t num_cores_x = compute_with_storage_grid_size.x;
     uint32_t num_cores_y = compute_with_storage_grid_size.y;
 
@@ -87,9 +92,6 @@ void matmul_multicore_reuse_mcast(
     uint32_t Mt = M / TILE_HEIGHT;
     uint32_t Kt = K / TILE_WIDTH;
     uint32_t Nt = N / TILE_WIDTH;
-    uint32_t KtNt = Kt * Nt;
-    uint32_t MtKt = Mt * Kt;
-    uint32_t MtNt = Mt * Nt;
 
     // NOTE: Only supports matmuls where output is blocks of 16 x 16 tiles (ie. multiples of 16*32 x 16*32)
     // NOTE: Maximum number of tiles in output is 120 * 16^2 = 30,720 (eg. [1, 1, 5120, 6144])2
@@ -213,30 +215,15 @@ void matmul_multicore_reuse_mcast(
         single_tile_size * Nt * Kt;  // num_tiles of FP16_B, hard-coded in the reader/writer kernels
     uint32_t dram_buffer_C_size =
         single_tile_size * Mt * Nt;  // num_tiles of FP16_B, hard-coded in the reader/writer kernels
-    tt_metal::InterleavedBufferConfig dram_config_A{
-        .device = device,
-        .size = dram_buffer_A_size,
-        .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM};
+    distributed::ReplicatedBufferConfig buffer_config_A{.size = dram_buffer_A_size};
+    distributed::ReplicatedBufferConfig buffer_config_B{.size = dram_buffer_B_size};
+    distributed::ReplicatedBufferConfig buffer_config_C{.size = dram_buffer_C_size};
+    distributed::DeviceLocalBufferConfig dram_config{
+        .page_size = single_tile_size, .buffer_type = tt_metal::BufferType::DRAM};
 
-    tt_metal::InterleavedBufferConfig dram_config_B{
-        .device = device,
-        .size = dram_buffer_B_size,
-        .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM};
-
-    tt_metal::InterleavedBufferConfig dram_config_C{
-        .device = device,
-        .size = dram_buffer_C_size,
-        .page_size = single_tile_size,
-        .buffer_type = tt_metal::BufferType::DRAM};
-
-    auto src0_dram_buffer = CreateBuffer(dram_config_A);
-    auto src1_dram_buffer = CreateBuffer(dram_config_B);
-    auto dst_dram_buffer = CreateBuffer(dram_config_C);
-    uint32_t src0_addr = src0_dram_buffer->address();
-    uint32_t src1_addr = src1_dram_buffer->address();
-    uint32_t dst_addr = dst_dram_buffer->address();
+    auto src0_dram_buffer = distributed::MeshBuffer::create(buffer_config_A, dram_config, mesh_device.get());
+    auto src1_dram_buffer = distributed::MeshBuffer::create(buffer_config_B, dram_config, mesh_device.get());
+    auto dst_dram_buffer = distributed::MeshBuffer::create(buffer_config_C, dram_config, mesh_device.get());
 
     /*
      * Config of Circular Buffer in the device L1
@@ -245,12 +232,12 @@ void matmul_multicore_reuse_mcast(
     uint32_t src0_cb_index = CBIndex::c_0;  // 0
     CircularBufferConfig cb_src0_config = CircularBufferConfig(in0_CB_size, {{src0_cb_index, cb_data_format}})
                                               .set_page_size(src0_cb_index, single_tile_size);
-    auto cb_src0 = tt_metal::CreateCircularBuffer(program, all_cores, cb_src0_config);
+    tt_metal::CreateCircularBuffer(program, all_cores, cb_src0_config);
 
     uint32_t src1_cb_index = CBIndex::c_1;  // 1
     CircularBufferConfig cb_src1_config = CircularBufferConfig(in1_CB_size, {{src1_cb_index, cb_data_format}})
                                               .set_page_size(src1_cb_index, single_tile_size);
-    auto cb_src1 = tt_metal::CreateCircularBuffer(program, all_cores, cb_src1_config);
+    tt_metal::CreateCircularBuffer(program, all_cores, cb_src1_config);
 
     uint32_t output_cb_index = tt::CBIndex::c_16;
     uint32_t interm0_cb_index = 24;
@@ -259,7 +246,7 @@ void matmul_multicore_reuse_mcast(
     CircularBufferConfig cb_output_config = CircularBufferConfig(out_CB_size, output_cb_data_format_spec)
                                                 .set_page_size(output_cb_index, single_tile_size)
                                                 .set_page_size(interm0_cb_index, single_tile_size);
-    auto cb_output = tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}), cb_output_config);
+    tt_metal::CreateCircularBuffer(program, CoreRangeSet({all_cores}), cb_output_config);
 
     ////////////////////////////
     /*
@@ -279,7 +266,7 @@ void matmul_multicore_reuse_mcast(
 
     auto mm_reader_kernel_in0_sender_in1_sender_id = tt_metal::CreateKernel(
         program,
-        "tt_metal/programming_examples/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_sender_in1_sender.cpp",
+        OVERRIDE_KERNEL_PREFIX "matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_sender_in1_sender.cpp",
         in0_sender_in1_sender,
         tt_metal::DataMovementConfig{
             .processor = tt_metal::DataMovementProcessor::RISCV_1,
@@ -288,8 +275,7 @@ void matmul_multicore_reuse_mcast(
 
     auto mm_reader_kernel_in0_sender_in1_receiver_id = tt_metal::CreateKernel(
         program,
-        "tt_metal/programming_examples/matmul_common/kernels/dataflow/"
-        "reader_bmm_tile_layout_in0_sender_in1_receiver.cpp",
+        OVERRIDE_KERNEL_PREFIX "matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_sender_in1_receiver.cpp",
         in0_sender_in1_receiver,
         tt_metal::DataMovementConfig{
             .processor = tt_metal::DataMovementProcessor::RISCV_1,
@@ -298,8 +284,7 @@ void matmul_multicore_reuse_mcast(
 
     auto mm_reader_kernel_in0_receiver_in1_sender_id = tt_metal::CreateKernel(
         program,
-        "tt_metal/programming_examples/matmul_common/kernels/dataflow/"
-        "reader_bmm_tile_layout_in0_receiver_in1_sender.cpp",
+        OVERRIDE_KERNEL_PREFIX "matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_receiver_in1_sender.cpp",
         in0_receiver_in1_sender,
         tt_metal::DataMovementConfig{
             .processor = tt_metal::DataMovementProcessor::RISCV_1,
@@ -308,8 +293,7 @@ void matmul_multicore_reuse_mcast(
 
     auto mm_reader_kernel_in0_receiver_in1_receiver_id = tt_metal::CreateKernel(
         program,
-        "tt_metal/programming_examples/matmul_common/kernels/dataflow/"
-        "reader_bmm_tile_layout_in0_receiver_in1_receiver.cpp",
+        OVERRIDE_KERNEL_PREFIX "matmul/matmul_common/kernels/dataflow/reader_bmm_tile_layout_in0_receiver_in1_receiver.cpp",
         in0_receiver_in1_receiver,
         tt_metal::DataMovementConfig{
             .processor = tt_metal::DataMovementProcessor::RISCV_1,
@@ -318,7 +302,7 @@ void matmul_multicore_reuse_mcast(
 
     auto unary_writer_kernel_noc0_id = tt_metal::CreateKernel(
         program,
-        "tt_metal/programming_examples/matmul_common/kernels/dataflow/writer_bmm_tile_layout.cpp",
+        OVERRIDE_KERNEL_PREFIX "matmul/matmul_common/kernels/dataflow/writer_bmm_tile_layout.cpp",
         all_except_left_column,
         tt_metal::DataMovementConfig{
             .processor = tt_metal::DataMovementProcessor::RISCV_0,
@@ -327,7 +311,7 @@ void matmul_multicore_reuse_mcast(
 
     auto unary_writer_kernel_noc1_id = tt_metal::CreateKernel(
         program,
-        "tt_metal/programming_examples/matmul_common/kernels/dataflow/writer_bmm_tile_layout.cpp",
+        OVERRIDE_KERNEL_PREFIX "matmul/matmul_common/kernels/dataflow/writer_bmm_tile_layout.cpp",
         left_column,
         tt_metal::DataMovementConfig{
             .processor = tt_metal::DataMovementProcessor::RISCV_0,
@@ -335,9 +319,9 @@ void matmul_multicore_reuse_mcast(
             .compile_args = writer_compile_time_args});
 
     // Create compute kernel
-    auto mm_kernel_id = tt_metal::CreateKernel(
+    tt_metal::CreateKernel(
         program,
-        "tt_metal/programming_examples/matmul_common/kernels/compute/bmm_large_block_zm.cpp",
+        OVERRIDE_KERNEL_PREFIX "matmul/matmul_common/kernels/compute/bmm_large_block_zm.cpp",
         all_cores,
         tt_metal::ComputeConfig{.math_fidelity = math_fidelity, .compile_args = compute_kernel_args});
 
@@ -349,8 +333,6 @@ void matmul_multicore_reuse_mcast(
     /*
      * Kernels - Runtime arguments
      */
-    std::vector<KernelHandle> reader_kernel_ids;
-    std::vector<KernelHandle> writer_kernel_ids;
     for (int core_idx_y = 0; core_idx_y < num_cores_r; core_idx_y++) {
         for (int core_idx_x = 0; core_idx_x < num_cores_c; core_idx_x++) {
             CoreCoord core = {(std::size_t)start_core_x + core_idx_x, (std::size_t)start_core_y + core_idx_y};
@@ -362,12 +344,12 @@ void matmul_multicore_reuse_mcast(
             CoreCoord top_core_plus_one = {(std::size_t)core.x, (std::size_t)start_core_y + 1};
             CoreCoord bottom_core = {(std::size_t)core.x, (std::size_t)start_core_y + num_cores_r - 1};
 
-            auto left_core_physical = device->worker_core_from_logical_core(left_core);
-            auto left_core_plus_one_physical = device->worker_core_from_logical_core(left_core_plus_one);
-            auto right_core_physical = device->worker_core_from_logical_core(right_core);
-            auto top_core_physical = device->worker_core_from_logical_core(top_core);
-            auto top_core_plus_one_physical = device->worker_core_from_logical_core(top_core_plus_one);
-            auto bottom_core_physical = device->worker_core_from_logical_core(bottom_core);
+            auto left_core_physical = mesh_device->worker_core_from_logical_core(left_core);
+            auto left_core_plus_one_physical = mesh_device->worker_core_from_logical_core(left_core_plus_one);
+            auto right_core_physical = mesh_device->worker_core_from_logical_core(right_core);
+            auto top_core_physical = mesh_device->worker_core_from_logical_core(top_core);
+            auto top_core_plus_one_physical = mesh_device->worker_core_from_logical_core(top_core_plus_one);
+            auto bottom_core_physical = mesh_device->worker_core_from_logical_core(bottom_core);
 
             std::vector<uint32_t> mm_reader_args = {
                 (std::uint32_t)src0_dram_buffer->address(),   // in0_buffer_addr
@@ -440,36 +422,29 @@ void matmul_multicore_reuse_mcast(
                 tt_metal::SetRuntimeArgs(
                     program, mm_reader_kernel_in0_sender_in1_sender_id, core, mm_reader_args);      // RISCV_0_default
                 tt_metal::SetRuntimeArgs(program, unary_writer_kernel_noc1_id, core, writer_args);  // RISCV_1_default
-                reader_kernel_ids.push_back(mm_reader_kernel_in0_sender_in1_sender_id);
-                writer_kernel_ids.push_back(unary_writer_kernel_noc1_id);
             } else if (core_idx_x == 0 and core_idx_y != 0) {
                 tt_metal::SetRuntimeArgs(
                     program, mm_reader_kernel_in0_sender_in1_receiver_id, core, mm_reader_args);    // RISCV_0_default
                 tt_metal::SetRuntimeArgs(program, unary_writer_kernel_noc1_id, core, writer_args);  // RISCV_1_default
-                reader_kernel_ids.push_back(mm_reader_kernel_in0_sender_in1_receiver_id);
-                writer_kernel_ids.push_back(unary_writer_kernel_noc1_id);
             } else if (core_idx_x != 0 and core_idx_y == 0) {
                 tt_metal::SetRuntimeArgs(
                     program, mm_reader_kernel_in0_receiver_in1_sender_id, core, mm_reader_args);    // RISCV_1_default
                 tt_metal::SetRuntimeArgs(program, unary_writer_kernel_noc0_id, core, writer_args);  // RISCV_0_default
-                reader_kernel_ids.push_back(mm_reader_kernel_in0_receiver_in1_sender_id);
-                writer_kernel_ids.push_back(unary_writer_kernel_noc0_id);
             } else {
                 tt_metal::SetRuntimeArgs(
                     program, mm_reader_kernel_in0_receiver_in1_receiver_id, core, mm_reader_args);  // RISCV_1_default
                 tt_metal::SetRuntimeArgs(program, unary_writer_kernel_noc0_id, core, writer_args);  // RISCV_0_default
-                reader_kernel_ids.push_back(mm_reader_kernel_in0_receiver_in1_receiver_id);
-                writer_kernel_ids.push_back(unary_writer_kernel_noc0_id);
             }
         }
     }
 
     /* Launch program & read in output buffer result into the host vector */
 
-    EnqueueWriteBuffer(cq, src0_dram_buffer, a.data(), false);
-    EnqueueWriteBuffer(cq, src1_dram_buffer, b.data(), false);
-    EnqueueProgram(cq, program, false);
-    EnqueueReadBuffer(cq, dst_dram_buffer, output.data(), true);
+    distributed::EnqueueWriteMeshBuffer(cq, src0_dram_buffer, a, false);
+    distributed::EnqueueWriteMeshBuffer(cq, src1_dram_buffer, b, false);
+    workload.add_program(device_range, std::move(program));
+    distributed::EnqueueMeshWorkload(cq, workload, false);
+    distributed::EnqueueReadMeshBuffer(cq, output, dst_dram_buffer, true);
 }
 
 ///////////////////////////////////////
@@ -480,7 +455,7 @@ int main() {
     try {
         /* Silicon accelerator setup */
         constexpr int device_id = 0;
-        IDevice* device = CreateDevice(device_id);
+        std::shared_ptr<distributed::MeshDevice> mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
 
         ////////////////////////////////////////////////////////////////////////////
         //                      Matmul Parameters Setup
@@ -489,10 +464,16 @@ int main() {
         // NOTE: Maximum number of tiles in output is 120 * 16^2 = 30,720 (eg. [1, 1, 5120, 6144])
 
         /* Create source data */
-        constexpr uint32_t M = 3584;  // user-defined
-        constexpr uint32_t N = 3072;  // user-defined
-        constexpr uint32_t K = 768;   // user-defined
-        constexpr uint32_t B = 1;     // user-defined
+#ifdef TT_METAL_CI_MODE
+        constexpr uint32_t M = 2048;  // CI values
+        constexpr uint32_t N = 1024;  // CI values
+        constexpr uint32_t K = 512;   // CI values
+#else
+        constexpr uint32_t M = 3584;  // tutorial values
+        constexpr uint32_t N = 3072;  // tutorial values
+        constexpr uint32_t K = 768;   // tutorial values
+#endif
+        constexpr uint32_t B = 1;     // tutorial values
 
         uint32_t Mt = M / TILE_HEIGHT;
         uint32_t Kt = K / TILE_WIDTH;
@@ -517,7 +498,7 @@ int main() {
 
         /* Calling the MatMul host program. Read in result into a host vector */
         std::vector<bfloat16> result_vec(dram_buffer_C_size / sizeof(bfloat16));
-        matmul_multicore_reuse_mcast(src0_vec, src1_vec, result_vec, false, M, N, K, B, device);
+        matmul_multicore_reuse_mcast(src0_vec, src1_vec, result_vec, false, M, N, K, B, mesh_device);
         result_vec = untilize_nfaces(result_vec, M, N);
 
         fmt::print("Output vector of size {}\n", result_vec.size());
@@ -526,7 +507,7 @@ int main() {
         fmt::print("Metalium vs Golden -- PCC = {}\n", pearson);
         TT_FATAL(pearson > 0.98, "PCC not high enough. Result PCC: {}, Expected PCC: 0.98", pearson);
 
-        pass &= CloseDevice(device);
+        pass &= mesh_device->close();
 
     } catch (const std::exception& e) {
         fmt::print(stderr, "Test failed with exception!\n");

@@ -27,22 +27,22 @@ When performing systems tests developers should use the following test suite:
 `dockerfile/upstream_test_images/run_upstream_tests_vanilla.sh`
 
 The following tests are short in runtime and loop over all chips to test for basic component functionality:
-- `./build/test/tt_metal/tt_fabric/test_system_health` - This test prints Ethernet connnections, link statuses, and performs sanity checks on the system.
+- `./build/test/tt_metal/tt_fabric/test_system_health` - This test prints Ethernet connections, link statuses, and performs sanity checks on the system.
   The following expected output will appear upon completion of a successful Ethernet connection test:
 
 ![](https://github.com/tenstorrent/tt-metal/blob/main/docs/source/common/images/Ethernet_Link_Status_Test.png)
 
-- `TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN=1 ./build/test/tt_metal/unit_tests_dispatch --gtest_filter="CommandQueueSingleCardFixture.*"` - This test ensures that basic Command Queue APIs function correctly.
+- `TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN=1 ./build/test/tt_metal/unit_tests_dispatch --gtest_filter="UnitMeshCQSingleCardFixture.*"` - This test ensures that basic Command Queue APIs function correctly.
   The following expected output will appear upon completion of a successful Command Queue API test:
 
 ![](https://github.com/tenstorrent/tt-metal/blob/main/docs/source/common/images/CQ_API_Test.png)
 
-- `TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN=1 ./build/test/tt_metal/unit_tests_dispatch --gtest_filter="CommandQueueSingleCardProgramFixture.*"` - This test ensures that Metal Program APIs function correctly.
+- `TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN=1 ./build/test/tt_metal/unit_tests_dispatch --gtest_filter="UnitMeshCQSingleCardProgramFixture.*"` - This test ensures that Metal Program APIs function correctly.
   The following expected output will appear upon completion of a successful Program API test:
 
 ![](https://github.com/tenstorrent/tt-metal/blob/main/docs/source/common/images/Program_API_Test.png)
 
-- `TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN=1 ./build/test/tt_metal/unit_tests_dispatch --gtest_filter="CommandQueueSingleCardBufferFixture.ShardedBufferLarge*ReadWrites"` - This test ensures that basic Metal Buffers read and write to both L1 and DRAM memory buffers.
+- `TT_METAL_SKIP_ETH_CORES_WITH_RETRAIN=1 ./build/test/tt_metal/unit_tests_dispatch --gtest_filter="UnitMeshCQSingleCardBufferFixture.ShardedBufferLarge*ReadWrites"` - This test ensures that basic Metal Buffers read and write to both L1 and DRAM memory buffers.
   The following expected output will appear upon completion of a successful Memory Buffer test:
 
 ![](https://github.com/tenstorrent/tt-metal/blob/main/docs/source/common/images/Memory_Buffer_Test.png)
@@ -53,8 +53,8 @@ The following tests are short in runtime and loop over all chips to test for bas
 ![](https://github.com/tenstorrent/tt-metal/blob/main/docs/source/common/images/Fabric_API_Test.png)
 
 ### Ethernet Bandwidth Tests
-The following Ethernet bandwidth tests loop over all active Ethernet links and prints bandwidth. The following tests require a profiler build and therefore take longer to run:
-- `./build_metal.sh --build-tests --enable-profiler` - This command enables the profiler.
+The following Ethernet bandwidth tests loop over all active Ethernet links and prints bandwidth. These tests require a build with Tracy enabled (default)
+- `./build_metal.sh --build-tests`
 - `pytest tests/tt_metal/microbenchmarks/ethernet/test_all_ethernet_links_bandwidth.py` - This test ensures that Ethernet links are properly sending and receiving data.
   In the following expected output the test is identifying all mismatching values.
 
@@ -71,6 +71,6 @@ The following Ethernet bandwidth tests loop over all active Ethernet links and p
 ## Internal Tenstorrent Members
 
 > [!WARNING]
-> For internal Tentorrent memebers only!
+> For internal Tentorrent members only!
 
-For users with internal Tenstorrent access see this document for futher information regarding 6U Galaxy installation and troubleshooting: [TG/6U Metal Infra Galaxy Notes and FAQ](https://tenstorrent.atlassian.net/wiki/spaces/MI6/pages/1074659406/External+TG+6U+Metal+infra+Galaxy+notes+FAQ).
+For users with internal Tenstorrent access see this document for further information regarding 6U Galaxy installation and troubleshooting: [TG/6U Metal Infra Galaxy Notes and FAQ](https://tenstorrent.atlassian.net/wiki/spaces/MI6/pages/1074659406/External+TG+6U+Metal+infra+Galaxy+notes+FAQ).

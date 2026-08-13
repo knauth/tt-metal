@@ -1,11 +1,13 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "moreh_arange_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
 
 #include "ttnn/operations/moreh/moreh_helper_functions.hpp"
 #include "ttnn/tensor/tensor.hpp"
+#include "ttnn/device_operation.hpp"
 
 namespace ttnn::operations::moreh::moreh_arange {
 void MorehArangeOperation::validate_inputs(
@@ -28,7 +30,10 @@ void MorehArangeOperation::validate_inputs(
     }
     TT_FATAL(output->buffer() != nullptr, "Must have 1 output tensor.");
     TT_FATAL(dtype == output->dtype(), "If output is provided as input, its dtype should match the dtype parameter.");
-    TT_FATAL(output->memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED, "Error");
+    TT_FATAL(
+        output->memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+        "Output memory config layout must be INTERLEAVED but got {}",
+        output->memory_config().memory_layout());
 
     auto output_layout = output->layout();
     if (operation_attributes.untilize_out) {
@@ -39,17 +44,7 @@ void MorehArangeOperation::validate_inputs(
     }
 }
 
-MorehArangeOperation::program_factory_t MorehArangeOperation::select_program_factory(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    return ProgramFactory{};
-}
-
 void MorehArangeOperation::validate_on_program_cache_miss(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    validate_inputs(operation_attributes, tensor_args);
-};
-
-void MorehArangeOperation::validate_on_program_cache_hit(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     validate_inputs(operation_attributes, tensor_args);
 };
@@ -64,13 +59,13 @@ MorehArangeOperation::spec_return_value_t MorehArangeOperation::compute_output_s
         std::ceil((operation_attributes.end - operation_attributes.start) / operation_attributes.step));
 
     if (operation_attributes.untilize_out) {
-        return TensorSpec(
+        return tt::tt_metal::TensorSpec(
             Shape({num_elems}),
             TensorLayout(
                 operation_attributes.dtype, PageConfig(Layout::ROW_MAJOR), operation_attributes.memory_config));
     }
 
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         Shape({1, num_elems}),
         TensorLayout(operation_attributes.dtype, PageConfig(Layout::TILE), operation_attributes.memory_config));
 };
@@ -80,32 +75,30 @@ MorehArangeOperation::tensor_return_value_t MorehArangeOperation::create_output_
     if (tensor_args.output.has_value()) {
         return tensor_args.output.value();
     }
-    return create_device_tensor(compute_output_specs(operation_attributes, tensor_args), tensor_args.any.device());
+    return create_device_tensor(
+        compute_output_specs(operation_attributes, tensor_args), operation_attributes.mesh_device);
 }
 
-std::tuple<MorehArangeOperation::operation_attributes_t, MorehArangeOperation::tensor_args_t>
-MorehArangeOperation::invoke(
+}  // namespace ttnn::operations::moreh::moreh_arange
+
+namespace ttnn::prim {
+
+ttnn::operations::moreh::moreh_arange::MorehArangeOperation::tensor_return_value_t moreh_arange(
     float start,
     float end,
     float step,
-    const Tensor& any,
+    ttnn::MeshDevice* mesh_device,
     const std::optional<Tensor>& output,
     bool untilize_out,
-    const std::optional<DataType>& dtype,
-    const std::optional<MemoryConfig>& memory_config) {
-    return {
-        operation_attributes_t{
-            start,
-            end,
-            step,
-            untilize_out,
-            dtype.value_or(any.dtype()),
-            memory_config.value_or(any.memory_config()),
-        },
-        tensor_args_t{
-            any,
-            output,
-        },
-    };
+    const DataType& dtype,
+    const MemoryConfig& memory_config) {
+    using OperationType = ttnn::operations::moreh::moreh_arange::MorehArangeOperation;
+
+    auto operation_attributes =
+        OperationType::operation_attributes_t{start, end, step, untilize_out, mesh_device, dtype, memory_config};
+    auto tensor_args = OperationType::tensor_args_t{output};
+
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
-}  // namespace ttnn::operations::moreh::moreh_arange
+
+}  // namespace ttnn::prim

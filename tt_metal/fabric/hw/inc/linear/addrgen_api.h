@@ -1,18 +1,32 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "tt_metal/hw/inc/dataflow_api_addrgen.h"
-#include "tt_metal/api/tt-metalium/fabric_edm_packet_header.hpp"
+#include "internal/dataflow/dataflow_api_addrgen.h"
+#include "api/tensor/tensor_accessor.h"
+#include "tt_metal/fabric/fabric_edm_packet_header.hpp"
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_utils.hpp"
 #include "ttnn/cpp/ttnn/operations/ccl/kernel_common/sharding_addrgen.hpp"
+#include "tt_metal/fabric/hw/inc/fabric_config.h"
+
+// ShardedAddrGen is declared under a global experimental namespace. So when you try to use experimental::ShardedAddrGen
+// within the tt::tt_fabric namespace it will end up clashing with tt::tt_fabric::experimental namespace
+// (which gets brought in in a header somewhere). So my best solution (and AI's) so far is to bring it in at global
+// scope with the using which I made really stupid and obvious as to not cause any new name collisions.
+template <typename ShardingInfoType>
+using _ttnn_operations_experimental_ShardedAddrGen = experimental::ShardedAddrGen<ShardingInfoType>;
 
 namespace tt::tt_fabric {
 
+// NOTE: These helper functions are located in linear/addrgen_api.h rather than a common location
+// to avoid CI issues related to increased interleaved addr gen usage. Relocating these helper
+// functions to a more common place is avoided for now.
+
 namespace linear {
 
+// Helper namespace with address generation utilities
 namespace addrgen_detail {
 
 template <bool DRAM>
@@ -26,8 +40,13 @@ uint32_t get_page_size(const InterleavedAddrGenFast<DRAM>& s) {
 }
 
 template <typename ShardingInfoType>
-uint32_t get_page_size(const experimental::ShardedAddrGen<ShardingInfoType>& d) {
+uint32_t get_page_size(const _ttnn_operations_experimental_ShardedAddrGen<ShardingInfoType>& d) {
     return d.CONSTANT_ARGS.page_size_jump;
+}
+
+template <typename DSpec>
+uint32_t get_page_size(const TensorAccessor<DSpec>& d) {
+    return d.page_size;
 }
 
 template <typename AddrGenType>
@@ -58,28 +77,70 @@ FORCE_INLINE uint64_t get_noc_address(const AddrGenType& d, const uint32_t id, u
 
 }  // namespace addrgen_detail
 
-// Placeholder max page size for the addrgen until the page size is properly visible by the worker
-// https://github.com/tenstorrent/tt-metal/issues/25966
-static constexpr uint32_t max_fabric_addrgen_payload_size = 4532;
+// Maximum fabric packet payload size (runtime configuration)
+// Used for packetization logic in fabric write functions
+// Note: This is now a function call that reads from L1 configuration
+#define FABRIC_MAX_PACKET_SIZE (tt::tt_fabric::get_fabric_max_packet_size())
 
-FORCE_INLINE void validate_max_payload_size(uint32_t payload_size) {
-    ASSERT((page_size > max_fabric_addrgen_payload_size));
-    if ((payload_size > max_fabric_addrgen_payload_size)) {
-        WAYPOINT("HUNG");
-        // hang to prompt investigation
-        while (1) {
-        }
-    }
+template <typename AddrGenType>
+FORCE_INLINE void to_noc_unicast_write(
+    uint32_t packet_payload_size,
+    volatile PACKET_HEADER_TYPE* pkt_hdr,
+    const uint32_t id,
+    const AddrGenType& d,
+    uint32_t offset = 0) {
+    auto noc_address = addrgen_detail::get_noc_address(d, id, offset);
+    pkt_hdr->to_noc_unicast_write(NocUnicastCommandHeader{noc_address}, packet_payload_size);
 }
 
 template <typename AddrGenType>
 FORCE_INLINE void to_noc_unicast_write(
     volatile PACKET_HEADER_TYPE* pkt_hdr, const uint32_t id, const AddrGenType& d, uint32_t offset = 0) {
-    auto noc_address = addrgen_detail::get_noc_address(d, id, offset);
     auto page_size = addrgen_detail::get_page_size(d);
-    pkt_hdr->to_noc_unicast_write(NocUnicastCommandHeader{noc_address}, page_size);
+    to_noc_unicast_write(page_size, pkt_hdr, id, d, offset);
+}
 
-    validate_max_payload_size(page_size);
+// Resolves num_dests page ids through the shared addrgen into a flat, hop-ordered address list; counts[]
+// groups those pages per writing chip (num_chips chips, sum(counts) == num_dests). Valid because the
+// destination tensor is replicated with identical layout on every chip, so page id -> noc address is the
+// same function everywhere; only the page differs. Pages must be in hop order with each chip's pages
+// contiguous (see the setter).
+template <typename AddrGenType>
+FORCE_INLINE void to_noc_sparse_mcast_write(
+    uint32_t packet_payload_size,
+    volatile PACKET_HEADER_TYPE* pkt_hdr,
+    const uint32_t* ids,
+    uint8_t num_dests,
+    const uint8_t* counts,
+    uint8_t num_chips,
+    const AddrGenType& d,
+    uint32_t offset = 0) {
+    NocSparseMulticastWriteCommandHeader cmd;
+    for (uint8_t i = 0; i < num_dests; i++) {
+        cmd.noc_address[i] = addrgen_detail::get_noc_address(d, ids[i], offset);
+    }
+    for (uint8_t i = 0; i < num_chips; i++) {
+        cmd.counts[i] = counts[i];
+    }
+    cmd.num_dests = num_dests;
+    cmd.num_chips = num_chips;
+    pkt_hdr->to_noc_sparse_mcast_write(cmd, packet_payload_size);
+}
+
+template <typename AddrGenType>
+FORCE_INLINE void to_noc_fused_unicast_write_atomic_inc(
+    uint32_t page_size,
+    volatile PACKET_HEADER_TYPE* pkt_hdr,
+    const NocUnicastAtomicIncCommandHeader& atomic_inc_spec,
+    const uint32_t id,
+    const AddrGenType& d,
+    uint32_t offset = 0) {
+    auto noc_address = addrgen_detail::get_noc_address(d, id, offset);
+
+    pkt_hdr->to_noc_fused_unicast_write_atomic_inc(
+        NocUnicastAtomicIncFusedCommandHeader(
+            noc_address, atomic_inc_spec.noc_address, atomic_inc_spec.val, atomic_inc_spec.flush),
+        page_size);
 }
 
 template <typename AddrGenType>
@@ -90,14 +151,25 @@ FORCE_INLINE void to_noc_fused_unicast_write_atomic_inc(
     const AddrGenType& d,
     uint32_t offset = 0) {
     auto page_size = addrgen_detail::get_page_size(d);
-    auto noc_address = addrgen_detail::get_noc_address(d, id, offset);
+    to_noc_fused_unicast_write_atomic_inc(page_size, pkt_hdr, atomic_inc_spec, id, d, offset);
+}
 
-    pkt_hdr->to_noc_fused_unicast_write_atomic_inc(
-        NocUnicastAtomicIncFusedCommandHeader(
-            noc_address, atomic_inc_spec.noc_address, atomic_inc_spec.val, atomic_inc_spec.wrap, atomic_inc_spec.flush),
-        page_size);
+template <typename AddrGenType>
+FORCE_INLINE void to_noc_unicast_scatter_write(
+    uint32_t page_size,
+    volatile PACKET_HEADER_TYPE* pkt_hdr,
+    const uint32_t id0,
+    const uint32_t id1,
+    const AddrGenType& d,
+    uint32_t offset0 = 0,
+    uint32_t offset1 = 0) {
+    auto payload_size = page_size * 2;
 
-    validate_max_payload_size(page_size);
+    auto noc_address0 = addrgen_detail::get_noc_address(d, id0, offset0);
+    auto noc_address1 = addrgen_detail::get_noc_address(d, id1, offset1);
+
+    pkt_hdr->to_noc_unicast_scatter_write(
+        NocUnicastScatterCommandHeader({noc_address0, noc_address1}, {static_cast<uint16_t>(page_size)}), payload_size);
 }
 
 template <typename AddrGenType>
@@ -109,17 +181,12 @@ FORCE_INLINE void to_noc_unicast_scatter_write(
     uint32_t offset0 = 0,
     uint32_t offset1 = 0) {
     auto page_size = addrgen_detail::get_page_size(d);
-    auto payload_size = page_size * 2;
-
-    auto noc_address0 = addrgen_detail::get_noc_address(d, id0, offset0);
-    auto noc_address1 = addrgen_detail::get_noc_address(d, id1, offset1);
-
-    pkt_hdr->to_noc_unicast_scatter_write(
-        NocUnicastScatterCommandHeader({{noc_address0, noc_address1}, static_cast<uint16_t>(page_size)}), payload_size);
-
-    validate_max_payload_size(payload_size);
+    to_noc_unicast_scatter_write(page_size, pkt_hdr, id0, id1, d, offset0, offset1);
 }
 
 }  // namespace linear
 
-};  // namespace tt::tt_fabric
+// Alias to allow mesh code to access addrgen_detail at tt::tt_fabric level
+namespace addrgen_detail = linear::addrgen_detail;
+
+}  // namespace tt::tt_fabric

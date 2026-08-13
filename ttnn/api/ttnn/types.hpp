@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -25,7 +25,6 @@ constexpr auto TILE_SIZE = 32;
 using tt::tt_metal::BufferType;
 using tt::tt_metal::DataType;
 using tt::tt_metal::MemoryConfig;
-using tt::tt_metal::ShardMode;
 using tt::tt_metal::ShardOrientation;
 using tt::tt_metal::TensorMemoryLayout;
 
@@ -39,7 +38,7 @@ using tt::tt_metal::Layout;
 static constexpr auto ROW_MAJOR_LAYOUT = Layout::ROW_MAJOR;
 static constexpr auto TILE_LAYOUT = Layout::TILE;
 
-using tt::tt_metal::StorageType;
+using ttnn::StorageType;
 static constexpr auto DEVICE_STORAGE_TYPE = StorageType::DEVICE;
 static constexpr auto HOST_STORAGE_TYPE = StorageType::HOST;
 
@@ -52,7 +51,7 @@ struct CoreGrid {
     std::size_t y;
 
     CoreGrid(std::size_t x, std::size_t y) : x(x), y(y) {}
-    CoreCoord to_CoreCoord() { return CoreCoord(int(x), int(y)); }
+    CoreCoord to_CoreCoord() const { return CoreCoord(int(x), int(y)); }
 };
 
 using Buffer = tt::tt_metal::Buffer;
@@ -61,6 +60,8 @@ inline std::ostream& operator<<(std::ostream& os, const CoreGrid& core_grid) {
     os << "ttnn.CoreGrid(x=" << core_grid.x << ", y=" << core_grid.y << ")";
     return os;
 }
+
+std::ostream& operator<<(std::ostream& os, const CoreRangeSet& core_range_set);
 
 using tt::tt_metal::GlobalSemaphore;
 using tt::tt_metal::SubDevice;

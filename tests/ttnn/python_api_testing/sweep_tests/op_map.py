@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -296,6 +296,10 @@ op_map = {
     "eltwise-mish": {
         "tt_op": ttnn_ops.eltwise_mish,
         "pytorch_op": pytorch_ops.mish,
+    },
+    "eltwise-hardmish": {
+        "tt_op": ttnn_ops.eltwise_hardmish,
+        "pytorch_op": pytorch_ops.hardmish,
     },
     "eltwise-multigammaln": {
         "tt_op": ttnn_ops.eltwise_multigammaln,

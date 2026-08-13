@@ -7,7 +7,7 @@ Add `-e` or `--export-compile-commands` to `./build_metal.sh` to generate `compi
 Kernels are compiled and linked in runtime with `runtime/sfpi/compiler/bin/riscv32-tt-elf-g++`, and they naturally aren't part of the CMake project, so code indexing doesn't work there.
 
 ## 1. Create a fake CMake target to enable kernel code indexing
-Add `--fake-kernels-target` to `build_metal.sh`
+Add `--enable-fake-kernels-target` to `build_metal.sh`
 
 - This approach doesn't work very well:
   - many kernels depend on different defines and compile-time arguments
@@ -64,7 +64,7 @@ This will generate something like:
 
 `python3 ./scripts/build_kernel_compile_commands_json.py --input-command="python3 /home/ubuntu/projects/tt-metal/experiments/calls_ttnn_mean.py" --output-dir="build_Debug" --merge`
 
-### build_kernel_compile_commands_json.py scrip
+### build_kernel_compile_commands_json.py script
 
 Due to the nuances of how kernels are built on the device, there are a few things to keep in mind:
 1. All kernels for NCRISC/TRISC0/TRISC1/TRISC2/BRISC are included in ncrisc.cc/trisc0.cc/trisc1.cc/trisc2.cc/brisc.cc, so to enable indexing inside the kernel, the script has to search for actual kernel files and update generated compile_commands.json.
@@ -96,7 +96,7 @@ options:
 ### VS Code:
 - `clangd` by default searches for compile_commands.json in the project root, but it can be changed. `settings.json` example:
 ```json
-    "clangd.path": "/usr/bin/clangd-17",
+    "clangd.path": "/usr/bin/clangd-20",
     "clangd.arguments": [
         "-background-index",
         "-pretty",

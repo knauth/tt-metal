@@ -1,11 +1,10 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "rmsnorm_op.hpp"
 
 #include <cassert>
-#include <core/ttnn_all_includes.hpp>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -16,6 +15,10 @@
 #include "autograd/tensor.hpp"
 #include "core/compute_kernel_config.hpp"
 #include "metal/operations.hpp"
+#include "ttnn/operations/eltwise/binary/binary.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/reduction/generic/generic_reductions.hpp"
+#include "ttnn/tensor/tensor.hpp"
 #include "ttnn_fixed/trivial_ttnn_ops.hpp"
 
 namespace ttml::ops {
@@ -27,13 +30,10 @@ autograd::TensorPtr rmsnorm(const autograd::TensorPtr &tensor, const autograd::T
     }
 
     auto ashape_arr = a_shape.to_array_4D();
-    auto [B, N, S, C] = ashape_arr;
-    assert((N == 1));  // one sequence per batch
+    [[maybe_unused]] auto [B, N, S, C] = ashape_arr;
 
     // one gain parameter per channel
     assert((gamma->get_value().logical_shape().to_array_4D() == std::array<uint32_t, 4>{1, 1, 1, C}));
-
-    auto device = &autograd::ctx().get_device();
 
     auto rmsnorm_fw_result = ttml::metal::rmsnorm_fw(tensor->get_value(), gamma->get_value(), true, epsilon);
     if (rmsnorm_fw_result.size() != 2U) {
@@ -44,7 +44,7 @@ autograd::TensorPtr rmsnorm(const autograd::TensorPtr &tensor, const autograd::T
     auto rms_a = rmsnorm_fw_result[1].value();
     auto out = autograd::create_tensor(rmsnorm_fw_result[0].value());
 
-    autograd::GradFunction grad = [B, S, C, tensor, gamma, out, rms_a, epsilon]() {
+    autograd::GradFunction grad = [tensor, gamma, out, rms_a]() {
         auto dL_dout = out->get_grad();
 
         auto grads = ttml::metal::rmsnorm_bw(tensor->get_value(), gamma->get_value(), rms_a, dL_dout);
@@ -60,8 +60,7 @@ autograd::TensorPtr rmsnorm(const autograd::TensorPtr &tensor, const autograd::T
         }
     };
 
-    auto links = autograd::get_links(tensor, gamma);
-    out->set_node(autograd::ctx().add_backward_node(std::move(grad), links));
+    out->set_node(autograd::add_backward_node(std::move(grad), out, tensor, gamma));
 
     return out;
 }
@@ -74,19 +73,18 @@ autograd::TensorPtr rmsnorm_composite(
     }
 
     auto ashape_arr = a_shape.to_array_4D();
-    auto [B, N, S, C] = ashape_arr;
-    assert((N == 1));  // one sequence per batch
+    [[maybe_unused]] auto [B, N, S, C] = ashape_arr;
 
     // one gain parameter per channel
     assert((gamma->get_value().logical_shape().to_array_4D() == std::array<uint32_t, 4>{1, 1, 1, C}));
 
-    auto device = &autograd::ctx().get_device();
+    [[maybe_unused]] auto device = &autograd::ctx().get_device();
 
     ttnn::Tensor squares = ttnn::square(tensor->get_value());  // [B,1,S,C] -> [B,1,S,C]
 
     ttnn::Tensor seq_means_of_squares = ttnn::mean(squares, /*dim_arg=*/-1, /*keep_dim=*/true);  // [B,1,S,1]
 
-    constexpr auto none = ttsl::Span<const ttnn::operations::unary::UnaryWithParam>{};
+    constexpr auto none = ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam>{};
 
     ttnn::Tensor seq_means_of_squares_plus_epsilon = ttnn::add(
         seq_means_of_squares,
@@ -96,8 +94,7 @@ autograd::TensorPtr rmsnorm_composite(
         std::nullopt,
         none,
         none,
-        none,
-        false);  // [B,1,S,1] x. [1] -> [B,1,S,1] (bcast)
+        none);  // [B,1,S,1] x. [1] -> [B,1,S,1] (bcast)
 
     ttnn::Tensor rms_a = ttnn::sqrt(seq_means_of_squares_plus_epsilon);  // [B,1,S,1] -> [B,1,S,1]
 
@@ -109,8 +106,7 @@ autograd::TensorPtr rmsnorm_composite(
         std::nullopt,
         none,
         none,
-        none,
-        false);  // [1,1,1,C] x [B,1,S,C] -> [B,1,S,C]
+        none);  // [1,1,1,C] x [B,1,S,C] -> [B,1,S,C]
     // (bcast)
 
     ttnn::Tensor out_tensor = ttnn::divide(
@@ -122,11 +118,11 @@ autograd::TensorPtr rmsnorm_composite(
         none,
         none,
         none,
-        false);  // [B,1,S,C] x [B,1,S,C] -> [B,1,S,C]
+        /*fast_and_approximate*/ true);  // [B,1,S,C] x [B,1,S,C] -> [B,1,S,C]
 
     auto out = autograd::create_tensor(out_tensor);
 
-    autograd::GradFunction grad = [B, S, C, tensor, gamma, out, rms_a, device]() {
+    autograd::GradFunction grad = [tensor, gamma, out, rms_a]() {
         auto a = tensor->get_value();  // [B,1,S,C]
         auto g = gamma->get_value();   // [1,1,1,C]
 
@@ -136,7 +132,7 @@ autograd::TensorPtr rmsnorm_composite(
 
         auto dL_dout = out->get_grad();  // Grad w.r.t normalized arctivations, hence [B,1,S,C]
 
-        constexpr auto none = ttsl::Span<const ttnn::operations::unary::UnaryWithParam>{};
+        constexpr auto none = ttsl::Span<const ttnn::operations::unary::EltwiseUnaryWithParam>{};
 
         auto scaled_gain = ttnn::divide(
             g,
@@ -146,8 +142,7 @@ autograd::TensorPtr rmsnorm_composite(
             /*output*/ std::nullopt,
             /*activations*/ none,
             /*input_tensor_a_activations*/ none,
-            /*input_tensor_b_activations*/ none,
-            /*use_legacy*/ false);  // [1,1,1,C] x [B,1,S,1] -> [B,1,S,C] (bcast)
+            /*input_tensor_b_activations*/ none);  // [1,1,1,C] x [B,1,S,1] -> [B,1,S,C] (bcast)
 
         auto gained_dL_dout = ttnn::multiply(
             scaled_gain,
@@ -157,8 +152,7 @@ autograd::TensorPtr rmsnorm_composite(
             std::nullopt,
             none,
             none,
-            none,
-            false);  // [B,1,S,C] x [B,1,S,C] -> [B,1,S,C]
+            none);  // [B,1,S,C] x [B,1,S,C] -> [B,1,S,C]
 
         // notation:
         // _ · _ <- usual dot product
@@ -176,18 +170,18 @@ autograd::TensorPtr rmsnorm_composite(
         // scaled_outer = scale *. a : [1] x [B,1,S,C] -> [B,1,S,C]
 
         auto scale = ttml::ttnn_fixed::sum_over_dim(
-            ttnn::multiply(a, gained_dL_dout, std::nullopt, std::nullopt, std::nullopt, none, none, none, false),
+            ttnn::multiply(a, gained_dL_dout, std::nullopt, std::nullopt, std::nullopt, none, none, none),
             3);  // [B,1,S,C] x [B,1,S,C] -> [B,1,S,C] -> [B,1,S,1]
 
         auto scaled_outer = ttnn::multiply(
-            scale, a, std::nullopt, std::nullopt, std::nullopt, none, none, none, false);  // [B,1,S,1] x [B,1,S,C] ->
-                                                                                           // [B,1,S,C] (bcast)
+            scale, a, std::nullopt, std::nullopt, std::nullopt, none, none, none);  // [B,1,S,1] x [B,1,S,C] ->
+                                                                                    // [B,1,S,C] (bcast)
 
         auto ms_a = ttnn::square(rms_a);  // [B,1,S,1] -> [B,1,S,1]
 
-        auto c_by_ms_a = ttnn::multiply(
-            ms_a, c, std::nullopt, std::nullopt, std::nullopt, none, none, none, false);  // [B,1,S,1] x [1] ->
-                                                                                          // [B,1,S,1] (bcast)
+        auto c_by_ms_a =
+            ttnn::multiply(ms_a, c, std::nullopt, std::nullopt, std::nullopt, none, none, none);  // [B,1,S,1] x [1] ->
+                                                                                                  // [B,1,S,1] (bcast)
 
         auto rhs = ttnn::divide(
             scaled_outer,
@@ -197,8 +191,7 @@ autograd::TensorPtr rmsnorm_composite(
             std::nullopt,
             none,
             none,
-            none,
-            false);  // [B,1,S,C] x [B,1,S,1] -> [B,1,S,C] (bcast)
+            none);  // [B,1,S,C] x [B,1,S,1] -> [B,1,S,C] (bcast)
 
         auto dL_da = ttnn::subtract(
             gained_dL_dout,
@@ -208,24 +201,22 @@ autograd::TensorPtr rmsnorm_composite(
             std::nullopt,
             none,
             none,
-            none,
-            false);  // [B,1,S,C] x [B,1,S,C] -> [B,1,S,C]; checked by add_grad
+            none);  // [B,1,S,C] x [B,1,S,C] -> [B,1,S,C]; checked by add_grad
         tensor->add_grad(dL_da);
 
         // dL_dgamma = (a / rms(a)) * dL_dout -> requires sum over batch due to broadcasting
         auto dL_dg_components = ttnn::multiply(
             dL_dout,
-            ttnn::divide(a, rms_a, std::nullopt, std::nullopt, std::nullopt, none, none, none, false),
+            ttnn::divide(a, rms_a, std::nullopt, std::nullopt, std::nullopt, none, none, none),
             std::nullopt,
             std::nullopt,
             std::nullopt,
             none,
             none,
-            none,
-            false);  // [B,1,S,C] x [B,1,S,1] -> [B,1,S,C] (bcast); checked by add_grad
+            none);  // [B,1,S,C] x [B,1,S,1] -> [B,1,S,C] (bcast); checked by add_grad
         auto dL_dg = ttnn::sum(
             dL_dg_components,
-            /* dim_arg */ ttnn::SmallVector<int>{0, 1, 2},
+            /* dim_arg */ ttsl::SmallVector<int>{0, 1, 2},
             /* keep_dim */ true,
             /* output_mem_config */ std::nullopt,
             /*compute_kernel_config */ core::ComputeKernelConfig::precise());  // [B,1,S,C] -> [1,1,1,C]
@@ -233,8 +224,7 @@ autograd::TensorPtr rmsnorm_composite(
         gamma->add_grad(dL_dg);
     };
 
-    auto links = autograd::get_links(tensor, gamma);
-    out->set_node(autograd::ctx().add_backward_node(std::move(grad), links));
+    out->set_node(autograd::add_backward_node(std::move(grad), out, tensor, gamma));
 
     return out;
 }

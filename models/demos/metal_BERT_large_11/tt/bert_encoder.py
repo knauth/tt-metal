@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -36,27 +36,27 @@ class TtBertEncoder:
         if tt_cache_path is not None:
             attention_output_weight_path = str(
                 f"{tt_cache_path}/"
-                f"{attn_layer_name}.dense.weight_{self.model_config['OP7_SELFOUT_WEIGHTS_DTYPE'].name}.bin"
+                f"{attn_layer_name}.dense.weight_{self.model_config['OP7_SELFOUT_WEIGHTS_DTYPE'].name}.tensorbin"
             )
             attention_output_bias_path = str(
                 f"{tt_cache_path}/"
-                f"{attn_layer_name}.dense.bias_{self.model_config['OP7_SELFOUT_BIAS_DTYPE'].name}.bin"
+                f"{attn_layer_name}.dense.bias_{self.model_config['OP7_SELFOUT_BIAS_DTYPE'].name}.tensorbin"
             )
             mha_gamma_path = str(
                 f"{tt_cache_path}/"
-                f"{attn_layer_name}.LayerNorm.weight_{self.model_config['OP8_LAYERNORM_GAMMA_DTYPE'].name}.bin"
+                f"{attn_layer_name}.LayerNorm.weight_{self.model_config['OP8_LAYERNORM_GAMMA_DTYPE'].name}.tensorbin"
             )
             mha_beta_path = str(
                 f"{tt_cache_path}/"
-                f"{attn_layer_name}.LayerNorm.bias_{self.model_config['OP8_LAYERNORM_BETA_DTYPE'].name}.bin"
+                f"{attn_layer_name}.LayerNorm.bias_{self.model_config['OP8_LAYERNORM_BETA_DTYPE'].name}.tensorbin"
             )
             ffn_gamma_path = str(
                 f"{tt_cache_path}/"
-                f"{layer_name}.LayerNorm.weight_{self.model_config['OP11_LAYERNORM_GAMMA_DTYPE'].name}.bin"
+                f"{layer_name}.LayerNorm.weight_{self.model_config['OP11_LAYERNORM_GAMMA_DTYPE'].name}.tensorbin"
             )
             ffn_beta_path = str(
                 f"{tt_cache_path}/"
-                f"{layer_name}.LayerNorm.bias_{self.model_config['OP11_LAYERNORM_BETA_DTYPE'].name}.bin"
+                f"{layer_name}.LayerNorm.bias_{self.model_config['OP11_LAYERNORM_BETA_DTYPE'].name}.tensorbin"
             )
 
         def compute_attention_output_weight():
@@ -74,7 +74,7 @@ class TtBertEncoder:
             )
 
         def compute_attention_output_bias():
-            bias_torch = pad_weight(state_dict[f"{attn_layer_name}.dense.bias"])
+            bias_torch = state_dict[f"{attn_layer_name}.dense.bias"].reshape(1, 1, 1, -1)
             return ttnn.from_torch(
                 bias_torch,
                 model_config["OP7_SELFOUT_BIAS_DTYPE"],
@@ -120,7 +120,7 @@ class TtBertEncoder:
             mem_config=model_config["OP7_SELFOUT_WEIGHTS_MEMCFG"],
         )
         self.attention_output_bias = load_or_compute_and_cache(
-            attention_output_bias_path,
+            None,
             compute_attention_output_bias,
             device=device,
             mem_config=model_config["OP7_SELFOUT_BIAS_MEMCFG"],

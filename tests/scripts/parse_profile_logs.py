@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -13,7 +13,7 @@
 
     Next we have to run post processor for the ops.
 
-        ./tt_metal/tools/profiler/process_ops_logs.py -i stable_diffusion_reports -o stable_diffusion_reports/output
+        ./tools/tracy/process_ops_logs.py -i stable_diffusion_reports -o stable_diffusion_reports/output
 
     Finally run this script, you should have a few csv files titled: OP_cleaned_ops.csv
 

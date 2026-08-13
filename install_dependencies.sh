@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
 set -e
 
@@ -15,6 +15,7 @@ usage()
     echo "[--no-distributed]          Don't install distributed compute dependencies (OpenMPI)"
     echo "[--hugepages]               Install hugepages dependency"
     echo "[--sfpi]                    Install only SFPI package (minimal installation)"
+    echo "[--source-only]             Loads functions into shell"
     exit 1
 }
 
@@ -23,7 +24,7 @@ detect_os() {
         . /etc/os-release
         OS_ID="$ID"
         OS_VERSION="$VERSION_ID"
-        OS_CODENAME="${UBUNTU_CODENAME:VERSION_CODENAME}"
+        OS_CODENAME="${UBUNTU_CODENAME:-$VERSION_CODENAME}"
         OS_ID_LIKE="$ID_LIKE"
     else
         echo "Error: /etc/os-release not found. Unsupported system."
@@ -127,13 +128,15 @@ install_packages() {
 }
 
 validate_packages() {
-    echo "[INFO] Validating packages: ${PACKAGES[*]}"
+    echo "[INFO] Validating packages:"
     case "$PKG_MANAGER" in
         apt)
-            dpkg -l "${PACKAGES[@]}"
+            dpkg-query -W -f='  ${Package} ${Status}\n' "${PACKAGES[@]}"
+            echo "[INFO] Validation successful!"
             ;;
         dnf|yum)
-            rpm -q "${PACKAGES[@]}"
+            rpm -q --qf '  %{NAME} %{VERSION}-%{RELEASE}\n' "${PACKAGES[@]}"
+            echo "[INFO] Validation successful!"
             ;;
     esac
 }
@@ -166,47 +169,51 @@ init_packages() {
         debian)
             # Determine g++ version based on Ubuntu version
             local gpp_package="g++"
-            if [[ "$OS_ID" == "ubuntu" ]]; then
-                case "$OS_VERSION" in
-                    "22.04")
-                        gpp_package="g++-12"
-                        echo "[INFO] Using g++-12 for Ubuntu 22.04 (gcc-12 will be installed as dependency)"
-                        ;;
-                    "24.04")
-                        gpp_package="g++-14"
-                        echo "[INFO] Using g++-14 for Ubuntu 24.04 (gcc-14 will be installed as dependency)"
-                        ;;
-                    *)
-                        echo "[INFO] Using default g++ for Ubuntu $OS_VERSION"
-                        ;;
-                esac
-            fi
+            case "$UBUNTU_CODENAME" in
+                "jammy") # 22.04
+                    gpp_package="g++-12"
+                    echo "[INFO] Using g++-12 for Ubuntu 22.04 (gcc-12 will be installed as dependency)"
+                    ;;
+                "noble") # 24.04
+                    gpp_package="g++-14"
+                    echo "[INFO] Using g++-14 for Ubuntu 24.04 (gcc-14 will be installed as dependency)"
+                    ;;
+                *)
+                    echo "[INFO] Using default g++ for $OS_ID $OS_VERSION"
+                    ;;
+            esac
 
             # All packages needed for TT-Metal development
             PACKAGES=(
                 "git"
                 "build-essential"
-                "cmake"
                 "ninja-build"
                 "pkg-config"
                 "$gpp_package"
                 "pandoc"
                 "xz-utils"
+                "openssl"
+                "libssl-dev"
                 "python3-dev"
                 "python3-pip"
                 "python3-venv"
+                "python3-pkg-resources" # needed for setuptools
                 "libhwloc-dev"
                 "libnuma-dev"
                 "libatomic1"
                 "libstdc++6"
-                "libboost-dev"
                 "libtbb-dev"
                 "libcapstone-dev"
-                "libc++-17-dev"
-                "libc++abi-17-dev"
+                "libc++-20-dev"
+                "libc++abi-20-dev"
                 "wget"
                 "curl"
+                "xxd"
             )
+            # Add cmake to packages only if not in Docker (Docker provides via tool image)
+            if [ "$docker" -ne 1 ]; then
+                PACKAGES+=("cmake")
+            fi
             if [ "$distributed" -eq 1 ]; then
                 PACKAGES+=("openmpi-bin" "libopenmpi-dev")
             fi
@@ -217,9 +224,13 @@ init_packages() {
                 "gcc"
                 "gcc-c++"
                 "make"
+                "llvm"
                 "clang"
+                "clang-tools-extra" # for linker-wrapper
                 "cmake"
                 "ninja-build"
+                "openssl"
+                "openssl-devel"
                 "pkgconf-pkg-config"
                 "xz"
                 "python3-devel"
@@ -228,11 +239,11 @@ init_packages() {
                 "numactl-devel"
                 "libatomic"
                 "libstdc++"
-                "boost-devel"
-                "tbb-devel"
+                "intel-oneapi-tbb-devel"
                 "capstone-devel"
                 "wget"
                 "curl"
+                "vim-common" # Includes xxd
             )
             if [ "$distributed" -eq 1 ]; then
                 PACKAGES+=("openmpi" "openmpi-devel")
@@ -264,31 +275,107 @@ prep_ubuntu_system() {
     apt-get install -y --no-install-recommends ca-certificates gpg lsb-release wget software-properties-common gnupg jq
 
     # Add LLVM repository for Clang 17
-    wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -
-    echo "deb http://apt.llvm.org/$OS_CODENAME/ llvm-toolchain-$OS_CODENAME-17 main" | tee /etc/apt/sources.list.d/llvm-17.list
+    local llvm_keyring="/usr/share/keyrings/llvm-snapshot.gpg"
+    local llvm_keyring_tmp
+    llvm_keyring_tmp="$(mktemp "${llvm_keyring}.XXXXXX")"
+    ( set -o pipefail; wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor --batch --yes --no-tty -o "$llvm_keyring_tmp" )
+    chmod 0644 "$llvm_keyring_tmp"
+    mv -f "$llvm_keyring_tmp" "$llvm_keyring"
+    echo "deb [signed-by=$llvm_keyring] https://apt.llvm.org/$OS_CODENAME/ llvm-toolchain-$OS_CODENAME-17 main" | tee /etc/apt/sources.list.d/llvm-17.list
     # Also v20
-    echo "deb http://apt.llvm.org/$OS_CODENAME/ llvm-toolchain-$OS_CODENAME-20 main" | tee /etc/apt/sources.list.d/llvm-20.list
+    echo "deb [signed-by=$llvm_keyring] https://apt.llvm.org/$OS_CODENAME/ llvm-toolchain-$OS_CODENAME-20 main" | tee /etc/apt/sources.list.d/llvm-20.list
 
-    # Add Kitware repository for latest CMake
-    wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
-    echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ $OS_CODENAME main" | tee /etc/apt/sources.list.d/kitware.list >/dev/null
+    # Install CMake from GitHub releases (skip in Docker, cmake provided via tool image)
+    if [ "$docker" -ne 1 ]; then
+        local cmake_version="4.0.2"
+        local cmake_installer="/tmp/cmake-${cmake_version}-installer.sh"
+        local cmake_arch="$(uname -m)"
+        wget -q "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-${cmake_arch}.sh" -O "$cmake_installer"
+        bash "$cmake_installer" --skip-license --prefix=/usr/local
+        rm -f "$cmake_installer"
+    else
+        echo "[INFO] Skipping CMake install in Docker (cmake provided via tool image)"
+    fi
 
     # Add GCC toolchain repository for specific g++ versions if needed
-    if [[ "$OS_ID" == "ubuntu" ]]; then
-        case "$OS_VERSION" in
-            "24.04")
-                echo "[INFO] Adding toolchain repository for g++-14 on Ubuntu 24.04"
-                add-apt-repository -y ppa:ubuntu-toolchain-r/test
-                ;;
-        esac
-    fi
+    case "$UBUNTU_CODENAME" in
+        "noble")
+            echo "[INFO] Adding toolchain repository for g++-14 on Ubuntu 24.04"
+            add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            ;;
+    esac
 
     apt-get update
 }
 
 prep_redhat_system() {
     echo "[INFO] Preparing Red Hat family system..."
-    # TODO: Implement Red Hat family system preparation
+
+    # Add Intel oneAPI repository for TBB 2021+
+    # Legacy tbb-devel (2020.3) has an enum-out-of-range bug (oneapi-src/oneTBB#843)
+    # that is rejected by clang when gcc-toolset-15's <execution> header pulls tbb/task.h
+    cat > /etc/yum.repos.d/oneAPI.repo << 'REPO_EOF'
+[oneAPI]
+name=Intel oneAPI repository
+baseurl=https://yum.repos.intel.com/oneapi
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+# Keep the Intel repository scoped to the oneAPI TBB packages tt-metal needs.
+# Without this, DNF may satisfy unrelated dependencies (for example OpenMPI)
+# from oneAPI, pulling older Intel packages signed by keys not listed above.
+includepkgs=intel-oneapi-tbb* intel-oneapi-common-* intel-oneapi-tcm-*
+REPO_EOF
+}
+
+# Configure update-alternatives so gcc/g++ and clang/clang++ point to
+# version-specific compilers. Only applies to Ubuntu (debian-based).
+configure_compiler_alternatives() {
+    if ! is_debian_based; then
+        return
+    fi
+
+    if [[ "$OS_ID" != "ubuntu" ]]; then
+        return
+    fi
+
+    case "$OS_VERSION" in
+        22.04*)
+            if [ -x /usr/bin/gcc-12 ]; then
+                echo "[INFO] Setting gcc-12/g++-12 as defaults via update-alternatives"
+                update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 120 || true
+                update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 120 || true
+                update-alternatives --set gcc /usr/bin/gcc-12 2>/dev/null || true
+                update-alternatives --set g++ /usr/bin/g++-12 2>/dev/null || true
+            fi
+            ;;
+        24.04*)
+            if [ -x /usr/bin/gcc-14 ]; then
+                echo "[INFO] Setting gcc-14/g++-14 as defaults via update-alternatives"
+                update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 140 || true
+                update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 140 || true
+                update-alternatives --set gcc /usr/bin/gcc-14 2>/dev/null || true
+                update-alternatives --set g++ /usr/bin/g++-14 2>/dev/null || true
+            fi
+            ;;
+        *)
+            echo "[INFO] No GCC/G++ version override for Ubuntu $OS_VERSION"
+            ;;
+    esac
+
+    # Set llvm-20 toolchain as default when installed
+    if [ -x /usr/bin/clang-20 ]; then
+        echo "[INFO] Setting llvm-20 toolchain as defaults via update-alternatives"
+        for tool in clang clang++; do
+            update-alternatives --install /usr/bin/$tool $tool /usr/bin/${tool}-20 100 || true
+            update-alternatives --set $tool /usr/bin/${tool}-20 2>/dev/null || true
+        done
+        if [ -x /usr/bin/clang-tidy-20 ]; then
+            update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-20 100 || true
+            update-alternatives --set clang-tidy /usr/bin/clang-tidy-20 2>/dev/null || true
+        fi
+    fi
 }
 
 # We currently have an affinity to clang as it is more thoroughly tested in CI
@@ -301,85 +388,71 @@ install_llvm() {
         return
     fi
 
-    LLVM_VERSION="17"
-    echo "[INFO] Checking if LLVM $LLVM_VERSION is already installed..."
-    if command -v clang-$LLVM_VERSION &> /dev/null; then
-        echo "[INFO] LLVM $LLVM_VERSION is already installed. Skipping installation."
+    # Install LLVM 20:
+    # - clang-20: default toolchain for tt-metal (build_metal.sh) and tt-train
+    TEMP_DIR=$(mktemp -d)
+    wget -P $TEMP_DIR https://apt.llvm.org/llvm.sh
+    chmod u+x $TEMP_DIR/llvm.sh
+
+    echo "[INFO] Checking if LLVM 20 is already installed..."
+    if command -v clang-20 &> /dev/null; then
+        echo "[INFO] LLVM 20 is already installed. Skipping installation."
     else
-        echo "[INFO] Installing LLVM $LLVM_VERSION..."
-        TEMP_DIR=$(mktemp -d)
-        wget -P $TEMP_DIR https://apt.llvm.org/llvm.sh
-        chmod u+x $TEMP_DIR/llvm.sh
-        $TEMP_DIR/llvm.sh $LLVM_VERSION
-        rm -rf "$TEMP_DIR"
+        echo "[INFO] Installing LLVM 20..."
+        $TEMP_DIR/llvm.sh 20
     fi
+
+    rm -rf "$TEMP_DIR"
 }
 
 install_sfpi() {
-    local version_file=$(dirname $0)/tt_metal/sfpi-version.sh
+
+    local version_file=$(dirname $0)/tt_metal/sfpi-info.sh
     if ! [[ -r $version_file ]] ; then
-	version_file=$(dirname $0)/sfpi-version.sh
+	version_file=$(dirname $0)/sfpi-info.sh
 	if ! [[ -r $version_file ]] ; then
-	    echo "[ERROR] sfpi-version.sh not found" >&2
+	    echo "[ERROR] sfpi-info.sh not found" >&2
 	    exit 1
 	fi
     fi
-    # determine packaging system
-    local pkg
-    if dpkg-query -f '${Version}' -W libc-bin >/dev/null 2>&1 ; then
-	pkg=deb
-    elif rpm -q --qf '%{VERSION}' glibc >/dev/null 2>&1 ; then
-	pkg=rpm
-    else
-	echo "[ERROR] Unknown packaging system" >&2
-	exit 1
+    eval local $($version_file SHELL)
+    if [[ -z $sfpi_pkg ]] ; then
+        echo "[ERROR] Unknown packaging system for $sfpi_dist" >&2
+        exit 1
     fi
-    local $(grep -v '^#' $version_file)
-    local sfpi_arch_os=$(uname -m)_$(uname -s)
-    local sfpi_pkg_md5=$(eval echo "\$sfpi_${sfpi_arch_os}_${pkg}_md5")
-    if [ -z $(eval echo "$sfpi_${pkg}_md5") ] ; then
-	echo "[ERROR] SFPI $pkg package for ${sfpi_arch_os} is not available" >&2
+    if [[ -z $sfpi_hash ]] ; then
+	echo "[ERROR] SFPI $sfpi_version $sfpi_pkg package for $sfpi_arch $sfpi_dist is not available" >&2
 	exit 1
     fi
     local TEMP_DIR=$(mktemp -d)
-    wget -P $TEMP_DIR "$sfpi_url/$sfpi_version/sfpi-${sfpi_arch_os}.${pkg}"
-    if [ $(md5sum -b "${TEMP_DIR}/sfpi-${sfpi_arch_os}.${pkg}" | cut -d' ' -f1) \
-	     != "$sfpi_pkg_md5" ] ; then
-	echo "[ERROR] SFPI sfpi-${sfpi_arch_os}.${pkg} md5 mismatch" >&2
-	rm -rf $TEMP_DIR
+    wget -P $TEMP_DIR "$sfpi_url/$sfpi_filename"
+    if [[ $(${sfpi_hashtype}sum -b "${TEMP_DIR}/$sfpi_filename" | cut -d' ' -f1) \
+	     != "$sfpi_hash" ]] ; then
+	echo "[ERROR] SFPI $sfpi_filename ${sfpi_hashtype} mismatch" >&2
+	if [[ -d $TEMP_DIR ]] ; then
+	    rm -rf $TEMP_DIR
+	fi
 	exit 1
     fi
     # we must select exactly this version
-    case "$pkg" in
+    case "$sfpi_pkg" in
 	deb)
-	    apt-get install -y --allow-downgrades $TEMP_DIR/sfpi-${sfpi_arch_os}.deb
+	    apt-get install -y --allow-downgrades $TEMP_DIR/$sfpi_filename
 	    ;;
 	rpm)
-	    rpm --upgrade --force $TEMP_DIR/sfpi-${sfpi_arch_os}.rpm
+	    rpm --upgrade --force $TEMP_DIR/$sfpi_filename
+	    ;;
+	*)
+	    echo "[ERROR] Unknown packaging system $sfpi_pkg" >&2
+	    if [[ -d $TEMP_DIR ]] ; then
+		rm -rf $TEMP_DIR
+	    fi
+	    exit 1
 	    ;;
     esac
-    rm -rf $TEMP_DIR
-}
-
-install_sfpi_only() {
-    echo "[INFO] Installing only SFPI package for $OS_ID..."
-
-    # Check packaging system
-    local pkg
-    if dpkg-query -f '${Version}' -W libc-bin >/dev/null 2>&1; then
-        pkg=deb
-    elif rpm -q --qf '%{VERSION}' glibc >/dev/null 2>&1; then
-        pkg=rpm
-    else
-        echo "[ERROR] Unknown packaging system. SFPI installation requires either dpkg or rpm."
-        exit 1
+    if [[ -d $TEMP_DIR ]] ; then
+	rm -rf $TEMP_DIR
     fi
-    echo "[INFO] Detected packaging system: $pkg"
-
-    # Install SFPI using existing function
-    install_sfpi
-
-    echo "[INFO] SFPI installation completed successfully!"
 }
 
 install_mpi_ulfm() {
@@ -397,10 +470,16 @@ install_mpi_ulfm() {
     fi
 
     # Only install MPI ULFM for Ubuntu 24.04 or older
-    local VERSION_NUM=$(echo "$VERSION" | sed 's/\.//')
+    local VERSION_NUM=$(echo "$OS_VERSION" | sed 's/\.//')
 
-    if [ "$VERSION_NUM" -gt "2404" ]; then
-        echo "[INFO] Skipping MPI ULFM installation for Ubuntu $VERSION (only needed for 24.04 or older)"
+    if [[ "$OS_ID" == "ubuntu" ]] && [ "$VERSION_NUM" -gt "2404" ]; then
+        echo "[INFO] Skipping MPI ULFM installation for Ubuntu $OS_VERSION (only needed for 24.04 or older)"
+        return
+    fi
+
+    local DEB_ARCH="$(uname -m)"
+    if [[ "$DEB_ARCH" != "x86_64" ]]; then
+        echo "[INFO] Skipping MPI ULFM installation on $DEB_ARCH (only amd64 package is available)"
         return
     fi
 
@@ -421,15 +500,6 @@ install_mpi_ulfm() {
     apt-get install -f -y "$TMP_DIR/$DEB_FILE"
 }
 
-install_rust() {
-    INSTALL_CMD="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain 1.89.0 --profile minimal -y"
-    if [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" /bin/bash -c "$INSTALL_CMD"
-    else
-        /bin/bash -c "$INSTALL_CMD"
-    fi
-}
-
 # We don't really want to have hugepages dependency
 # This could be removed in the future
 
@@ -441,7 +511,7 @@ configure_hugepages() {
         return
     fi
 
-    # Fetch the lastest tt-tools release link and name of package
+    # Fetch the latest tt-tools release link and name of package
     TT_TOOLS_LINK=$(wget -qO- https://api.github.com/repos/tenstorrent/tt-system-tools/releases/latest | jq -r '.assets[] | select(.name | endswith(".deb")) | .browser_download_url')
     TT_TOOLS_NAME=$(wget -qO- https://api.github.com/repos/tenstorrent/tt-system-tools/releases/latest | jq -r '.assets[] | select(.name | endswith(".deb")) | .name')
 
@@ -466,11 +536,17 @@ install() {
     # Install core packages
     install_packages
 
-    # Install specialized components
-    install_sfpi
+    # Install specialized components (SFPI and MPI/ULFM come from container layers when --docker)
+    if [ "$docker" -ne 1 ]; then
+        install_sfpi
+        install_mpi_ulfm
+    fi
     install_llvm
-    install_mpi_ulfm
-    install_rust
+
+    # Set gcc/g++ and clang/clang++ defaults via update-alternatives (docker builds only)
+    if [ "$docker" -eq 1 ]; then
+        configure_compiler_alternatives
+    fi
 
     # Configure system (hugepages, etc.) - only for baremetal if requested (not docker)
     if [ "$docker" -ne 1 ] && [ "$hugepages" -eq 1 ]; then
@@ -484,76 +560,79 @@ cleanup() {
     fi
 }
 
-# Alright, lets run some things!
+main() {
+    # Alright, lets run some things!
 
-if [ "$EUID" -ne 0 ]; then
-    echo "This script must be run as root. Please use sudo."
-    usage
-fi
+    if [ "$EUID" -ne 0 ]; then
+        echo "This script must be run as root. Please use sudo."
+        usage
+    fi
 
-VERSION=`grep '^VERSION_ID=' /etc/os-release | awk -F= '{print $2}' | tr -d '"'`
+    VERSION=`grep '^VERSION_ID=' /etc/os-release | awk -F= '{print $2}' | tr -d '"'`
 
-# Initialize OS detection and validation
-detect_os
+    # Initialize OS detection and validation
+    detect_os
 
-if ! is_supported_os; then
-    echo "Error: $OS_ID is not currently supported."
-    echo "Supported distributions: Ubuntu, Debian, Fedora, CentOS, RHEL, Rocky Linux, AlmaLinux"
-    exit 1
-fi
+    if ! is_supported_os; then
+        echo "Error: $OS_ID is not currently supported."
+        echo "Supported distributions: Ubuntu, Debian, Fedora, CentOS, RHEL, Rocky Linux, AlmaLinux"
+        exit 1
+    fi
 
-validate=0
-docker=0
-distributed=1
-hugepages=0
-sfpi_only=0
+    validate=0
+    docker=0
+    distributed=1
+    hugepages=0
+    sfpi_only=0
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --help|-h)
-            usage
-            ;;
-        --validate|-v)
-            validate=1
-            shift
-            ;;
-        --docker|-d)
-            docker=1
-            shift
-            ;;
-        --no-distributed)
-            distributed=0
-            shift
-            ;;
-        --hugepages)
-            hugepages=1
-            shift
-            ;;
-        --sfpi)
-            sfpi_only=1
-            shift
-            ;;
-        *)
-            echo "Unknown option: $1"
-            usage
-            ;;
-    esac
-done
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h)
+                usage
+                ;;
+            --validate|-v)
+                validate=1
+                shift
+                ;;
+            --docker|-d)
+                docker=1
+                shift
+                ;;
+            --no-distributed)
+                distributed=0
+                shift
+                ;;
+            --hugepages)
+                hugepages=1
+                shift
+                ;;
+            --sfpi)
+                sfpi_only=1
+                shift
+                ;;
+            *)
+                echo "Unknown option: $1"
+                usage
+                ;;
+        esac
+    done
 
-init_packages
+    init_packages
 
-if [ "$sfpi_only" -eq 1 ]; then
-    install_sfpi_only
-elif [ "$validate" -eq 1 ]; then
-    validate_packages
-else
-    install
-fi
+    if [ "$sfpi_only" -eq 1 ]; then
+        install_sfpi
+        echo "[INFO] SFPI installation completed successfully!"
+    elif [ "$validate" -eq 1 ]; then
+        validate_packages
+    else
+        install
+        echo "[INFO] TT-Metalium dependencies installed successfully!"
+    fi
 
-cleanup
+    cleanup
 
-if [ "$sfpi_only" -eq 1 ]; then
-    echo "[INFO] SFPI installation completed successfully!"
-else
-    echo "[INFO] TT-Metalium dependencies installed successfully!"
+}
+
+if [ "${1}" != "--source-only" ]; then
+    main "${@}"
 fi

@@ -1,27 +1,23 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include <functional>
+#include "ttnn/operations/experimental/transformer/rotary_embedding/device/rotary_embedding_device_operation_types.hpp"
+#include "ttnn/device_operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
 
-#include "ttnn/tensor/tensor.hpp"
-#include "ttnn/run_operation.hpp"
-#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+namespace ttnn::experimental::prim {
 
-#include "ttnn/decorators.hpp"
+struct RotaryEmbeddingProgramFactory {
+    // Contract (1): single ProgramDescriptor.  Sharded variants set CBDescriptor::buffer.  Cache-hit
+    // re-application is owned by RotaryEmbeddingDeviceOperation::override_runtime_arguments, which
+    // patches the addresses and decode scalars in place -- this is a cache-miss-only path.
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const RotaryEmbeddingParams& operation_attributes,
+        const RotaryEmbeddingInputs& tensor_args,
+        Tensor& tensor_return_value);
+};
 
-namespace tt {
-namespace tt_metal {
-
-tt::tt_metal::operation::ProgramWithCallbacks rotary_embedding_multi_core(
-    const Tensor& input,
-    const Tensor& cos,
-    const Tensor& sin,
-    Tensor& output,
-    std::optional<uint32_t> token_idx,
-    ttnn::DeviceComputeKernelConfig compute_kernel_config);
-
-}  // namespace tt_metal
-}  // namespace tt
+}  // namespace ttnn::experimental::prim

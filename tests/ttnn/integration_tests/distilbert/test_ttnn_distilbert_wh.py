@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,10 +14,9 @@ from transformers import (
 from transformers import AutoTokenizer
 from models.demos.wormhole.distilbert.tt import ttnn_optimized_distilbert
 from tests.ttnn.utils_for_testing import assert_with_pcc
-from models.utility_functions import is_wormhole_b0, skip_for_grayskull
+from models.common.utility_functions import is_wormhole_b0
 
 
-@skip_for_grayskull()
 @pytest.mark.parametrize("model_name", ["distilbert-base-uncased-distilled-squad"])
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("sequence_size", [768])

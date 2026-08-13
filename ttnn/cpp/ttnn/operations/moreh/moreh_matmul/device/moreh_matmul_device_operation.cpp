@@ -1,8 +1,10 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "moreh_matmul_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+#include "ttnn/device_operation.hpp"
 
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/moreh/moreh_helper_functions.hpp"
@@ -39,11 +41,11 @@ void MorehMatmulOperation::validate_inputs(
     TT_FATAL(input_k == other_k, "k must be the same. input_k {}, other_k {}", input_k, other_k);
 
     // check batch dims
-    ttnn::SmallVector<uint32_t> input_dim(tt::tt_metal::MAX_NUM_DIMENSIONS, 1);
-    ttnn::SmallVector<uint32_t> other_dim(tt::tt_metal::MAX_NUM_DIMENSIONS, 1);
+    ttsl::SmallVector<uint32_t> input_dim(ttnn::MAX_NUM_DIMENSIONS, 1);
+    ttsl::SmallVector<uint32_t> other_dim(ttnn::MAX_NUM_DIMENSIONS, 1);
     get_tensor_dim(input_dim, input_shape);
     get_tensor_dim(other_dim, other_shape);
-    for (auto i = 2; i < tt::tt_metal::MAX_NUM_DIMENSIONS; ++i) {
+    for (auto i = 2; i < ttnn::MAX_NUM_DIMENSIONS; ++i) {
         if (input_dim[i] != other_dim[i]) {
             TT_FATAL(
                 input_dim[i] == 1 || other_dim[i] == 1,
@@ -62,10 +64,10 @@ void MorehMatmulOperation::validate_inputs(
         TT_FATAL(input_m == output_m, "m must be the same. input_m {}, output_m {}", input_m, output_m);
         TT_FATAL(other_n == output_n, "n must be the same. other_n {}, output_n {}", other_n, output_n);
 
-        ttnn::SmallVector<uint32_t> output_dim(tt::tt_metal::MAX_NUM_DIMENSIONS, 1);
+        ttsl::SmallVector<uint32_t> output_dim(ttnn::MAX_NUM_DIMENSIONS, 1);
         get_tensor_dim(output_dim, output_shape);
 
-        for (auto i = 2; i < tt::tt_metal::MAX_NUM_DIMENSIONS; ++i) {
+        for (auto i = 2; i < ttnn::MAX_NUM_DIMENSIONS; ++i) {
             TT_FATAL(
                 std::max(input_dim[i], other_dim[i]) == output_dim[i],
                 "{}th max(input_dim[i], other_dim[i]) {} must be the same as output_dim[i] {}",
@@ -89,11 +91,6 @@ void MorehMatmulOperation::validate_inputs(
     }
 }
 
-void MorehMatmulOperation::validate_on_program_cache_hit(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    validate_inputs(operation_attributes, tensor_args);
-}
-
 void MorehMatmulOperation::validate_on_program_cache_miss(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     validate_inputs(operation_attributes, tensor_args);
@@ -109,11 +106,6 @@ MorehMatmulOperation::tensor_return_value_t MorehMatmulOperation::create_output_
     return create_device_tensor(compute_output_specs(operation_attributes, tensor_args), tensor_args.input.device());
 };
 
-MorehMatmulOperation::program_factory_t MorehMatmulOperation::select_program_factory(
-    const operation_attributes_t&, const tensor_args_t&) {
-    return MultiCoreProgramFactory{};
-}
-
 MorehMatmulOperation::spec_return_value_t MorehMatmulOperation::compute_output_specs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     const auto& input_shape = tensor_args.input.padded_shape();
@@ -128,8 +120,8 @@ MorehMatmulOperation::spec_return_value_t MorehMatmulOperation::compute_output_s
     auto h_wo_padding = (transpose_input) ? (input_shape_wo_padding[-1]) : (input_shape_wo_padding[-2]);
     auto w_wo_padding = (transpose_other) ? (other_shape_wo_padding[-2]) : (other_shape_wo_padding[-1]);
 
-    ttnn::SmallVector<uint32_t> input_dim(tt::tt_metal::MAX_NUM_DIMENSIONS, 1);
-    ttnn::SmallVector<uint32_t> other_dim(tt::tt_metal::MAX_NUM_DIMENSIONS, 1);
+    ttsl::SmallVector<uint32_t> input_dim(ttnn::MAX_NUM_DIMENSIONS, 1);
+    ttsl::SmallVector<uint32_t> other_dim(ttnn::MAX_NUM_DIMENSIONS, 1);
     get_tensor_dim(input_dim, input_shape);
     get_tensor_dim(other_dim, other_shape);
 
@@ -143,7 +135,7 @@ MorehMatmulOperation::spec_return_value_t MorehMatmulOperation::compute_output_s
         other_shape.rank(),
         output_rank);
 
-    ttnn::SmallVector<uint32_t> output_dim(output_rank);
+    ttsl::SmallVector<uint32_t> output_dim(output_rank);
     // batch dims
     for (int i = 0; i < output_rank - 2; ++i) {
         int idx = output_rank - 1 - i;
@@ -159,7 +151,7 @@ MorehMatmulOperation::spec_return_value_t MorehMatmulOperation::compute_output_s
     ttnn::Shape output_shape_wo_padding = output_shape;
     output_shape_wo_padding[output_rank - 2] = h_wo_padding;
     output_shape_wo_padding[output_rank - 1] = w_wo_padding;
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         output_shape_wo_padding,
         TensorLayout::fromPaddedShape(
             tensor_args.input.dtype(),
@@ -168,9 +160,10 @@ MorehMatmulOperation::spec_return_value_t MorehMatmulOperation::compute_output_s
             output_shape_wo_padding,
             output_shape));
 }
+}  // namespace ttnn::operations::moreh::moreh_matmul
 
-std::tuple<MorehMatmulOperation::operation_attributes_t, MorehMatmulOperation::tensor_args_t>
-MorehMatmulOperation::invoke(
+namespace ttnn::prim {
+ttnn::operations::moreh::moreh_matmul::MorehMatmulOperation::tensor_return_value_t moreh_matmul(
     const Tensor& input,
     const Tensor& other,
     bool transpose_input,
@@ -179,12 +172,13 @@ MorehMatmulOperation::invoke(
     const std::optional<const Tensor>& bias,
     const std::optional<MemoryConfig>& output_memory_config,
     const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
-    return {
-        MorehMatmulOperation::operation_attributes_t{
-            transpose_input,
-            transpose_other,
-            output_memory_config.value_or(input.memory_config()),
-            init_device_compute_kernel_config(input.device()->arch(), compute_kernel_config)},
-        MorehMatmulOperation::tensor_args_t{input, other, output, bias}};
+    using OperationType = ttnn::operations::moreh::moreh_matmul::MorehMatmulOperation;
+    auto operation_attributes = OperationType::operation_attributes_t{
+        transpose_input,
+        transpose_other,
+        output_memory_config.value_or(input.memory_config()),
+        init_device_compute_kernel_config(input.device()->arch(), compute_kernel_config)};
+    auto tensor_args = OperationType::tensor_args_t{input, other, output, bias};
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
-}  // namespace ttnn::operations::moreh::moreh_matmul
+}  // namespace ttnn::prim

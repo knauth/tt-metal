@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,7 +11,7 @@ from loguru import logger
 from pathlib import Path
 
 from models.experimental.vgg.tt.vgg import *
-from models.utility_functions import torch_to_tt_tensor, unpad_from_zero
+from models.common.utility_functions import torch_to_tt_tensor, unpad_from_zero
 from models.experimental.vgg.vgg_utils import store_weights, get_tt_cache_path
 
 

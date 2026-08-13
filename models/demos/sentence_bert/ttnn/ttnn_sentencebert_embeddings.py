@@ -1,9 +1,14 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import ttnn
-from models.demos.sentence_bert.ttnn.common import layernorm_program_config
+from models.common.utility_functions import is_blackhole
+
+if is_blackhole():
+    from models.demos.blackhole.sentence_bert.ttnn.common import layernorm_program_config
+else:
+    from models.demos.wormhole.sentence_bert.ttnn.common import layernorm_program_config
 
 
 class TtnnSentenceBertEmbeddings:

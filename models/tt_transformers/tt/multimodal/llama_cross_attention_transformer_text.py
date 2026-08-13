@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -10,11 +10,12 @@ from tqdm import tqdm
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
+from models.common.utility_functions import nearest_32
+from models.tt_transformers.tt.common import Mode
 from models.tt_transformers.tt.decoder import TransformerBlock
 from models.tt_transformers.tt.distributed_norm import DistributedNorm
 from models.tt_transformers.tt.multimodal.llama_cross_block import TtLlamaCrossAttentionTransformerBlock
 from models.tt_transformers.tt.rope import RotarySetup
-from models.utility_functions import is_blackhole, nearest_32
 
 
 def _get_full_row_masked_out_mask(
@@ -56,13 +57,16 @@ class TtLlamaCrossAttentionTransformerText(LightweightModule):
         state_dict_prefix = configuration.get_state_dict_prefix("", None)
         self.configuration = configuration
         self.model_config = configuration.get_model_config()
-        self.state_dict = state_dict
 
         # NOTE: Running all embeddings in torch for now since learnable embeddings use complex indexing ops which must be in torch
         self.tok_embeddings = torch.nn.Embedding(configuration.vocab_size, configuration.dim)
         tok_embedding_prefix = f"{state_dict_prefix}tok_embeddings."
         self.tok_embeddings.load_state_dict(
-            {k[len(tok_embedding_prefix) :]: v for k, v in state_dict.items() if k.startswith(tok_embedding_prefix)}
+            {
+                k[len(tok_embedding_prefix) :]: v[: configuration.vocab_size]
+                for k, v in state_dict.items()
+                if k.startswith(tok_embedding_prefix)
+            }
         )
 
         self.norm = DistributedNorm(
@@ -75,8 +79,6 @@ class TtLlamaCrossAttentionTransformerText(LightweightModule):
                 weight_dtype=ttnn.bfloat16,
                 weight_key="norm",
                 is_distributed=configuration.is_distributed_norm,
-                sharded_program_config=self.model_config["SHARDED_NORM_LM_HEAD_PRGM_CFG"],
-                sharded_output_config=self.model_config["LM_HEAD_INPUT_MEMCFG"],
                 tt_ccl=self.tt_ccl,
             ),
             configuration,
@@ -84,7 +86,7 @@ class TtLlamaCrossAttentionTransformerText(LightweightModule):
         )
 
         # TODO: Generalize LMHead, maybe use llama_model's single-tile-sequence LMHead
-        lm_head_torch = self.state_dict[f"{state_dict_prefix}output.weight"].transpose(-1, -2)
+        lm_head_torch = state_dict[f"{state_dict_prefix}output.weight"].transpose(-1, -2)
         total_splits = 8  # Arbitrary value which allows whole-tile splits in LM Head
         num_splits = total_splits // self.configuration.num_devices
         lm_head_torch = torch.chunk(lm_head_torch, num_splits, dim=-1)
@@ -275,7 +277,7 @@ class TtLlamaCrossAttentionTransformerText(LightweightModule):
         current_pos,
         rot_mats_global=None,
         user_id=0,
-        mode="decode",
+        mode=Mode.DECODE,
         page_table=None,
         kv_cache=None,
         cross_page_table=None,
@@ -318,7 +320,9 @@ class TtLlamaCrossAttentionTransformerText(LightweightModule):
 
         if get_last_token != -1:
             h = ttnn.slice(h, (0, 0, get_last_token, 0), (1, 1, get_last_token + 32, h.shape[-1]))
-        h = self.norm(h, mode=mode)
+
+        lm_head_norm_config = self.configuration.get_norm_config("lm_head", mode, None)
+        h = self.norm(h, mode=mode, norm_config=lm_head_norm_config)
 
         # TODO: Switch to using dram-sharded LM head and remove this
         # Note: workaround for sharded_to_interleaved memory corruption (#15113)
@@ -336,7 +340,7 @@ class TtLlamaCrossAttentionTransformerText(LightweightModule):
             output = ttnn.linear(
                 h,
                 out_weight,
-                compute_kernel_config=self.model_config["SDPA_DECODE_COMPUTE_PROGCFG"],
+                compute_kernel_config=self.configuration.compute_kernel_config_hifi2_na,
                 core_grid=None,
                 dtype=ttnn.bfloat16,
                 program_config=pc,
@@ -344,23 +348,18 @@ class TtLlamaCrossAttentionTransformerText(LightweightModule):
             )
 
             if self.configuration.num_devices > 1:
-                # TODO: 26411
-                # Remove this blackhole condition once fabric CCLs are working on blackhole
-                if is_blackhole():
-                    output = ttnn.all_gather(output, dim=3, num_links=1, topology=ttnn.Topology.Linear)
-                else:
-                    output = ttnn.experimental.all_gather_async(
-                        output,
-                        persistent_output_buffer=None,
-                        dim=3,
-                        multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
-                        num_links=1,
-                        topology=ttnn.Topology.Linear,
-                        barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
-                        chunks_per_sync=10,
-                        num_workers_per_link=2,
-                        num_buffers_per_channel=2,
-                    )
+                output = ttnn.experimental.all_gather_async(
+                    output,
+                    persistent_output_buffer=None,
+                    dim=3,
+                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+                    num_links=1,
+                    topology=ttnn.Topology.Linear,
+                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+                    chunks_per_sync=10,
+                    num_workers_per_link=2,
+                    num_buffers_per_channel=2,
+                )
             outputs.append(output)
 
         output = ttnn.concat(outputs, dim=-1)

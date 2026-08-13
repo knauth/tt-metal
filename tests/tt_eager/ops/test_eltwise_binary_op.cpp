@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,15 +6,12 @@
 #include <tt-metalium/constants.hpp>
 #include <functional>
 
-#include <tt-metalium/assert.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/device.hpp>
-#include <tt-metalium/host_api.hpp>
 #include <tt-metalium/shape.hpp>
-#include "ttnn/decorators.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/functions.hpp"
-#include "ttnn/tensor/enum_types.hpp"
 #include "ttnn/tensor/host_buffer/functions.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 #include "ttnn/tensor/storage.hpp"
@@ -23,8 +20,8 @@
 
 using tt::tt_metal::DataType;
 using tt::tt_metal::Layout;
-using tt::tt_metal::Tensor;
 using tt::tt_metal::distributed::MeshDevice;
+using ttnn::Tensor;
 
 template <typename BinaryFunction>
 Tensor host_function(const Tensor& input_tensor_a, const Tensor& input_tensor_b) {
@@ -34,7 +31,8 @@ Tensor host_function(const Tensor& input_tensor_a, const Tensor& input_tensor_b)
     auto output_buffer = std::vector<bfloat16>(input_tensor_a.physical_volume());
 
     for (auto index = 0; index < output_buffer.size(); index++) {
-        auto value = BinaryFunction{}(input_a_buffer[index].to_float(), input_b_buffer[index].to_float());
+        auto value =
+            BinaryFunction{}(static_cast<float>(input_a_buffer[index]), static_cast<float>(input_b_buffer[index]));
         output_buffer[index] = bfloat16(value);
     }
     return Tensor(
@@ -65,55 +63,62 @@ int main() {
 
     int device_id = 0;
     auto device_owner = MeshDevice::create_unit_mesh(device_id);
-    auto device = device_owner.get();
+    auto* device = device_owner.get();
 
     {
         ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH});
-        auto allclose = run_test<host_function<std::plus<float>>>(shape, ttnn::add, device);
+        auto allclose = run_test<host_function<std::plus<float>>>(
+            shape, [](const auto& a, const auto& b) { return ttnn::add(a, b); }, device);
         TT_FATAL(allclose, "Error");
     }
 
     {
         ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH});
-        auto allclose = run_test<host_function<std::minus<float>>>(shape, ttnn::subtract, device);
+        auto allclose = run_test<host_function<std::minus<float>>>(
+            shape, [](const auto& a, const auto& b) { return ttnn::subtract(a, b); }, device);
         TT_FATAL(allclose, "Error");
     }
 
     {
         ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH});
-        auto allclose = run_test<host_function<std::multiplies<float>>>(shape, ttnn::multiply, device, 1e-2f, 1e-3f);
+        auto allclose = run_test<host_function<std::multiplies<float>>>(
+            shape, [](const auto& a, const auto& b) { return ttnn::multiply(a, b); }, device, 1e-2f, 1e-3f);
         TT_FATAL(allclose, "Error");
     }
 
     auto run_binary_ops = [&] {
         {
             ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH});
-            auto allclose = run_test<host_function<std::plus<float>>>(shape, ttnn::add, device);
+            auto allclose = run_test<host_function<std::plus<float>>>(
+                shape, [](const auto& a, const auto& b) { return ttnn::add(a, b); }, device);
             TT_FATAL(allclose, "Error");
         }
 
         {
             ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH});
-            auto allclose = run_test<host_function<std::minus<float>>>(shape, ttnn::subtract, device);
+            auto allclose = run_test<host_function<std::minus<float>>>(
+                shape, [](const auto& a, const auto& b) { return ttnn::subtract(a, b); }, device);
             TT_FATAL(allclose, "Error");
         }
 
         {
             ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT * 2, tt::constants::TILE_WIDTH * 2});
-            auto allclose = run_test<host_function<std::plus<float>>>(shape, ttnn::add, device);
+            auto allclose = run_test<host_function<std::plus<float>>>(
+                shape, [](const auto& a, const auto& b) { return ttnn::add(a, b); }, device);
             TT_FATAL(allclose, "Error");
         }
 
         {
             ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT, tt::constants::TILE_WIDTH});
-            auto allclose =
-                run_test<host_function<std::multiplies<float>>>(shape, ttnn::multiply, device, 1e-2f, 1e-3f);
+            auto allclose = run_test<host_function<std::multiplies<float>>>(
+                shape, [](const auto& a, const auto& b) { return ttnn::multiply(a, b); }, device, 1e-2f, 1e-3f);
             TT_FATAL(allclose, "Error");
         }
 
         {
             ttnn::Shape shape({1, 1, tt::constants::TILE_HEIGHT * 4, tt::constants::TILE_WIDTH * 4});
-            auto allclose = run_test<host_function<std::plus<float>>>(shape, ttnn::add, device);
+            auto allclose = run_test<host_function<std::plus<float>>>(
+                shape, [](const auto& a, const auto& b) { return ttnn::add(a, b); }, device);
             TT_FATAL(allclose, "Error");
         }
     };

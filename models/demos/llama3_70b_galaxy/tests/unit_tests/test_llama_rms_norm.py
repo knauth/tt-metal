@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import torch
@@ -8,18 +8,16 @@ import ttnn
 from models.common.rmsnorm import RMSNorm as TtRMSNorm
 from models.demos.llama3_70b_galaxy.tt.model_config import TtModelArgs
 from models.demos.t3000.llama2_70b.reference.llama.llama31_8b.model import RMSNorm as RefRMSNorm
-from models.utility_functions import (
+from models.common.utility_functions import (
     comp_pcc,
     comp_allclose,
 )
-from models.utility_functions import skip_for_grayskull
 from models.demos.llama3_70b_galaxy.tt.distributed_norm import DistributedNorm
 from models.demos.llama3_70b_galaxy.tt.prefetcher_common import TtLlamaPrefetcherSetup
 from models.demos.llama3_70b_galaxy.tt.llama_ccl import TT_CCL
 
 
 @torch.no_grad()
-@skip_for_grayskull("Requires wormhole_b0 to run")
 @pytest.mark.parametrize(
     "mesh_device",
     [
@@ -88,7 +86,6 @@ def test_llama_rms_norm_inference(
     tt_model = DistributedNorm(
         tt_inner_norm,
         model_args,
-        TG=model_args.is_galaxy,
         tt_ccl=tt_ccl,
         ccl_topology=model_args.model_config["CCL_TOPOLOGY"],
     )

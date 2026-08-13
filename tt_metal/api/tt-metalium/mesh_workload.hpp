@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -10,6 +10,7 @@
 
 namespace tt::tt_metal::distributed {
 
+class MeshWorkload;
 class MeshWorkloadImpl;
 
 class MeshCommandQueue;
@@ -20,7 +21,7 @@ class MeshWorkload {
     // A MeshWorkload can be fully described using a set of programs mapped to different Logical Device Regions
     // in a Mesh + configurable runtime Args
     // The current iteration supports the following compute paradigms:
-    //  - Single Program Multi Device (Completely Homogenous MeshWorkload)
+    //  - Single Program Multi Device (Completely Homogeneous MeshWorkload)
     //  - Multi Program Multi Device (Completely Heterogeneous MeshWorkload)
     // Support for configurable runtime arguments will be added in future versions.
 public:
@@ -29,6 +30,8 @@ public:
     ~MeshWorkload();
     MeshWorkload(MeshWorkload&& other) noexcept;
     MeshWorkload& operator=(MeshWorkload&& other) noexcept;
+    // Requirement: In one MeshWorkload, device ranges for different programs must not share devices; each device can
+    // belong to only one program. Not all devices need a program—leaving some devices unassigned is allowed.
     void add_program(const MeshCoordinateRange& device_range, Program&& program);
     std::unordered_map<MeshCoordinateRange, Program>& get_programs();
     const std::unordered_map<MeshCoordinateRange, Program>& get_programs() const;

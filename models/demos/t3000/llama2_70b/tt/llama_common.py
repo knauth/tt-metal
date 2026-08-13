@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -13,12 +13,12 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.common.utility_functions import torch2tt_tensor, tt2torch_tensor
 from models.demos.t3000.llama2_70b.reference.llama.llama.generation import (
     load_chunked_checkpoints,
     load_sharded_checkpoints,
 )
 from models.demos.t3000.llama2_70b.tt.model_config import get_model_config
-from models.utility_functions import torch2tt_tensor, tt2torch_tensor
 
 MAX_SEQ_LEN = 4096
 MAX_SEQ_LEN_LLAMA3 = 8192
@@ -119,13 +119,13 @@ def setup_llama_env(llama_version="llama3", max_batch_size=32, max_context_len=4
     return model_config, ckpt_dir, tokenizer_path, cache_path
 
 
-def check_mesh_device(t3k_mesh_device, model_config):
-    assert t3k_mesh_device.get_num_devices() >= model_config["NUM_DEVICES"], (
+def check_mesh_device(mesh_device, model_config):
+    assert mesh_device.get_num_devices() >= model_config["NUM_DEVICES"], (
         "Requires at least %d devices to run",
         model_config["NUM_DEVICES"],
     )
 
-    compute_grid_size = t3k_mesh_device.compute_with_storage_grid_size()
+    compute_grid_size = mesh_device.compute_with_storage_grid_size()
     assert not (
         compute_grid_size.x < model_config["MAX_GRID_SIZE"][0] or compute_grid_size.y < model_config["MAX_GRID_SIZE"][1]
     ), ("Requires grid size of at least %d to run", model_config["MAX_GRID_SIZE"])
@@ -136,20 +136,6 @@ def extract_pcc_from_log(log):
     extracted_pcc = re.search(pattern, log)
     extracted_pcc = float(extracted_pcc.group(1))
     return extracted_pcc
-
-
-def get_weight_cache_path(base_cache_path, tensor_str, device_idx, num_devices, cache_id=None):
-    return base_cache_path / f"{tensor_str}{'' if cache_id is None else cache_id}_{device_idx}_{num_devices}.bin"
-
-
-def get_weight_cache_path_ttnn(
-    base_cache_path, tensor_str, device_idx, num_devices, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT
-):
-    return base_cache_path / f"{tensor_str}_{device_idx}_{num_devices}_dtype_{dtype.name}_layout_{layout.name}.bin"
-
-
-def get_weight_cache_path_galaxy(base_cache_path, tensor_str, device_idx, num_devices, x, y):
-    return base_cache_path / f"{tensor_str}_{device_idx}_{num_devices}_{x}_{y}.bin"
 
 
 def rms_decomp(x, norm_weight, eps):

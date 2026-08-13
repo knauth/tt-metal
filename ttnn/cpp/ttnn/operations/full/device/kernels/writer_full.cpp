@@ -1,64 +1,69 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-
-#include "dataflow_api.h"
-
-union value {
-    float f;
-    uint32_t u;
-};
-constexpr uint32_t onetile = 1;
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
+#include "experimental/kernel_args.h"
+#include "full_kernel_common.hpp"
 
 void kernel_main() {
-    uint32_t output_addr = get_arg_val<uint32_t>(0);
-    uint32_t fill_value = get_arg_val<uint32_t>(1);
-    uint32_t num_tiles = get_arg_val<uint32_t>(2);
-    uint32_t start_id = get_arg_val<uint32_t>(3);
+    uint32_t fill_value = get_arg(args::fill_value);
+    uint32_t num_pages_per_core = get_arg(args::num_pages_per_core);
+    uint32_t start_id = get_arg(args::start_id);
 
-    constexpr uint32_t cb_value = get_compile_time_arg_val(0);
-    const uint32_t cb_page_size = get_tile_size(cb_value);
-    const auto cb_data_format = get_dataformat(cb_value);
+    constexpr uint32_t elems_per_page = get_arg(args::elems_per_page);
+    constexpr uint32_t page_size = get_arg(args::page_size);
 
     value val;
     val.u = fill_value;
 
-    cb_reserve_back(cb_value, onetile);
+    Noc noc;
+    // Holds the single fill-value page this instance builds and then writes to every output page it
+    // owns. This instance is the buffer's only toucher: it fills the page and drains it itself.
+    DataflowBuffer dfb(dfb::value);
 
-    uint32_t write_addr = get_write_ptr(cb_value);
+    dfb.reserve_back(onepage);
 
+    uint32_t write_addr = dfb.get_write_ptr();
+
+    if (val.u == 0) {
+        zero_buffer(dfb, page_size);
+    } else {
 #ifdef OUTPUT_DTYPE_BFLOAT16
-    auto ptr = reinterpret_cast<uint16_t*>(write_addr);
-    for (uint32_t i = 0; i < 1024; ++i) {
-        ptr[i] = val.u >> 16;
-    }
+        auto ptr = reinterpret_cast<uint16_t*>(write_addr);
+        for (uint32_t i = 0; i < elems_per_page; ++i) {
+            ptr[i] = val.u >> 16;
+        }
 #endif
 #ifdef OUTPUT_DTYPE_INT32
-    auto ptr = reinterpret_cast<uint32_t*>(write_addr);
-    for (uint32_t i = 0; i < 1024; ++i) {
-        ptr[i] = fill_value;
-    }
+        auto ptr = reinterpret_cast<uint32_t*>(write_addr);
+        for (uint32_t i = 0; i < elems_per_page; ++i) {
+            ptr[i] = fill_value;
+        }
 #endif
 #ifdef OUTPUT_DTYPE_FLOAT32
-    auto ptr = reinterpret_cast<float*>(write_addr);
-    for (uint32_t i = 0; i < 1024; ++i) {
-        ptr[i] = val.f;
-    }
+        auto ptr = reinterpret_cast<float*>(write_addr);
+        for (uint32_t i = 0; i < elems_per_page; ++i) {
+            ptr[i] = val.f;
+        }
 #endif
-    cb_push_back(cb_value, 1);
-
-    const InterleavedAddrGenFast<true> s = {
-        .bank_base_address = output_addr, .page_size = cb_page_size, .data_format = cb_data_format};
-
-    cb_wait_front(cb_value, 1);
-
-    uint32_t end_id = start_id + num_tiles;
-    for (std::uint32_t i = start_id; i < end_id; i++) {
-        const auto cb_value_addr = get_read_ptr(cb_value);
-        noc_async_write_tile(i, s, cb_value_addr);
-        noc_async_write_barrier();
     }
-    cb_pop_front(cb_value, 1);
+
+    dfb.push_back(1);
+
+    const auto s = TensorAccessor(tensor::output);
+
+    dfb.wait_front(1);
+
+    uint32_t end_id = start_id + num_pages_per_core;
+    for (std::uint32_t i = start_id; i < end_id; i++) {
+        noc.async_write(dfb, s, s.get_aligned_page_size(), {}, {.page_id = i});
+    }
+    noc.async_writes_flushed();
+    dfb.pop_front(1);
+    noc.async_write_barrier();
 }

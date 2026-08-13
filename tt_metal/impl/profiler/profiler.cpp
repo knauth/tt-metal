@@ -1,53 +1,254 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <tt_stl/fmt.hpp>
+#include <optional>
+#include "context/metal_env_accessor.hpp"
 #include "core_coord.hpp"
-#include "dev_msgs.h"
+#include <common/TracyTTDeviceData.hpp>
 #include <device.hpp>
 #include <distributed.hpp>
-#include "device_pool.hpp"
+#include "llrt/hal.hpp"
+#include "mesh_device.hpp"
+#include "impl/threading/thread_pool.hpp"
 #include "tools/profiler/event_metadata.hpp"
 #include "distributed/fd_mesh_command_queue.hpp"
 #include <host_api.hpp>
 #include <enchantum/enchantum.hpp>
 #include <nlohmann/json.hpp>
+#include <stack>
 #include <tracy/TracyTTDevice.hpp>
 #include <tt_metal.hpp>
+#include "tt_metal_profiler.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 
-#include "assert.hpp"
-#include "dispatch/hardware_command_queue.hpp"
+#include <mutex>
+#include <unordered_map>
+
+#include <tt_stl/assert.hpp>
 #include "dispatch/kernels/cq_commands.hpp"
+#include "dispatch/data_collection.hpp"
+#include "impl/dispatch/dispatch_core_common.hpp"
+#include "profiler_analysis.hpp"
 #include "hal_types.hpp"
 #include "hostdevcommon/profiler_common.h"
 #include "llrt.hpp"
 #include <tt-logger/tt-logger.hpp>
-#include "metal_soc_descriptor.h"
+#include "llrt/metal_soc_descriptor.hpp"
 #include "profiler.hpp"
 #include "profiler_paths.hpp"
 #include "profiler_state.hpp"
+#include "profiler_state_manager.hpp"
 #include "tools/profiler/noc_event_profiler_utils.hpp"
 #include "tracy/Tracy.hpp"
-#include "tt-metalium/profiler_types.hpp"
-#include "tt_backend_api_types.hpp"
-#include "impl/context/metal_context.hpp"
-#include <umd/device/tt_core_coordinates.h>
-#include <umd/device/types/arch.h>
-#include <umd/device/types/xy_pair.h>
-#include <tt-metalium/device_pool.hpp>
+#include "profiler_types.hpp"
+#include "common/tt_backend_api_types.hpp"
+#include "common/filesystem_utils.hpp"
+#include "context/metal_context.hpp"
+#include "context/context_types.hpp"
+#include <umd/device/types/core_coordinates.hpp>
+#include <umd/device/types/arch.hpp>
+#include <umd/device/types/xy_pair.hpp>
+#include <umd/device/arch/wormhole_implementation.hpp>
+#include "device/device_manager.hpp"
 #include "tt_cluster.hpp"
+#include "tools/profiler/perf_counters.hpp"
+#include "debug/noc_debugging.hpp"
+#include "tools/profiler/noc_debugging_metadata.hpp"
 
-namespace tt {
+#if !defined(TRACY_ENABLE) && defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#endif
 
-namespace tt_metal {
+namespace tt::tt_metal {
 
-static kernel_profiler::PacketTypes get_packet_type(uint32_t timer_id) {
-    return static_cast<kernel_profiler::PacketTypes>((timer_id >> 16) & 0x7);
+namespace {
+kernel_profiler::PacketTypes get_packet_type(uint32_t timer_id) {
+    return static_cast<kernel_profiler::PacketTypes>(
+        (timer_id >> kernel_profiler::PROFILER_TIMER_PACKET_TYPE_SHIFT) &
+        kernel_profiler::PROFILER_TIMER_PACKET_TYPE_MASK);
+}
+
+void add_program_sub_device_meta_data(nlohmann::json& meta_data, tt::ChipId device_id, uint32_t runtime_id) {
+    using CacheKey = std::pair<tt::ChipId, uint32_t>;
+    struct CacheKeyHash {
+        std::size_t operator()(const CacheKey& k) const noexcept {
+            const std::size_t h1 = std::hash<tt::ChipId>{}(k.first);
+            const std::size_t h2 = std::hash<std::uint32_t>{}(k.second);
+            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));  // boost::hash_combine
+        }
+    };
+    static std::mutex cache_mutex;
+    static std::unordered_map<CacheKey, std::optional<tt::ProgramSubDeviceInfo>, CacheKeyHash> sub_device_info_cache;
+
+    const CacheKey cache_key{device_id, runtime_id};
+    std::optional<tt::ProgramSubDeviceInfo> sub_device_info;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto cache_it = sub_device_info_cache.find(cache_key);
+        if (cache_it == sub_device_info_cache.end()) {
+            cache_it = sub_device_info_cache
+                           .emplace(cache_key, tt::GetProgramSubDevice(device_id, static_cast<uint16_t>(runtime_id)))
+                           .first;
+        }
+        sub_device_info = cache_it->second;
+    }
+    if (!sub_device_info.has_value()) {
+        return;
+    }
+    meta_data["sub_device_id"] = sub_device_info->sub_device_id;
+    meta_data["sub_device_manager_id"] = sub_device_info->sub_device_manager_id;
+}
+
+void add_program_sub_device_meta_data(nlohmann::json& meta_data, uint32_t encoded_run_host_id) {
+    if (encoded_run_host_id == 0) {
+        return;
+    }
+    const auto decoded = detail::DecodePerDeviceProgramID(encoded_run_host_id);
+    add_program_sub_device_meta_data(meta_data, decoded.device_id, decoded.base_program_id);
+}
+
+#if defined(TRACY_ENABLE)
+NOCDebugEvent make_noc_debug_event(
+    const CoreCoord& src_core,
+    const KernelProfilerNocEventMetadata::LocalNocEvent& event,
+    const KernelProfilerNocEventMetadata::LocalNocEventDstTrailer& trailer) {
+    using EMD = KernelProfilerNocEventMetadata;
+    int8_t src_x = static_cast<int8_t>(src_core.x);
+    int8_t src_y = static_cast<int8_t>(src_core.y);
+    switch (event.noc_xfer_type) {
+        case EMD::NocEventType::READ:
+            return NOCDebugEvent(NocReadEvent{
+                trailer.getDstAddr(),
+                trailer.getSrcAddr(),
+                event.getNumBytes(),
+                static_cast<uint32_t>(trailer.counter_value),
+                event.dst_x,
+                event.dst_y,
+                src_x,
+                src_y,
+                event.noc_type == EMD::NocType::NOC_1});
+        case EMD::NocEventType::WRITE_: [[fallthrough]];
+        case EMD::NocEventType::WRITE_MULTICAST: [[fallthrough]];
+        case EMD::NocEventType::SEMAPHORE_SET_MULTICAST: [[fallthrough]];
+        case EMD::NocEventType::SEMAPHORE_SET_REMOTE: {
+            bool is_semaphore = event.noc_xfer_type == EMD::NocEventType::SEMAPHORE_SET_MULTICAST ||
+                                event.noc_xfer_type == EMD::NocEventType::SEMAPHORE_SET_REMOTE;
+            bool is_mcast = event.noc_xfer_type == EMD::NocEventType::WRITE_MULTICAST ||
+                            event.noc_xfer_type == EMD::NocEventType::SEMAPHORE_SET_MULTICAST;
+            return NOCDebugEvent(NocWriteEvent{
+                trailer.getSrcAddr(),
+                trailer.getDstAddr(),
+                event.getNumBytes(),
+                static_cast<uint32_t>(trailer.counter_value),
+                src_x,
+                src_y,
+                event.dst_x,
+                event.dst_y,
+                static_cast<bool>(event.posted),
+                event.noc_type == EMD::NocType::NOC_1,
+                is_semaphore,
+                is_mcast,
+                event.mcast_end_dst_x,
+                event.mcast_end_dst_y});
+        }
+        case EMD::NocEventType::READ_BARRIER_END:
+            return NOCDebugEvent(NocReadBarrierEvent{src_x, src_y, event.noc_type == EMD::NocType::NOC_1});
+        case EMD::NocEventType::WRITE_BARRIER_END: [[fallthrough]];
+        case EMD::NocEventType::WRITE_FLUSH:
+            // This event is only being emitted from noc_async_writes_flushed which is non posted
+            // event.posted should always be false; if true, data was corrupted during read
+            TT_ASSERT(!event.posted);
+            return NOCDebugEvent(NocWriteFlushEvent{
+                src_x, src_y, static_cast<bool>(event.posted), event.noc_type == EMD::NocType::NOC_1});
+        default: return NOCDebugEvent(UnknownNocEvent{});
+    }
+}
+
+uint32_t risc_type_to_control_buffer_dram_address_offset(tracy::RiscType risc_type) {
+    kernel_profiler::ControlBuffer offset;
+    switch (risc_type) {
+        case tracy::RiscType::BRISC: [[fallthrough]];
+        case tracy::RiscType::ERISC: offset = kernel_profiler::ControlBuffer::DRAM_PROFILER_ADDRESS_BR_ER_0; break;
+        case tracy::RiscType::NCRISC: offset = kernel_profiler::ControlBuffer::DRAM_PROFILER_ADDRESS_NC_0; break;
+        case tracy::RiscType::TRISC_0: offset = kernel_profiler::ControlBuffer::DRAM_PROFILER_ADDRESS_T0_0; break;
+        case tracy::RiscType::TRISC_1: offset = kernel_profiler::ControlBuffer::DRAM_PROFILER_ADDRESS_T1_0; break;
+        case tracy::RiscType::TRISC_2: offset = kernel_profiler::ControlBuffer::DRAM_PROFILER_ADDRESS_T2_0; break;
+        default: TT_THROW("Invalid RISC type {}", risc_type);
+    }
+    return static_cast<uint32_t>(offset);
+}
+
+uint32_t risc_type_to_control_buffer_host_index_offset(tracy::RiscType risc_type) {
+    kernel_profiler::ControlBuffer offset;
+    switch (risc_type) {
+        case tracy::RiscType::BRISC: [[fallthrough]];
+        case tracy::RiscType::ERISC: offset = kernel_profiler::ControlBuffer::HOST_BUFFER_END_INDEX_BR_ER; break;
+        case tracy::RiscType::NCRISC: offset = kernel_profiler::ControlBuffer::HOST_BUFFER_END_INDEX_NC; break;
+        case tracy::RiscType::TRISC_0: offset = kernel_profiler::ControlBuffer::HOST_BUFFER_END_INDEX_T0; break;
+        case tracy::RiscType::TRISC_1: offset = kernel_profiler::ControlBuffer::HOST_BUFFER_END_INDEX_T1; break;
+        case tracy::RiscType::TRISC_2: offset = kernel_profiler::ControlBuffer::HOST_BUFFER_END_INDEX_T2; break;
+        default: TT_THROW("Invalid RISC type {}", risc_type);
+    }
+    return static_cast<uint32_t>(offset);
+}
+
+uint32_t risc_type_to_control_buffer_device_index_offset(tracy::RiscType risc_type) {
+    kernel_profiler::ControlBuffer offset;
+    switch (risc_type) {
+        case tracy::RiscType::BRISC: [[fallthrough]];
+        case tracy::RiscType::ERISC: offset = kernel_profiler::ControlBuffer::DEVICE_BUFFER_END_INDEX_BR_ER; break;
+        case tracy::RiscType::NCRISC: offset = kernel_profiler::ControlBuffer::DEVICE_BUFFER_END_INDEX_NC; break;
+        case tracy::RiscType::TRISC_0: offset = kernel_profiler::ControlBuffer::DEVICE_BUFFER_END_INDEX_T0; break;
+        case tracy::RiscType::TRISC_1: offset = kernel_profiler::ControlBuffer::DEVICE_BUFFER_END_INDEX_T1; break;
+        case tracy::RiscType::TRISC_2: offset = kernel_profiler::ControlBuffer::DEVICE_BUFFER_END_INDEX_T2; break;
+        default: TT_THROW("Invalid RISC type {}", risc_type);
+    }
+    return static_cast<uint32_t>(offset);
+}
+
+int get_processor_id(tracy::RiscType risc_type) {
+    switch (risc_type) {
+        case tracy::RiscType::BRISC: return 0;
+        case tracy::RiscType::NCRISC: return 1;
+        case tracy::RiscType::TRISC_0: return 2;
+        case tracy::RiscType::TRISC_1: return 3;
+        case tracy::RiscType::TRISC_2: return 4;
+        default: TT_THROW("Invalid RISC type {}", risc_type);
+    }
+}
+
+DeviceAddr getControlVectorAddress(IDevice* device, const CoreCoord& virtual_core, ContextId context_id) {
+    TT_ASSERT(context_id == extract_context_id(device));
+    const auto& hal = MetalContext::instance(context_id).hal();
+    const HalProgrammableCoreType core_type = tt::llrt::get_core_type(device->id(), virtual_core);
+    DeviceAddr profiler_msg_addr = hal.get_dev_addr(core_type, HalL1MemAddrType::PROFILER);
+    DeviceAddr control_vector_addr =
+        profiler_msg_addr + hal.get_dev_msgs_factory(core_type).offset_of<dev_msgs::profiler_msg_t>(
+                                dev_msgs::profiler_msg_t::Field::control_vector);
+    return control_vector_addr;
+}
+#endif
+
+}  // namespace
+
+tracy::TTDeviceMarkerType get_marker_type_from_packet_type(kernel_profiler::PacketTypes packet_type) {
+    switch (packet_type) {
+        case kernel_profiler::PacketTypes::ZONE_START: return tracy::TTDeviceMarkerType::ZONE_START;
+        case kernel_profiler::PacketTypes::ZONE_END: return tracy::TTDeviceMarkerType::ZONE_END;
+        case kernel_profiler::PacketTypes::ZONE_TOTAL: return tracy::TTDeviceMarkerType::ZONE_TOTAL;
+        // TS_DATA_16B contains additional metadata from trailers
+        case kernel_profiler::PacketTypes::TS_DATA: [[fallthrough]];
+        case kernel_profiler::PacketTypes::TS_DATA_16B: return tracy::TTDeviceMarkerType::TS_DATA;
+        case kernel_profiler::PacketTypes::TS_EVENT: return tracy::TTDeviceMarkerType::TS_EVENT;
+        default: TT_THROW("Invalid packet type");
+    }
 }
 
 uint32_t hash32CT(const char* str, size_t n, uint32_t basis) {
@@ -63,19 +264,23 @@ void populateZoneSrcLocations(
     const std::string& new_log_name,
     const std::string& log_name,
     const bool push_new,
-    std::unordered_map<uint16_t, ZoneDetails>& hash_to_zone_src_locations,
+    std::unordered_map<uint16_t, tracy::MarkerDetails>& hash_to_zone_src_locations,
     std::unordered_set<std::string>& zone_src_locations) {
     std::ifstream log_file_read(new_log_name);
     std::string line;
+    static const std::string delimiter = "'#pragma message: ";
     while (std::getline(log_file_read, line)) {
-        std::string delimiter = "'#pragma message: ";
-        int delimiter_index = line.find(delimiter) + delimiter.length();
+        auto pos = line.find(delimiter);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        size_t delimiter_index = pos + delimiter.length();
         std::string zone_src_location = line.substr(delimiter_index, line.length() - delimiter_index - 1);
 
         uint16_t hash_16bit = hash16CT(zone_src_location);
 
         auto did_insert = zone_src_locations.insert(zone_src_location);
-        if (did_insert.second && (hash_to_zone_src_locations.find(hash_16bit) != hash_to_zone_src_locations.end())) {
+        if (did_insert.second && (hash_to_zone_src_locations.contains(hash_16bit))) {
             TT_THROW("Source location hashes are colliding, two different locations are having the same hash");
         }
 
@@ -87,7 +292,23 @@ void populateZoneSrcLocations(
         std::getline(ss, source_file, ',');
         std::getline(ss, line_num_str, ',');
 
-        ZoneDetails details(zone_name, source_file, std::stoull(line_num_str));
+        if (line_num_str.empty()) {
+            log_warning(tt::LogMetal, "Skipping malformed zone source location entry: {}", zone_src_location);
+            continue;
+        }
+        uint64_t line_num = 0;
+        try {
+            line_num = std::stoull(line_num_str);
+        } catch (const std::exception& e) {
+            log_warning(
+                tt::LogMetal,
+                "Skipping zone source location entry '{}' with invalid line number '{}': {}",
+                zone_src_location,
+                line_num_str,
+                e.what());
+            continue;
+        }
+        tracy::MarkerDetails details(zone_name, source_file, line_num);
 
         auto ret = hash_to_zone_src_locations.emplace(hash_16bit, details);
         if (ret.second && push_new) {
@@ -99,18 +320,18 @@ void populateZoneSrcLocations(
     log_file_read.close();
 }
 
-std::unordered_map<uint16_t, ZoneDetails> generateZoneSourceLocationsHashes() {
-    std::unordered_map<uint16_t, ZoneDetails> hash_to_zone_src_locations;
+std::unordered_map<uint16_t, tracy::MarkerDetails> generateZoneSourceLocationsHashes() {
+    std::unordered_map<uint16_t, tracy::MarkerDetails> hash_to_zone_src_locations;
     std::unordered_set<std::string> zone_src_locations;
 
     // Load existing zones from previous runs
     populateZoneSrcLocations(
-        tt::tt_metal::PROFILER_ZONE_SRC_LOCATIONS_LOG, "", false, hash_to_zone_src_locations, zone_src_locations);
+        PROFILER_ZONE_SRC_LOCATIONS_LOG, "", false, hash_to_zone_src_locations, zone_src_locations);
 
     // Load new zones from the current run
     populateZoneSrcLocations(
-        tt::tt_metal::NEW_PROFILER_ZONE_SRC_LOCATIONS_LOG,
-        tt::tt_metal::PROFILER_ZONE_SRC_LOCATIONS_LOG,
+        NEW_PROFILER_ZONE_SRC_LOCATIONS_LOG,
+        PROFILER_ZONE_SRC_LOCATIONS_LOG,
         true,
         hash_to_zone_src_locations,
         zone_src_locations);
@@ -118,162 +339,169 @@ std::unordered_map<uint16_t, ZoneDetails> generateZoneSourceLocationsHashes() {
     return hash_to_zone_src_locations;
 }
 
-tracy::Color::ColorType getDeviceEventColor(
-    uint32_t risc_num,
-    const std::array<bool, static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::COUNT)>& zone_name_keyword_flags) {
-    constexpr std::array<tracy::Color::ColorType, 7> colors = {
-        tracy::Color::Orange2,
-        tracy::Color::SeaGreen3,
-        tracy::Color::SkyBlue3,
-        tracy::Color::Turquoise2,
-        tracy::Color::CadetBlue1,
-        tracy::Color::Yellow3,
-        tracy::Color::DarkSlateGray3};
-    return (zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::PROFILER)])
-               ? tracy::Color::Tomato3
-               : colors[risc_num % colors.size()];
-}
+void mergeSortedDeviceMarkerChunks(
+    std::vector<std::reference_wrapper<const tracy::TTDeviceMarker>>& device_markers,
+    const std::vector<uint32_t>& device_markers_chunk_offsets,
+    ThreadPool& thread_pool) {
+    const uint32_t num_chunks = device_markers_chunk_offsets.size() - 1;
 
-void sortDeviceEvents(std::vector<std::reference_wrapper<const tracy::TTDeviceEvent>>& device_events) {
-    constexpr uint32_t num_threads = 8;
+    uint32_t num_chunks_to_merge_together = 2;
+    while (num_chunks_to_merge_together <= num_chunks) {
+        uint32_t i = 0;
+        while (i <= num_chunks - num_chunks_to_merge_together) {
+            thread_pool.enqueue([&device_markers, &device_markers_chunk_offsets, i, num_chunks_to_merge_together]() {
+                TT_ASSERT(std::is_sorted(
+                    device_markers.begin() + device_markers_chunk_offsets[i],
+                    device_markers.begin() + device_markers_chunk_offsets[i + (num_chunks_to_merge_together / 2)],
+                    [](std::reference_wrapper<const tracy::TTDeviceMarker> a,
+                       std::reference_wrapper<const tracy::TTDeviceMarker> b) { return a.get() < b.get(); }));
+                TT_ASSERT(std::is_sorted(
+                    device_markers.begin() + device_markers_chunk_offsets[i + (num_chunks_to_merge_together / 2)],
+                    device_markers.begin() + device_markers_chunk_offsets[i + num_chunks_to_merge_together],
+                    [](std::reference_wrapper<const tracy::TTDeviceMarker> a,
+                       std::reference_wrapper<const tracy::TTDeviceMarker> b) { return a.get() < b.get(); }));
 
-    if (device_events.size() < num_threads) {
-        std::sort(
-            device_events.begin(),
-            device_events.end(),
-            [](std::reference_wrapper<const tracy::TTDeviceEvent> a,
-               std::reference_wrapper<const tracy::TTDeviceEvent> b) { return a.get() < b.get(); });
-        return;
+                std::inplace_merge(
+                    device_markers.begin() + device_markers_chunk_offsets[i],
+                    device_markers.begin() + device_markers_chunk_offsets[i + (num_chunks_to_merge_together / 2)],
+                    device_markers.begin() + device_markers_chunk_offsets[i + num_chunks_to_merge_together],
+                    [](std::reference_wrapper<const tracy::TTDeviceMarker> a,
+                       std::reference_wrapper<const tracy::TTDeviceMarker> b) { return a.get() < b.get(); });
+            });
+            i += num_chunks_to_merge_together;
+        }
+
+        thread_pool.wait();
+
+        TT_ASSERT(std::is_sorted(
+            device_markers.begin() + device_markers_chunk_offsets[i - num_chunks_to_merge_together],
+            device_markers.begin() + device_markers_chunk_offsets[i],
+            [](std::reference_wrapper<const tracy::TTDeviceMarker> a,
+               std::reference_wrapper<const tracy::TTDeviceMarker> b) { return a.get() < b.get(); }));
+        TT_ASSERT(std::is_sorted(
+            device_markers.begin() + device_markers_chunk_offsets[i],
+            device_markers.end(),
+            [](std::reference_wrapper<const tracy::TTDeviceMarker> a,
+               std::reference_wrapper<const tracy::TTDeviceMarker> b) { return a.get() < b.get(); }));
+
+        std::inplace_merge(
+            device_markers.begin() + device_markers_chunk_offsets[i - num_chunks_to_merge_together],
+            device_markers.begin() + device_markers_chunk_offsets[i],
+            device_markers.end(),
+            [](std::reference_wrapper<const tracy::TTDeviceMarker> a,
+               std::reference_wrapper<const tracy::TTDeviceMarker> b) { return a.get() < b.get(); });
+
+        num_chunks_to_merge_together *= 2;
     }
-
-    std::array<std::thread, num_threads - 1> threads;
-    const uint32_t chunk_size = device_events.size() / num_threads;
-    for (uint32_t i = 0; i < num_threads - 1; i++) {
-        const uint32_t start_idx = i * chunk_size;
-        const uint32_t end_idx = (i + 1) * chunk_size;
-        threads[i] = std::thread([&device_events, start_idx, end_idx]() {
-            std::sort(
-                device_events.begin() + start_idx,
-                device_events.begin() + end_idx,
-                [](std::reference_wrapper<const tracy::TTDeviceEvent> a,
-                   std::reference_wrapper<const tracy::TTDeviceEvent> b) { return a.get() < b.get(); });
-        });
-    }
-
-    std::sort(
-        device_events.begin() + (num_threads - 1) * chunk_size,
-        device_events.end(),
-        [](std::reference_wrapper<const tracy::TTDeviceEvent> a, std::reference_wrapper<const tracy::TTDeviceEvent> b) {
-            return a.get() < b.get();
-        });
-
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    uint32_t chunk_idx = 0;
-    for (uint32_t i = 0; i < (num_threads / 2) - 1; ++i) {
-        threads[i] = std::thread([&device_events, chunk_size, chunk_idx]() {
-            std::inplace_merge(
-                device_events.begin() + chunk_idx * chunk_size,
-                device_events.begin() + (chunk_idx + 1) * chunk_size,
-                device_events.begin() + (chunk_idx + 2) * chunk_size,
-                [](std::reference_wrapper<const tracy::TTDeviceEvent> a,
-                   std::reference_wrapper<const tracy::TTDeviceEvent> b) { return a.get() < b.get(); });
-        });
-        chunk_idx += 2;
-    }
-
-    std::inplace_merge(
-        device_events.begin() + chunk_idx * chunk_size,
-        device_events.begin() + (chunk_idx + 1) * chunk_size,
-        device_events.end(),
-        [](std::reference_wrapper<const tracy::TTDeviceEvent> a, std::reference_wrapper<const tracy::TTDeviceEvent> b) {
-            return a.get() < b.get();
-        });
-
-    for (uint32_t i = 0; i < (num_threads / 2) - 1; ++i) {
-        threads[i].join();
-    }
-
-    chunk_idx = 0;
-    for (uint32_t i = 0; i < (num_threads / 4) - 1; ++i) {
-        threads[i] = std::thread([&device_events, chunk_size, chunk_idx]() {
-            std::inplace_merge(
-                device_events.begin() + chunk_idx * chunk_size,
-                device_events.begin() + (chunk_idx + 2) * chunk_size,
-                device_events.begin() + (chunk_idx + 4) * chunk_size,
-                [](std::reference_wrapper<const tracy::TTDeviceEvent> a,
-                   std::reference_wrapper<const tracy::TTDeviceEvent> b) { return a.get() < b.get(); });
-        });
-        chunk_idx += 4;
-    }
-
-    std::inplace_merge(
-        device_events.begin() + chunk_idx * chunk_size,
-        device_events.begin() + (chunk_idx + 2) * chunk_size,
-        device_events.end(),
-        [](std::reference_wrapper<const tracy::TTDeviceEvent> a, std::reference_wrapper<const tracy::TTDeviceEvent> b) {
-            return a.get() < b.get();
-        });
-
-    for (uint32_t i = 0; i < (num_threads / 4) - 1; ++i) {
-        threads[i].join();
-    }
-
-    std::inplace_merge(
-        device_events.begin(),
-        device_events.begin() + 4 * chunk_size,
-        device_events.end(),
-        [](std::reference_wrapper<const tracy::TTDeviceEvent> a, std::reference_wrapper<const tracy::TTDeviceEvent> b) {
-            return a.get() < b.get();
-        });
 
     TT_ASSERT(std::is_sorted(
-        device_events.begin(),
-        device_events.end(),
-        [](std::reference_wrapper<const tracy::TTDeviceEvent> a, std::reference_wrapper<const tracy::TTDeviceEvent> b) {
-            return a.get() < b.get();
-        }));
+        device_markers.begin(),
+        device_markers.end(),
+        [](std::reference_wrapper<const tracy::TTDeviceMarker> a,
+           std::reference_wrapper<const tracy::TTDeviceMarker> b) { return a.get() < b.get(); }));
 }
 
-std::vector<std::reference_wrapper<const tracy::TTDeviceEvent>> getDeviceEventsVector(
-    const std::unordered_set<tracy::TTDeviceEvent>& device_events) {
-    tracy::TTDeviceEvent dummy_event;
-    std::vector<std::reference_wrapper<const tracy::TTDeviceEvent>> device_events_vec(
-        device_events.size(), std::cref(dummy_event));
+// Merges markers from each (physical core, risc type) group into a single sorted vector. The markers in each group
+// should already be sorted.
+//
+// IMPORTANT: This function creates a vector of references to the TTDeviceMarker objects stored in
+// device_markers_per_core_risc_map. These are direct references to the original objects, not copies of the data.
+// Thread safety warning: device_markers_per_core_risc_map MUST NOT be modified (no insertions, deletions, or rehashing)
+// while these references are in use, as this could invalidate the references and cause undefined behavior.
+std::vector<std::reference_wrapper<const tracy::TTDeviceMarker>> getSortedDeviceMarkersVector(
+    const std::map<CoreCoord, std::map<tracy::RiscType, std::set<tracy::TTDeviceMarker>>>&
+        device_markers_per_core_risc_map,
+    ThreadPool& thread_pool) {
+    ZoneScoped;
 
-    auto middle = device_events.begin();
-    std::advance(middle, device_events.size() / 2);
+    uint32_t total_num_markers = 0;
+    auto middle = device_markers_per_core_risc_map.begin();
+    std::advance(middle, device_markers_per_core_risc_map.size() / 2);
+    uint32_t middle_index = 0;
+    std::vector<uint32_t> device_markers_chunk_offsets;
+    for (const auto& [core, risc_map] : device_markers_per_core_risc_map) {
+        if (core == middle->first) {
+            middle_index = total_num_markers;
+        }
+        for (const auto& [_, markers] : risc_map) {
+            device_markers_chunk_offsets.push_back(total_num_markers);
+            total_num_markers += markers.size();
+        }
+    }
 
-    std::thread t([&device_events_vec, &device_events, &middle]() {
-        uint32_t i = device_events.size() / 2;
-        for (auto it = middle; it != device_events.end(); ++it) {
-            device_events_vec[i] = std::cref(*it);
-            i++;
+    device_markers_chunk_offsets.push_back(total_num_markers);
+
+    tracy::TTDeviceMarker dummy_marker;
+    std::vector<std::reference_wrapper<const tracy::TTDeviceMarker>> device_markers_vec(
+        total_num_markers, std::cref(dummy_marker));
+
+    thread_pool.enqueue([&device_markers_vec, &device_markers_per_core_risc_map, middle, middle_index]() {
+        uint32_t i = middle_index;
+        for (auto it = middle; it != device_markers_per_core_risc_map.end(); ++it) {
+            for (const auto& [_, markers] : it->second) {
+                for (const tracy::TTDeviceMarker& marker : markers) {
+                    device_markers_vec[i] = std::cref(marker);
+                    ++i;
+                }
+            }
         }
     });
 
     uint32_t i = 0;
-    for (auto it = device_events.begin(); it != middle; ++it) {
-        device_events_vec[i] = std::cref(*it);
-        i++;
+    for (auto it = device_markers_per_core_risc_map.begin(); it != middle; ++it) {
+        for (const auto& [_, markers] : it->second) {
+            for (const tracy::TTDeviceMarker& marker : markers) {
+                device_markers_vec[i] = std::cref(marker);
+                ++i;
+            }
+        }
     }
 
-    t.join();
+    thread_pool.wait();
 
-    return device_events_vec;
+    mergeSortedDeviceMarkerChunks(device_markers_vec, device_markers_chunk_offsets, thread_pool);
+
+    return device_markers_vec;
 }
 
-bool doAllDispatchCoresComeAfterNonDispatchCores(const IDevice* device, const std::vector<CoreCoord>& virtual_cores) {
-    const auto& dispatch_core_config = get_dispatch_core_config();
-    const std::vector<CoreCoord> logical_dispatch_cores =
-        get_logical_dispatch_cores(device->id(), device->num_hw_cqs(), dispatch_core_config);
+std::set<experimental::ProgramAnalysisData> translateProgramsPerfResults(
+    const ProgramsPerfResults& programs_perf_results) {
+    ZoneScoped;
 
+    std::set<experimental::ProgramAnalysisData> programs_analyses_data;
+    for (const auto& [program_execution_uid, program_perf_results] :
+         programs_perf_results.program_execution_uid_to_perf_results) {
+        experimental::ProgramAnalysisData program_analysis_data;
+        program_analysis_data.program_execution_uid = program_execution_uid;
+        TT_ASSERT(
+            program_perf_results.analysis_results.size() == programs_perf_results.analysis_results_configs.size());
+        for (uint32_t i = 0; i < program_perf_results.analysis_results.size(); ++i) {
+            const AnalysisResultsConfig results_config = programs_perf_results.analysis_results_configs[i];
+            program_analysis_data.program_analyses_results[results_config.analysis_name] =
+                program_perf_results.analysis_results[i];
+        }
+        program_analysis_data.core_count = program_perf_results.program_meta_data.num_fw_cores;
+        program_analysis_data.num_available_cores = program_perf_results.program_meta_data.num_available_worker_cores;
+        programs_analyses_data.insert(program_analysis_data);
+    }
+    return programs_analyses_data;
+}
+
+bool doAllDispatchCoresComeAfterNonDispatchCores(
+    const IDevice* device, const std::vector<CoreCoord>& virtual_cores, ContextId context_id) {
+    TT_ASSERT(context_id == extract_context_id(device));
+    const auto& dispatch_core_config = get_dispatch_core_config();
+    auto& env = MetalEnvAccessor(tt::tt_metal::MetalContext::instance(context_id).get_env()).impl();
+    const std::vector<CoreCoord> logical_dispatch_cores =
+        get_logical_dispatch_cores(env, device->id(), device->num_hw_cqs(), dispatch_core_config);
+
+    const CoreType dispatch_core_type =
+        resolve_dispatch_core_type(env, device->id(), dispatch_core_config);
     std::vector<CoreCoord> virtual_dispatch_cores;
+    virtual_dispatch_cores.reserve(logical_dispatch_cores.size());
     for (const CoreCoord& core : logical_dispatch_cores) {
         const CoreCoord virtual_dispatch_core =
-            device->virtual_core_from_logical_core(core, dispatch_core_config.get_core_type());
+            device->virtual_core_from_logical_core(core, dispatch_core_type);
         virtual_dispatch_cores.push_back(virtual_dispatch_core);
     }
 
@@ -289,211 +517,221 @@ bool doAllDispatchCoresComeAfterNonDispatchCores(const IDevice* device, const st
     return true;
 }
 
-CoreCoord getPhysicalAddressFromVirtual(chip_id_t device_id, const CoreCoord& c) {
-    bool coord_is_translated = c.x >= MetalContext::instance().hal().get_virtual_worker_start_x() - 1 ||
-                               c.y >= MetalContext::instance().hal().get_virtual_worker_start_y() - 1;
+// The input coordinates are from noc tracing and therefore
+// will be in whatever coord system is used by the noc for that core type on that arch
+// so translation to the NOC 0 coordinate system must be done accordingly
+// For wormhole, tensix and ethernet coords are TRANSLATED and dram are NOC_0/NOC_1
+// For blackhole, tensix, ethernet, and dram are all TRANSLATED
+tt::umd::CoreCoord translateNocCoordinatesToNoc0(
+    ChipId device_id, const CoreCoord& c, KernelProfilerNocEventMetadata::NocType noc_used_for_transfer) {
+    bool coord_is_translated = MetalContext::instance().get_cluster().arch() != tt::ARCH::WORMHOLE_B0 ||
+                               c.x >= tt::umd::wormhole::tensix_translated_coordinate_start_x ||
+                               c.y >= tt::umd::wormhole::tensix_translated_coordinate_start_y ||
+                               c.x >= tt::umd::wormhole::eth_translated_coordinate_start_x ||
+                               c.y >= tt::umd::wormhole::eth_translated_coordinate_start_y;
     try {
+        const metal_SocDescriptor& soc_desc = MetalContext::instance().get_cluster().get_soc_desc(device_id);
         if (MetalContext::instance().hal().is_coordinate_virtualization_enabled() && coord_is_translated) {
-            const metal_SocDescriptor& soc_desc =
-                tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(device_id);
-            // disable linting here; slicing is __intended__
-            // NOLINTBEGIN
             return soc_desc.translate_coord_to(c, CoordSystem::TRANSLATED, CoordSystem::NOC0);
-            // NOLINTEND
-        } else {
-            return c;
         }
+        if (noc_used_for_transfer == KernelProfilerNocEventMetadata::NocType::NOC_0) {
+            // Check for noc 0 coord and return
+            return soc_desc.get_coord_at(c, CoordSystem::NOC0);
+        }  // soc desc is not created with noc1 mapping by default  so will have to manually convert to noc0
+        CoreCoord noc0_coord(soc_desc.grid_size.x - 1 - c.x, soc_desc.grid_size.y - 1 - c.y);
+        // Check for noc 0 coord and return
+        return soc_desc.get_coord_at(noc0_coord, CoordSystem::NOC0);
+
     } catch (const std::exception& e) {
-        log_error(tt::LogMetal, "Failed to translate virtual coordinate {},{} to physical", c.x, c.y);
-        return c;
+        TT_FATAL(
+            0,
+            "Failed to translate coordinate {},{} used on {} to NOC0 coordinates",
+            c.x,
+            c.y,
+            enchantum::to_string(noc_used_for_transfer));
     }
-    return c;
+    TT_FATAL(
+        0,
+        "Failed to translate coordinate {},{} used on {} to NOC0 coordinates",
+        c.x,
+        c.y,
+        enchantum::to_string(noc_used_for_transfer));
 }
 
-bool isDatapointAZone(const DeviceProfilerDataPoint& datapoint) {
-    return datapoint.packet_type == kernel_profiler::ZONE_START || datapoint.packet_type == kernel_profiler::ZONE_END;
+bool skipReadingDeviceTraceCounter() {
+    return MetalContext::instance().rtoptions().get_profiler_do_dispatch_cores() ||
+           MetalContext::instance().rtoptions().get_profiler_trace_only();
 }
 
-bool isDatapointTimestampedData(const DeviceProfilerDataPoint& datapoint) {
-    return datapoint.packet_type == kernel_profiler::TS_DATA;
+bool isMarkerAZoneEndpoint(const tracy::TTDeviceMarker& marker) {
+    return marker.marker_type == tracy::TTDeviceMarkerType::ZONE_START ||
+           marker.marker_type == tracy::TTDeviceMarkerType::ZONE_END;
+}
+
+bool isMarkerATimestampedDatapoint(const tracy::TTDeviceMarker& marker) {
+    return marker.marker_type == tracy::TTDeviceMarkerType::TS_DATA;
 }
 
 void addFabricMuxEvents(
-    std::vector<DeviceProfilerDataPoint>& events,
-    std::unordered_map<CoreCoord, std::queue<DeviceProfilerDataPoint>>& fabric_mux_events,
+    std::vector<tracy::TTDeviceMarker>& markers,
+    std::unordered_map<CoreCoord, std::queue<tracy::TTDeviceMarker>>& fabric_mux_markers,
     const CoreCoord& fabric_mux_core) {
     using EMD = KernelProfilerNocEventMetadata;
-    for (int i = 0; i < events.size(); i++) {
-        if (isDatapointTimestampedData(events[i]) && CoreCoord(events[i].core_x, events[i].core_y) == fabric_mux_core &&
-            std::get<EMD::LocalNocEvent>(EMD(events[i].data).getContents()).noc_xfer_type ==
-                EMD::NocEventType::WRITE_) {
-            fabric_mux_events[fabric_mux_core].push(events[i]);
+    for (const auto& marker : markers) {
+        if (isMarkerATimestampedDatapoint(marker) && CoreCoord(marker.core_x, marker.core_y) == fabric_mux_core &&
+            std::get<EMD::LocalNocEvent>(EMD(marker.data).getContents()).noc_xfer_type == EMD::NocEventType::WRITE_) {
+            fabric_mux_markers[fabric_mux_core].push(marker);
         }
     }
 }
 
 void removeFabricMuxEvents(
-    std::vector<std::variant<FabricEventDataPoints, DeviceProfilerDataPoint>>& coalesced_events,
+    std::vector<std::variant<FabricEventMarkers, tracy::TTDeviceMarker>>& coalesced_events,
     const CoreCoord& fabric_mux_core) {
-    std::vector<std::variant<FabricEventDataPoints, DeviceProfilerDataPoint>> filtered_events;
-    for (int i = 0; i < coalesced_events.size(); i++) {
-        if (std::holds_alternative<DeviceProfilerDataPoint>(coalesced_events[i])) {
-            auto event = std::get<DeviceProfilerDataPoint>(coalesced_events[i]);
+    std::vector<std::variant<FabricEventMarkers, tracy::TTDeviceMarker>> filtered_events;
+    filtered_events.reserve(coalesced_events.size());
+    for (const auto& coalesced_event : coalesced_events) {
+        if (std::holds_alternative<tracy::TTDeviceMarker>(coalesced_event)) {
+            auto event = std::get<tracy::TTDeviceMarker>(coalesced_event);
 
-            if (isDatapointAZone(event) || CoreCoord(event.core_x, event.core_y) != fabric_mux_core) {
-                filtered_events.push_back(coalesced_events[i]);
+            if (isMarkerAZoneEndpoint(event) || CoreCoord(event.core_x, event.core_y) != fabric_mux_core) {
+                filtered_events.push_back(coalesced_event);
             }
         } else {
-            filtered_events.push_back(coalesced_events[i]);
+            filtered_events.push_back(coalesced_event);
         }
     }
     coalesced_events = std::move(filtered_events);
 }
 
-std::unordered_map<RuntimeID, nlohmann::json::array_t> convertNocTracePacketsToJson(
-    const std::vector<DeviceProfilerDataPoint>::const_iterator start_it,
-    const std::vector<DeviceProfilerDataPoint>::const_iterator end_it,
-    chip_id_t device_id,
-    const FabricRoutingLookup& routing_lookup) {
-    if (!MetalContext::instance().rtoptions().get_profiler_noc_events_enabled()) {
-        return std::unordered_map<RuntimeID, nlohmann::json::array_t>();
-    }
+bool compareMarkersByCoreAndTimestamp(const tracy::TTDeviceMarker& a, const tracy::TTDeviceMarker& b) {
+    return std::tie(a.core_x, a.core_y, a.risc, a.timestamp) < std::tie(b.core_x, b.core_y, b.risc, b.timestamp);
+}
 
+bool compareCoalescedMarkersByCoreAndTimestamp(
+    const std::variant<FabricEventMarkers, tracy::TTDeviceMarker>& a,
+    const std::variant<FabricEventMarkers, tracy::TTDeviceMarker>& b) {
+    auto a_marker = std::holds_alternative<tracy::TTDeviceMarker>(a)
+                        ? std::get<tracy::TTDeviceMarker>(a)
+                        : std::get<FabricEventMarkers>(a).local_noc_write_marker;
+    auto b_marker = std::holds_alternative<tracy::TTDeviceMarker>(b)
+                        ? std::get<tracy::TTDeviceMarker>(b)
+                        : std::get<FabricEventMarkers>(b).local_noc_write_marker;
+    // Include marker_id in sort order to ensure trailers (marker_id = M+1) come immediately after their events
+    // (marker_id = M)
+    return std::tie(a_marker.core_x, a_marker.core_y, a_marker.risc, a_marker.timestamp, a_marker.marker_id) <
+           std::tie(b_marker.core_x, b_marker.core_y, b_marker.risc, b_marker.timestamp, b_marker.marker_id);
+}
+
+auto coalesceFabricEvents(
+    std::unordered_map<experimental::ProgramExecutionUID, std::vector<tracy::TTDeviceMarker>>&
+        timestamped_datapoints_by_op,
+    ChipId device_id) {
+    std::unordered_map<
+        experimental::ProgramExecutionUID,
+        std::vector<std::variant<FabricEventMarkers, tracy::TTDeviceMarker>>>
+        coalesced_events_by_op;
     using EMD = KernelProfilerNocEventMetadata;
-    std::unordered_map<RuntimeID, std::vector<DeviceProfilerDataPoint>> events_by_opname;
-    // Pass 1: separate out start/end zones and noc events from datapoints and group by runtime id
-    for (auto it = start_it; it != end_it; ++it) {
-        const DeviceProfilerDataPoint& data_point = *it;
-        if (isDatapointAZone(data_point)) {
-            if ((data_point.risc_name == "NCRISC" || data_point.risc_name == "BRISC") &&
-                (data_point.zone_name.starts_with("TRUE-KERNEL-END") || data_point.zone_name.ends_with("-KERNEL"))) {
-                events_by_opname[data_point.run_host_id].push_back(data_point);
-            }
-        } else if (isDatapointTimestampedData(data_point)) {
-            events_by_opname[data_point.run_host_id].push_back(data_point);
-        }
+
+    // Need to sort noc events in each opname group by x, y, proc, timestamp for proper coalescing
+    for (auto& [program_execution_uid, markers] : timestamped_datapoints_by_op) {
+        std::sort(markers.begin(), markers.end(), compareMarkersByCoreAndTimestamp);
     }
 
-    // Pass 2: sort noc events in each opname group by x, y, proc, and then timestamp
-    for (auto& [runtime_id, events] : events_by_opname) {
-        std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) {
-            return std::tie(a.core_x, a.core_y, a.risc_name, a.timestamp) <
-                   std::tie(b.core_x, b.core_y, b.risc_name, b.timestamp);
-        });
-    }
-
-    // Pass 3: for each opname in events_by_opname, adjust timestamps to be relative to the smallest timestamp within
-    // the group with identical sx,sy,proc
-    for (auto& [runtime_id, events] : events_by_opname) {
-        std::tuple<int, int, std::string> reference_event_loc;
-        uint64_t reference_timestamp = 0;
-        for (auto& data_point : events) {
-            // if -KERNEL::begin event is found, reset the reference timestamp
-            std::string zone = data_point.zone_name;
-            if (zone.ends_with("-KERNEL") && data_point.packet_type == kernel_profiler::ZONE_START) {
-                reference_timestamp = data_point.timestamp;
-            }
-
-            // fix timestamp to be relative to reference_timestamp
-            data_point.timestamp = data_point.timestamp - reference_timestamp;
-        }
-    }
-
-    // Pass 4: group fabric event datapoints into a single struct to process later
-    std::unordered_map<RuntimeID, std::vector<std::variant<FabricEventDataPoints, DeviceProfilerDataPoint>>>
-        coalesced_events_by_opname;
-    for (auto& [runtime_id, events] : events_by_opname) {
+    for (auto& [program_execution_uid, markers] : timestamped_datapoints_by_op) {
         // temporary queue to store events on fabric muxes
-        std::unordered_map<CoreCoord, std::queue<DeviceProfilerDataPoint>> fabric_mux_datapoints;
+        std::unordered_map<CoreCoord, std::queue<tracy::TTDeviceMarker>> fabric_mux_markers;
 
-        for (size_t i = 0; i < events.size(); /* manual increment */) {
+        for (size_t i = 0; i < markers.size(); /* manual increment */) {
             // If it is a zone, simply copy existing event as-is
-            if (isDatapointAZone(events[i])) {
-                coalesced_events_by_opname[runtime_id].push_back(events[i]);
-                i += 1;
-                continue;
-            }
-
-            auto current_event = EMD(events[i].data).getContents();
+            auto current_event = EMD(markers[i].data).getContents();
+            TT_FATAL(
+                EMD::isValidEventType(EMD(markers[i].data).data.raw_event.noc_xfer_type),
+                "Invalid NoC transfer type on device: {}.",
+                device_id);
             if (std::holds_alternative<EMD::FabricNoCScatterEvent>(current_event) ||
                 std::holds_alternative<EMD::FabricNoCEvent>(current_event)) {
-                FabricEventDataPoints fabric_event_datapoints;
+                FabricEventMarkers fabric_event_markers;
                 if (std::holds_alternative<EMD::FabricNoCScatterEvent>(current_event)) {
                     auto fabric_noc_scatter_event = std::get<EMD::FabricNoCScatterEvent>(current_event);
 
-                    if (i + fabric_noc_scatter_event.num_chunks - 1 >= events.size()) {
+                    if (i + fabric_noc_scatter_event.num_chunks - 1 >= markers.size()) {
                         log_warning(
                             tt::LogMetal,
                             "[profiler noc tracing] Failed to coalesce fabric noc trace events in op '{}': "
                             "missing remaining fabric scatter write chunks.",
-                            events[i].op_name);
+                            markers[i].op_name);
                         i += 1;
                         continue;
                     }
 
                     for (int j = 0; j < fabric_noc_scatter_event.num_chunks; j++) {
-                        fabric_event_datapoints.fabric_write_datapoints.push_back(events[i + j]);
+                        fabric_event_markers.fabric_write_markers.push_back(markers[i + j]);
                     }
 
                     i += fabric_noc_scatter_event.num_chunks - 1;
                 } else {
-                    fabric_event_datapoints.fabric_write_datapoints.push_back(events[i]);
+                    fabric_event_markers.fabric_write_markers.push_back(markers[i]);
                 }
 
-                if (i + 2 >= events.size() ||
-                    !std::holds_alternative<EMD::FabricRoutingFields>(EMD(events[i + 1].data).getContents()) ||
-                    !std::holds_alternative<EMD::LocalNocEvent>(EMD(events[i + 2].data).getContents()) ||
-                    std::get<EMD::LocalNocEvent>(EMD(events[i + 2].data).getContents()).noc_xfer_type !=
+                if (i + 2 >= markers.size() ||
+                    (!std::holds_alternative<EMD::FabricRoutingFields1D>(EMD(markers[i + 1].data).getContents()) &&
+                     !std::holds_alternative<EMD::FabricRoutingFields2D>(EMD(markers[i + 1].data).getContents())) ||
+                    !std::holds_alternative<EMD::LocalNocEvent>(EMD(markers[i + 2].data).getContents()) ||
+                    std::get<EMD::LocalNocEvent>(EMD(markers[i + 2].data).getContents()).noc_xfer_type !=
                         EMD::NocEventType::WRITE_) {
                     log_warning(
                         tt::LogMetal,
                         "[profiler noc tracing] Failed to coalesce fabric noc trace events in op '{}': "
                         "missing routing fields event and/or local write.",
-                        events[i].op_name);
+                        markers[i].op_name);
                     i += 1;
                     continue;
                 }
 
-                fabric_event_datapoints.fabric_routing_fields_datapoint = events[i + 1];
-                fabric_event_datapoints.local_noc_write_datapoint = events[i + 2];
+                fabric_event_markers.fabric_routing_fields_marker = markers[i + 1];
+                fabric_event_markers.local_noc_write_marker = markers[i + 2];
 
-                // if local noc write is to a fabric mux (i.e. worker core), add datapoint for fabric mux
+                // if local noc write is to a fabric mux (i.e. worker core), add marker for fabric mux
                 // if it is to a fabric router (i.e. active ethernet core), do nothing
-                auto local_noc_write = std::get<EMD::LocalNocEvent>(EMD(events[i + 2].data).getContents());
-                CoreCoord local_noc_write_dst_virt = {local_noc_write.dst_x, local_noc_write.dst_y};
+                auto local_noc_write = std::get<EMD::LocalNocEvent>(EMD(markers[i + 2].data).getContents());
+                CoreCoord local_noc_write_dst_virt = {
+                    static_cast<size_t>(local_noc_write.dst_x), static_cast<size_t>(local_noc_write.dst_y)};
                 const HalProgrammableCoreType core_type = tt::llrt::get_core_type(device_id, local_noc_write_dst_virt);
                 if (core_type == HalProgrammableCoreType::TENSIX) {
+                    // disable linting here; slicing is __intended__
+                    // NOLINTBEGIN
                     CoreCoord local_noc_write_dst_phys =
-                        getPhysicalAddressFromVirtual(device_id, local_noc_write_dst_virt);
-                    if (fabric_mux_datapoints.find(local_noc_write_dst_phys) == fabric_mux_datapoints.end()) {
-                        addFabricMuxEvents(events, fabric_mux_datapoints, local_noc_write_dst_phys);
+                        translateNocCoordinatesToNoc0(device_id, local_noc_write_dst_virt, local_noc_write.noc_type);
+                    // NOLINTEND
+                    if (!fabric_mux_markers.contains(local_noc_write_dst_phys)) {
+                        addFabricMuxEvents(markers, fabric_mux_markers, local_noc_write_dst_phys);
                     }
-                    if (fabric_mux_datapoints[local_noc_write_dst_phys].size() == 0) {
+                    if (fabric_mux_markers[local_noc_write_dst_phys].empty()) {
                         log_warning(
                             tt::LogMetal,
                             "[profiler noc tracing] Failed to coalesce fabric noc trace events in op '{}': "
                             "local write is to a worker core but corresponding event from worker (fabric mux) to eth "
                             "router not found.",
-                            events[i].op_name);
+                            markers[i].op_name);
                         i += 3;
                         continue;
                     }
-                    fabric_event_datapoints.fabric_mux_datapoint =
-                        fabric_mux_datapoints[local_noc_write_dst_phys].front();
-                    fabric_mux_datapoints[local_noc_write_dst_phys].pop();
+                    fabric_event_markers.fabric_mux_marker = fabric_mux_markers[local_noc_write_dst_phys].front();
+                    fabric_mux_markers[local_noc_write_dst_phys].pop();
                 } else if (core_type != HalProgrammableCoreType::ACTIVE_ETH) {
                     log_warning(
                         tt::LogMetal,
                         "[profiler noc tracing] Failed to coalesce fabric noc trace events in op '{}': "
                         "local noc write is to an invalid core (neither worker nor active eth).",
-                        events[i].op_name);
+                        markers[i].op_name);
                     i += 3;
                     continue;
                 }
 
                 // Check if timestamps are close enough;
-                // otherwise advance past all fabric event datapoints
-                double ts_diff = events[i + 2].timestamp - events[i].timestamp;
+                // otherwise advance past all fabric event markers
+                double ts_diff = markers[i + 2].timestamp - markers[i].timestamp;
                 if (ts_diff > 1000) {
                     log_warning(
                         tt::LogMetal,
@@ -504,59 +742,127 @@ std::unordered_map<RuntimeID, nlohmann::json::array_t> convertNocTracePacketsToJ
                     continue;
                 }
 
-                // Advance past all fabric event datapoints (fabric_event, fabric_routing_fields,
+                // Advance past all fabric event markers (fabric_event, fabric_routing_fields,
                 // local_noc_write_event)
                 i += 3;
-                coalesced_events_by_opname[runtime_id].push_back(fabric_event_datapoints);
+                coalesced_events_by_op[program_execution_uid].push_back(fabric_event_markers);
             } else {
                 // If not a fabric event group, simply copy existing event as-is
-                coalesced_events_by_opname[runtime_id].push_back(events[i]);
+                coalesced_events_by_op[program_execution_uid].push_back(markers[i]);
                 i += 1;
             }
         }
 
         // remove fabric mux events since they are now part of the coalesced fabric events
-        for (auto& [fabric_mux_core, _] : fabric_mux_datapoints) {
-            removeFabricMuxEvents(coalesced_events_by_opname[runtime_id], fabric_mux_core);
+        for (auto& [fabric_mux_core, _] : fabric_mux_markers) {
+            removeFabricMuxEvents(coalesced_events_by_op[program_execution_uid], fabric_mux_core);
         }
     }
 
-    // Pass 5: convert to json
-    std::unordered_map<RuntimeID, nlohmann::json::array_t> json_events_by_opname;
-    for (auto& [runtime_id, events] : coalesced_events_by_opname) {
-        for (auto event : events) {
-            if (std::holds_alternative<DeviceProfilerDataPoint>(event)) {
-                auto datapoint = std::get<DeviceProfilerDataPoint>(event);
+    return coalesced_events_by_op;
+}
 
-                if (isDatapointAZone(datapoint)) {
-                    tracy::TTDeviceEventPhase zone_phase = (datapoint.packet_type == kernel_profiler::ZONE_END)
-                                                               ? tracy::TTDeviceEventPhase::end
-                                                               : tracy::TTDeviceEventPhase::begin;
-                    json_events_by_opname[runtime_id].push_back(nlohmann::ordered_json{
-                        {"run_host_id", datapoint.run_host_id},
-                        {"op_name", datapoint.op_name},
-                        {"proc", datapoint.risc_name},
-                        {"zone", datapoint.zone_name},
+std::unordered_map<experimental::ProgramExecutionUID, nlohmann::json::array_t> convertNocTracePacketsToJson(
+    const std::map<CoreCoord, std::map<tracy::RiscType, std::set<tracy::TTDeviceMarker>>>&
+        device_markers_per_core_risc_map,
+    ChipId device_id,
+    const FabricRoutingLookup& routing_lookup,
+    double device_sync_freq_scale,
+    int64_t device_sync_shift) {
+    if (!MetalContext::instance().rtoptions().get_profiler_noc_events_enabled()) {
+        return std::unordered_map<experimental::ProgramExecutionUID, nlohmann::json::array_t>();
+    }
+
+    using EMD = KernelProfilerNocEventMetadata;
+    std::unordered_map<experimental::ProgramExecutionUID, std::vector<tracy::TTDeviceMarker>>
+        timestamped_datapoints_by_op;
+    std::unordered_map<experimental::ProgramExecutionUID, std::vector<tracy::TTDeviceMarker>> zones_by_op;
+    // Separate out zones and noc events, and group by runtime id
+    for (const auto& [core, risc_map] : device_markers_per_core_risc_map) {
+        for (const auto& [risc, device_markers] : risc_map) {
+            for (const tracy::TTDeviceMarker& marker : device_markers) {
+                experimental::ProgramExecutionUID program_execution_uid(
+                    marker.runtime_host_id, marker.trace_id, marker.trace_id_counter);
+                if (isMarkerAZoneEndpoint(marker)) {
+                    if (marker.marker_name != "SYNC-ZONE-SENDER" && marker.marker_name != "SYNC-ZONE-RECEIVER" &&
+                        marker.marker_name != "PROFILER-NOC-QUICK-SEND" && !marker.marker_name.ends_with("-FW") &&
+                        (!marker.marker_name.ends_with("-KERNEL") || marker.risc == tracy::RiscType::BRISC ||
+                         marker.risc == tracy::RiscType::NCRISC)) {
+                        zones_by_op[program_execution_uid].push_back(marker);
+                    }
+                } else if (isMarkerATimestampedDatapoint(marker)) {
+                    timestamped_datapoints_by_op[program_execution_uid].push_back(marker);
+                }
+            }
+        }
+    }
+
+    // Adjust timestamps based on device sync info
+    for (auto& [program_execution_uid, markers] : timestamped_datapoints_by_op) {
+        for (tracy::TTDeviceMarker& marker : markers) {
+            marker.timestamp = marker.timestamp * device_sync_freq_scale + device_sync_shift;
+        }
+    }
+    for (auto& [program_execution_uid, markers] : zones_by_op) {
+        for (tracy::TTDeviceMarker& marker : markers) {
+            marker.timestamp = marker.timestamp * device_sync_freq_scale + device_sync_shift;
+        }
+    }
+
+    // Group fabric event markers into a single struct to process later
+    std::unordered_map<
+        experimental::ProgramExecutionUID,
+        std::vector<std::variant<FabricEventMarkers, tracy::TTDeviceMarker>>>
+        coalesced_events_by_op = coalesceFabricEvents(timestamped_datapoints_by_op, device_id);
+
+    // Add zones back and sort by x, y, proc, timestamp
+    for (auto& [program_execution_uid, markers] : zones_by_op) {
+        for (auto marker : markers) {
+            coalesced_events_by_op[program_execution_uid].push_back(marker);
+        }
+    }
+    for (auto& [program_execution_uid, markers] : coalesced_events_by_op) {
+        std::sort(markers.begin(), markers.end(), compareCoalescedMarkersByCoreAndTimestamp);
+    }
+
+    // Convert to json
+    std::unordered_map<experimental::ProgramExecutionUID, nlohmann::json::array_t> json_events_by_op;
+    for (auto& [program_execution_uid, markers] : coalesced_events_by_op) {
+        for (auto& marker_it : markers) {
+            if (std::holds_alternative<tracy::TTDeviceMarker>(marker_it)) {
+                auto device_marker = std::get<tracy::TTDeviceMarker>(marker_it);
+
+                if (isMarkerAZoneEndpoint(device_marker)) {
+                    tracy::TTDeviceMarkerType zone_phase =
+                        (device_marker.marker_type == tracy::TTDeviceMarkerType::ZONE_END)
+                            ? tracy::TTDeviceMarkerType::ZONE_END
+                            : tracy::TTDeviceMarkerType::ZONE_START;
+                    json_events_by_op[program_execution_uid].push_back(nlohmann::ordered_json{
+                        {"run_host_id", device_marker.runtime_host_id},
+                        {"op_name", device_marker.op_name},
+                        {"proc", enchantum::to_string(device_marker.risc)},
+                        {"src_device_id", device_marker.chip_id},
+                        {"zone", device_marker.marker_name},
                         {"zone_phase", enchantum::to_string(zone_phase)},
-                        {"sx", datapoint.core_x},
-                        {"sy", datapoint.core_y},
-                        {"timestamp", datapoint.timestamp},
+                        {"sx", device_marker.core_x},
+                        {"sy", device_marker.core_y},
+                        {"timestamp", device_marker.timestamp},
                     });
-                } else {
-                    auto local_noc_event = std::get<EMD::LocalNocEvent>(EMD(datapoint.data).getContents());
+                } else if (std::holds_alternative<EMD::LocalNocEvent>(EMD(device_marker.data).getContents())) {
+                    auto local_noc_event = std::get<EMD::LocalNocEvent>(EMD(device_marker.data).getContents());
 
                     nlohmann::ordered_json data = {
-                        {"run_host_id", datapoint.run_host_id},
-                        {"op_name", datapoint.op_name},
-                        {"proc", datapoint.risc_name},
+                        {"run_host_id", device_marker.runtime_host_id},
+                        {"op_name", device_marker.op_name},
+                        {"proc", enchantum::to_string(device_marker.risc)},
                         {"noc", enchantum::to_string(local_noc_event.noc_type)},
                         {"vc", int(local_noc_event.noc_vc)},
-                        {"src_device_id", datapoint.device_id},
-                        {"sx", datapoint.core_x},
-                        {"sy", datapoint.core_y},
+                        {"src_device_id", device_marker.chip_id},
+                        {"sx", device_marker.core_x},
+                        {"sy", device_marker.core_y},
                         {"num_bytes", local_noc_event.getNumBytes()},
                         {"type", enchantum::to_string(local_noc_event.noc_xfer_type)},
-                        {"timestamp", datapoint.timestamp},
+                        {"timestamp", device_marker.timestamp},
                     };
 
                     // handle dst coordinates correctly for different NocEventType
@@ -566,109 +872,134 @@ std::unordered_map<RuntimeID, nlohmann::json::array_t> convertNocTracePacketsToJ
                         // DO NOT emit destination coord; it isn't meaningful
 
                     } else if (local_noc_event.noc_xfer_type == EMD::NocEventType::WRITE_MULTICAST) {
-                        auto phys_start_coord = getPhysicalAddressFromVirtual(
-                            datapoint.device_id, {local_noc_event.dst_x, local_noc_event.dst_y});
+                        auto phys_start_coord = translateNocCoordinatesToNoc0(
+                            device_marker.chip_id,
+                            {static_cast<size_t>(local_noc_event.dst_x), static_cast<size_t>(local_noc_event.dst_y)},
+                            local_noc_event.noc_type);
                         data["mcast_start_x"] = phys_start_coord.x;
                         data["mcast_start_y"] = phys_start_coord.y;
-                        auto phys_end_coord = getPhysicalAddressFromVirtual(
-                            datapoint.device_id, {local_noc_event.mcast_end_dst_x, local_noc_event.mcast_end_dst_y});
+                        auto phys_end_coord = translateNocCoordinatesToNoc0(
+                            device_marker.chip_id,
+                            {static_cast<size_t>(local_noc_event.mcast_end_dst_x),
+                             static_cast<size_t>(local_noc_event.mcast_end_dst_y)},
+                            local_noc_event.noc_type);
                         data["mcast_end_x"] = phys_end_coord.x;
                         data["mcast_end_y"] = phys_end_coord.y;
                     } else {
-                        auto phys_coord = getPhysicalAddressFromVirtual(
-                            datapoint.device_id, {local_noc_event.dst_x, local_noc_event.dst_y});
+                        auto phys_coord = translateNocCoordinatesToNoc0(
+                            device_marker.chip_id,
+                            {static_cast<size_t>(local_noc_event.dst_x), static_cast<size_t>(local_noc_event.dst_y)},
+                            local_noc_event.noc_type);
                         data["dx"] = phys_coord.x;
                         data["dy"] = phys_coord.y;
                     }
 
-                    json_events_by_opname[runtime_id].push_back(std::move(data));
-                }
-            } else if (std::holds_alternative<FabricEventDataPoints>(event)) {
-                // coalesce fabric event datapoints into a single logical trace event with extra 'fabric_send' metadata
-                auto fabric_event_datapoints = std::get<FabricEventDataPoints>(event);
+                    // Additional metadata from trailer data
+                    if (device_marker.meta_data.contains("dst_addr")) {
+                        data["dst_addr"] = device_marker.meta_data["dst_addr"];
+                        data["src_addr"] = device_marker.meta_data["src_addr"];
+                        data["posted"] = device_marker.meta_data["posted"];
+                        data["noc_status_counter"] = device_marker.meta_data["noc_status_counter"];
+                    }
 
-                auto first_fabric_write_datapoint = fabric_event_datapoints.fabric_write_datapoints[0];
-                auto fabric_routing_fields_datapoint = fabric_event_datapoints.fabric_routing_fields_datapoint;
-                auto local_noc_write_datapoint = fabric_event_datapoints.local_noc_write_datapoint;
+                    json_events_by_op[program_execution_uid].push_back(data);
+                }
+            } else if (std::holds_alternative<FabricEventMarkers>(marker_it)) {
+                // coalesce fabric event markers into a single logical trace event with extra 'fabric_send' metadata
+                auto fabric_event_markers = std::get<FabricEventMarkers>(marker_it);
+
+                auto first_fabric_write_marker = fabric_event_markers.fabric_write_markers[0];
+                auto fabric_routing_fields_marker = fabric_event_markers.fabric_routing_fields_marker;
+                auto local_noc_write_marker = fabric_event_markers.local_noc_write_marker;
 
                 EMD::FabricPacketType routing_fields_type;
                 EMD::NocEventType noc_xfer_type;
-                if (std::holds_alternative<EMD::FabricNoCEvent>(EMD(first_fabric_write_datapoint.data).getContents())) {
+                if (std::holds_alternative<EMD::FabricNoCEvent>(EMD(first_fabric_write_marker.data).getContents())) {
                     auto fabric_write_event =
-                        std::get<EMD::FabricNoCEvent>(EMD(first_fabric_write_datapoint.data).getContents());
+                        std::get<EMD::FabricNoCEvent>(EMD(first_fabric_write_marker.data).getContents());
                     routing_fields_type = fabric_write_event.routing_fields_type;
                     noc_xfer_type = fabric_write_event.noc_xfer_type;
                 } else {
                     auto first_fabric_scatter_write_event =
-                        std::get<EMD::FabricNoCScatterEvent>(EMD(first_fabric_write_datapoint.data).getContents());
+                        std::get<EMD::FabricNoCScatterEvent>(EMD(first_fabric_write_marker.data).getContents());
                     routing_fields_type = first_fabric_scatter_write_event.routing_fields_type;
                     noc_xfer_type = first_fabric_scatter_write_event.noc_xfer_type;
                 }
 
-                auto fabric_routing_fields_event =
-                    std::get<EMD::FabricRoutingFields>(EMD(fabric_routing_fields_datapoint.data).getContents());
                 auto local_noc_write_event =
-                    std::get<EMD::LocalNocEvent>(EMD(local_noc_write_datapoint.data).getContents());
+                    std::get<EMD::LocalNocEvent>(EMD(local_noc_write_marker.data).getContents());
 
-                // determine hop count and other routing metadata from routing fields value
-                int start_distance = 0;
-                int range = 0;
+                nlohmann::ordered_json fabric_event_json = {
+                    {"run_host_id", local_noc_write_marker.runtime_host_id},
+                    {"op_name", local_noc_write_marker.op_name},
+                    {"proc", enchantum::to_string(local_noc_write_marker.risc)},
+                    {"noc", enchantum::to_string(local_noc_write_event.noc_type)},
+                    {"vc", int(local_noc_write_event.noc_vc)},
+                    {"src_device_id", local_noc_write_marker.chip_id},
+                    {"sx", local_noc_write_marker.core_x},
+                    {"sy", local_noc_write_marker.core_y},
+                    {"num_bytes", local_noc_write_event.getNumBytes()},
+                    {"type", enchantum::to_string(noc_xfer_type)},  // replace the type with fabric event type
+                    {"timestamp", local_noc_write_marker.timestamp},
+                };
+
+                // extract routing metadata from routing fields event
                 switch (routing_fields_type) {
                     case EMD::FabricPacketType::REGULAR: {
-                        std::tie(start_distance, range) =
+                        auto fabric_routing_fields_event =
+                            std::get<EMD::FabricRoutingFields1D>(EMD(fabric_routing_fields_marker.data).getContents());
+                        auto [start_distance, range] =
                             get_routing_start_distance_and_range(fabric_routing_fields_event.routing_fields_value);
+                        fabric_event_json["fabric_send"] = {{"start_distance", start_distance}, {"range", range}};
                         break;
                     }
                     case EMD::FabricPacketType::LOW_LATENCY: {
-                        std::tie(start_distance, range) = get_low_latency_routing_start_distance_and_range(
+                        auto fabric_routing_fields_event =
+                            std::get<EMD::FabricRoutingFields1D>(EMD(fabric_routing_fields_marker.data).getContents());
+                        auto [start_distance, range] = get_low_latency_routing_start_distance_and_range(
                             fabric_routing_fields_event.routing_fields_value);
+                        fabric_event_json["fabric_send"] = {{"start_distance", start_distance}, {"range", range}};
                         break;
                     }
                     case KernelProfilerNocEventMetadata::FabricPacketType::LOW_LATENCY_MESH: {
+                        auto fabric_routing_fields_event =
+                            std::get<EMD::FabricRoutingFields2D>(EMD(fabric_routing_fields_marker.data).getContents());
+                        fabric_event_json["fabric_send"] = {
+                            {"ns_hops", fabric_routing_fields_event.ns_hops},
+                            {"e_hops", fabric_routing_fields_event.e_hops},
+                            {"w_hops", fabric_routing_fields_event.w_hops},
+                            {"is_mcast", fabric_routing_fields_event.is_mcast}};
+                        break;
+                    }
+                    case KernelProfilerNocEventMetadata::FabricPacketType::DYNAMIC_MESH: {
                         log_error(
-                            tt::LogMetal,
-                            "[profiler noc tracing] noc tracing does not support LOW_LATENCY_MESH packets!");
+                            tt::LogMetal, "[profiler noc tracing] noc tracing does not support DYNAMIC_MESH packets!");
                         continue;
                     }
                 }
 
-                nlohmann::ordered_json fabric_event_json = {
-                    {"run_host_id", local_noc_write_datapoint.run_host_id},
-                    {"op_name", local_noc_write_datapoint.op_name},
-                    {"proc", local_noc_write_datapoint.risc_name},
-                    {"noc", enchantum::to_string(local_noc_write_event.noc_type)},
-                    {"vc", int(local_noc_write_event.noc_vc)},
-                    {"src_device_id", local_noc_write_datapoint.device_id},
-                    {"sx", local_noc_write_datapoint.core_x},
-                    {"sy", local_noc_write_datapoint.core_y},
-                    {"num_bytes", local_noc_write_event.getNumBytes()},
-                    {"type", enchantum::to_string(noc_xfer_type)},  // replace the type with fabric event type
-                    {"timestamp",
-                     first_fabric_write_datapoint.timestamp},  // replace the timestamp with fabric event timestamp
-                };
-
-                fabric_event_json["fabric_send"] = {{"start_distance", start_distance}, {"range", range}};
-
                 // if fabric mux is used, add fabric mux coords and noc into "fabric_send" metadata
                 // and use corresponding write on fabric mux to get eth channel used on src device for the transfer
-                if (fabric_event_datapoints.fabric_mux_datapoint.has_value()) {
+                if (fabric_event_markers.fabric_mux_marker.has_value()) {
                     // mux core location is derived from the local noc write event
-                    auto mux_phys_coord = getPhysicalAddressFromVirtual(
-                        local_noc_write_datapoint.device_id,
-                        {local_noc_write_event.dst_x, local_noc_write_event.dst_y});
+                    auto mux_phys_coord = translateNocCoordinatesToNoc0(
+                        local_noc_write_marker.chip_id,
+                        {static_cast<size_t>(local_noc_write_event.dst_x),
+                         static_cast<size_t>(local_noc_write_event.dst_y)},
+                        local_noc_write_event.noc_type);
 
-                    auto fabric_mux_datapoint = fabric_event_datapoints.fabric_mux_datapoint.value();
-                    auto fabric_mux_event = std::get<EMD::LocalNocEvent>(EMD(fabric_mux_datapoint.data).getContents());
+                    auto fabric_mux_marker = fabric_event_markers.fabric_mux_marker.value();
+                    auto fabric_mux_event = std::get<EMD::LocalNocEvent>(EMD(fabric_mux_marker.data).getContents());
 
                     fabric_event_json["fabric_send"]["fabric_mux"] = {
                         {"x", mux_phys_coord.x},
                         {"y", mux_phys_coord.y},
-                        {"noc", enchantum::to_string(fabric_mux_event.noc_type)},
-                        //{"timestamp", fabric_mux_datapoint.timestamp}
-                    };
+                        {"noc", enchantum::to_string(fabric_mux_event.noc_type)}};
 
-                    CoreCoord eth_router_phys_coord = getPhysicalAddressFromVirtual(
-                        fabric_mux_datapoint.device_id, {fabric_mux_event.dst_x, fabric_mux_event.dst_y});
+                    auto eth_router_phys_coord = translateNocCoordinatesToNoc0(
+                        fabric_mux_marker.chip_id,
+                        {static_cast<size_t>(fabric_mux_event.dst_x), static_cast<size_t>(fabric_mux_event.dst_y)},
+                        fabric_mux_event.noc_type);
                     auto eth_chan_opt =
                         routing_lookup.getRouterEthCoreToChannelLookup(device_id, eth_router_phys_coord);
                     if (!eth_chan_opt) {
@@ -677,22 +1008,23 @@ std::unordered_map<RuntimeID, nlohmann::json::array_t> convertNocTracePacketsToJ
                             "[profiler noc tracing] Fabric edm_location->channel lookup failed for event in op '{}' at "
                             "ts {}: "
                             "src_dev={}, "
-                            "eth_core=({}, {}), start_distance={}. Keeping original events.",
-                            first_fabric_write_datapoint.op_name,
-                            first_fabric_write_datapoint.timestamp,
+                            "eth_core=({}, {}). Skipping.",
+                            first_fabric_write_marker.op_name,
+                            first_fabric_write_marker.timestamp,
                             device_id,
                             eth_router_phys_coord.x,
-                            eth_router_phys_coord.y,
-                            start_distance);
+                            eth_router_phys_coord.y);
                         continue;
                     }
                     tt::tt_fabric::chan_id_t eth_chan = *eth_chan_opt;
                     fabric_event_json["fabric_send"]["eth_chan"] = eth_chan;
                 } else {
                     // router eth core location is derived from the local noc write event
-                    auto eth_router_phys_coord = getPhysicalAddressFromVirtual(
-                        local_noc_write_datapoint.device_id,
-                        {local_noc_write_event.dst_x, local_noc_write_event.dst_y});
+                    auto eth_router_phys_coord = translateNocCoordinatesToNoc0(
+                        local_noc_write_marker.chip_id,
+                        {static_cast<size_t>(local_noc_write_event.dst_x),
+                         static_cast<size_t>(local_noc_write_event.dst_y)},
+                        local_noc_write_event.noc_type);
                     auto eth_chan_opt =
                         routing_lookup.getRouterEthCoreToChannelLookup(device_id, eth_router_phys_coord);
                     if (!eth_chan_opt) {
@@ -701,13 +1033,12 @@ std::unordered_map<RuntimeID, nlohmann::json::array_t> convertNocTracePacketsToJ
                             "[profiler noc tracing] Fabric edm_location->channel lookup failed for event in op '{}' at "
                             "ts {}: "
                             "src_dev={}, "
-                            "eth_core=({}, {}), start_distance={}. Keeping original events.",
-                            first_fabric_write_datapoint.op_name,
-                            first_fabric_write_datapoint.timestamp,
+                            "eth_core=({}, {}). Skipping.",
+                            first_fabric_write_marker.op_name,
+                            first_fabric_write_marker.timestamp,
                             device_id,
                             eth_router_phys_coord.x,
-                            eth_router_phys_coord.y,
-                            start_distance);
+                            eth_router_phys_coord.y);
                         continue;
                     }
                     tt::tt_fabric::chan_id_t eth_chan = *eth_chan_opt;
@@ -716,29 +1047,34 @@ std::unordered_map<RuntimeID, nlohmann::json::array_t> convertNocTracePacketsToJ
 
                 // Add true destination coord(s) from fabric unicast/scatter event
                 if (KernelProfilerNocEventMetadata::isFabricUnicastEventType(noc_xfer_type)) {
-                    auto fabric_write_datapoint = fabric_event_datapoints.fabric_write_datapoints[0];
+                    auto fabric_write_marker = fabric_event_markers.fabric_write_markers[0];
                     auto fabric_write_event =
-                        std::get<EMD::FabricNoCEvent>(EMD(fabric_write_datapoint.data).getContents());
-                    auto phys_coord = getPhysicalAddressFromVirtual(
-                        fabric_write_datapoint.device_id, {fabric_write_event.dst_x, fabric_write_event.dst_y});
+                        std::get<EMD::FabricNoCEvent>(EMD(fabric_write_marker.data).getContents());
+                    auto phys_coord = translateNocCoordinatesToNoc0(
+                        fabric_write_marker.chip_id,
+                        {static_cast<size_t>(fabric_write_event.dst_x), static_cast<size_t>(fabric_write_event.dst_y)},
+                        fabric_write_event.dst_noc_type);
                     fabric_event_json["dst"] = {
                         {{"dx", phys_coord.x},
                          {"dy", phys_coord.y},
+                         {"noc", enchantum::to_string(fabric_write_event.dst_noc_type)},
                          {"num_bytes", local_noc_write_event.getNumBytes()}}};
                 } else if (KernelProfilerNocEventMetadata::isFabricScatterEventType(noc_xfer_type)) {
                     // add all chunks for scatter write and compute last chunk size
                     fabric_event_json["dst"] = nlohmann::json::array();
                     int last_chunk_size = local_noc_write_event.getNumBytes();
-                    for (int j = 0; j < fabric_event_datapoints.fabric_write_datapoints.size(); j++) {
-                        auto fabric_scatter_write_datapoint = fabric_event_datapoints.fabric_write_datapoints[j];
-                        auto fabric_scatter_write = std::get<EMD::FabricNoCScatterEvent>(
-                            EMD(fabric_scatter_write_datapoint.data).getContents());
-                        auto phys_coord = getPhysicalAddressFromVirtual(
-                            fabric_scatter_write_datapoint.device_id,
-                            {fabric_scatter_write.dst_x, fabric_scatter_write.dst_y});
+                    for (const auto& fabric_scatter_write_marker : fabric_event_markers.fabric_write_markers) {
+                        auto fabric_scatter_write =
+                            std::get<EMD::FabricNoCScatterEvent>(EMD(fabric_scatter_write_marker.data).getContents());
+                        auto phys_coord = translateNocCoordinatesToNoc0(
+                            fabric_scatter_write_marker.chip_id,
+                            {static_cast<size_t>(fabric_scatter_write.dst_x),
+                             static_cast<size_t>(fabric_scatter_write.dst_y)},
+                            fabric_scatter_write.dst_noc_type);
                         fabric_event_json["dst"].push_back({
                             {"dx", phys_coord.x},
                             {"dy", phys_coord.y},
+                            {"noc", enchantum::to_string(fabric_scatter_write.dst_noc_type)},
                             {"num_bytes", fabric_scatter_write.chunk_size},
                         });
                         last_chunk_size -= fabric_scatter_write.chunk_size;
@@ -751,23 +1087,21 @@ std::unordered_map<RuntimeID, nlohmann::json::array_t> convertNocTracePacketsToJ
                     continue;
                 }
 
-                json_events_by_opname[runtime_id].push_back(std::move(fabric_event_json));
+                json_events_by_op[program_execution_uid].push_back(fabric_event_json);
             }
         }
     }
 
-    return json_events_by_opname;
+    return json_events_by_op;
 }
 
 void dumpJsonNocTraces(
-    const std::vector<std::unordered_map<RuntimeID, nlohmann::json::array_t>>& noc_trace_data,
-    chip_id_t device_id,
+    const std::unordered_map<experimental::ProgramExecutionUID, nlohmann::json::array_t>& noc_trace_data,
+    ChipId device_id,
     const std::filesystem::path& output_dir) {
-    ZoneScoped;
-
     // create output directory if it does not exist
-    std::filesystem::create_directories(output_dir);
-    if (!std::filesystem::is_directory(output_dir)) {
+    tt::filesystem::safe_create_directories(output_dir);
+    if (!tt::filesystem::safe_is_directory(output_dir).value_or(false)) {
         log_error(
             tt::LogMetal,
             "Could not write profiler noc traces to '{}' because the directory path could not be created!",
@@ -775,51 +1109,61 @@ void dumpJsonNocTraces(
         return;
     }
 
-    for (const auto& processed_events_by_opname : noc_trace_data) {
-        for (auto& [runtime_id, events] : processed_events_by_opname) {
-            // dump events to a json file inside directory output_dir named after the op_name
-            std::filesystem::path rpt_path = output_dir;
-            const std::string op_name = events.front().value("op_name", "UnknownOP");
-            if (!op_name.empty()) {
-                rpt_path /= fmt::format("noc_trace_dev{}_{}_ID{}.json", device_id, op_name, runtime_id);
-            } else {
-                rpt_path /= fmt::format("noc_trace_dev{}_ID{}.json", device_id, runtime_id);
-            }
-            std::ofstream file(rpt_path);
-            if (file.is_open()) {
-                // Write the final processed events for this op
-                file << nlohmann::json(std::move(events)).dump(2);
-            } else {
-                log_error(tt::LogMetal, "Could not write profiler noc json trace to '{}'", rpt_path);
-            }
+    for (const auto& [program_execution_uid, events] : noc_trace_data) {
+        // dump events to a json file inside directory output_dir named after the op_name
+        std::filesystem::path rpt_path = output_dir;
+        const std::string op_name = events.front().value("op_name", "UnknownOP");
+        // add trace id to name, extract on npe side then group using this as well,
+        // include when getting data in report
+        rpt_path /= fmt::format(
+            "noc_trace{}{}{}{}.json",
+            "_dev" + std::to_string(device_id),
+            op_name.empty() ? "" : "_" + op_name,
+            "_ID" + std::to_string(program_execution_uid.runtime_id),
+            program_execution_uid.trace_id_counter == tracy::TTDeviceMarker::INVALID_NUM
+                ? ""
+                : "_traceID" +
+                      std::to_string((program_execution_uid.trace_id << 32) | program_execution_uid.trace_id_counter));
+
+        std::ofstream file(rpt_path);
+        if (file.is_open()) {
+            // Write the final processed events for this op
+            file << nlohmann::json(events).dump(2);
+        } else {
+            log_error(tt::LogMetal, "Could not write profiler noc json trace to '{}'", rpt_path);
         }
     }
 }
 
-void writeCSVHeader(std::ofstream& log_file_ofs, tt::ARCH device_architecture, int device_core_frequency) {
+void writeCSVHeader(
+    std::ofstream& log_file_ofs, tt::ARCH device_architecture, int device_core_frequency, uint32_t max_compute_cores) {
     log_file_ofs << "ARCH: " << get_string_lowercase(device_architecture)
-                 << ", CHIP_FREQ[MHz]: " << device_core_frequency << std::endl;
-    log_file_ofs << "PCIe slot, core_x, core_y, RISC processor type, timer_id, time[cycles since reset], data, "
-                    "run host ID,  zone name, type, source line, source file, meta data"
+                 << ", CHIP_FREQ[MHz]: " << device_core_frequency << ", Max Compute Cores: " << max_compute_cores
+                 << std::endl;
+    log_file_ofs << "PCIe slot, core_x, core_y, RISC processor type, timer_id, time[cycles since reset], data, run "
+                    "host ID, trace id, trace id counter, zone name, type, source line, source file, meta data"
                  << std::endl;
 }
 
 void dumpDeviceResultsToCSV(
-    const std::vector<DeviceProfilerDataPoint>& device_data_points,
+    const std::map<CoreCoord, std::map<tracy::RiscType, std::set<tracy::TTDeviceMarker>>>&
+        device_markers_per_core_risc_map,
     tt::ARCH device_arch,
     int device_core_frequency,
+    uint32_t max_compute_cores,
     const std::filesystem::path& log_path) {
-    ZoneScoped;
+    TT_ASSERT(tt::filesystem::safe_exists(log_path.parent_path()).value_or(false));
+    TT_ASSERT(log_path.extension() == ".csv");
 
     // open CSV log file
     std::ofstream log_file_ofs;
 
     // append to existing CSV log file if it already exists
-    if (std::filesystem::exists(log_path)) {
+    if (tt::filesystem::safe_exists(log_path).value_or(false)) {
         log_file_ofs.open(log_path, std::ios_base::app);
     } else {
         log_file_ofs.open(log_path);
-        writeCSVHeader(log_file_ofs, device_arch, device_core_frequency);
+        writeCSVHeader(log_file_ofs, device_arch, device_core_frequency, max_compute_cores);
     }
 
     if (!log_file_ofs) {
@@ -827,209 +1171,226 @@ void dumpDeviceResultsToCSV(
         return;
     }
 
-    for (const DeviceProfilerDataPoint& data_point : device_data_points) {
-        std::string meta_data_str = "";
-        if (!data_point.meta_data.is_null()) {
-            meta_data_str = data_point.meta_data.dump();
-            std::replace(meta_data_str.begin(), meta_data_str.end(), ',', ';');
-        }
+    for (const auto& [core, device_markers_per_risc_map] : device_markers_per_core_risc_map) {
+        for (const auto& [risc, device_markers] : device_markers_per_risc_map) {
+            for (const tracy::TTDeviceMarker& marker : device_markers) {
+                std::string meta_data_str;
+                if (!marker.meta_data.is_null()) {
+                    meta_data_str = marker.meta_data.dump();
+                    std::replace(meta_data_str.begin(), meta_data_str.end(), ',', ';');
+                }
 
-        log_file_ofs << fmt::format(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-            data_point.device_id,
-            data_point.core_x,
-            data_point.core_y,
-            data_point.risc_name,
-            data_point.timer_id,
-            data_point.timestamp,
-            data_point.data,
-            data_point.run_host_id,
-            data_point.zone_name,
-            enchantum::to_string(data_point.packet_type),
-            data_point.source_line,
-            data_point.source_file,
-            meta_data_str);
+                const std::string trace_id_str =
+                    marker.trace_id == tracy::TTDeviceMarker::INVALID_NUM ? "" : fmt::format("{}", marker.trace_id);
+                const std::string trace_id_counter_str = marker.trace_id_counter == tracy::TTDeviceMarker::INVALID_NUM
+                                                             ? ""
+                                                             : fmt::format("{}", marker.trace_id_counter);
+
+                log_file_ofs << fmt::format(
+                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                    marker.chip_id,
+                    marker.core_x,
+                    marker.core_y,
+                    enchantum::to_string(marker.risc),
+                    marker.marker_id,
+                    marker.timestamp,
+                    marker.data,
+                    marker.runtime_host_id,
+                    trace_id_str,
+                    trace_id_counter_str,
+                    marker.marker_name,
+                    enchantum::to_string(marker.marker_type),
+                    marker.line,
+                    marker.file,
+                    meta_data_str);
+            }
+        }
     }
 
     log_file_ofs.close();
 }
 
-bool isGalaxyMMIODevice(IDevice* device) {
-    // This is wrapped in a try-catch block because get_mesh_device() can throw a std::bad_weak_ptr if profiler read is
-    // called during MeshDevice::close()
-    try {
-        if (auto mesh_device = device->get_mesh_device()) {
-            return false;
-        } else {
-            return tt::tt_metal::MetalContext::instance().get_cluster().is_galaxy_cluster() &&
-                   device->is_mmio_capable();
-        }
-    } catch (const std::bad_weak_ptr& e) {
+bool isGalaxyMMIODevice(distributed::MeshDevice* mesh_device, IDevice* device) {
+    if (mesh_device) {
         return false;
     }
+    return MetalContext::instance(extract_context_id(device)).get_cluster().is_galaxy_cluster() &&
+           device->is_mmio_capable();
 }
 
-bool useFastDispatch(IDevice* device) {
-    return tt::DevicePool::instance().is_dispatch_firmware_active() && !isGalaxyMMIODevice(device);
+bool useFastDispatch(distributed::MeshDevice* mesh_device, IDevice* device, ContextId context_id) {
+    return MetalContext::instance(context_id).rtoptions().get_fast_dispatch() &&
+           MetalContext::instance(context_id).device_manager()->is_dispatch_firmware_active() &&
+           !isGalaxyMMIODevice(mesh_device, device);
 }
 
-void writeToCoreControlBuffer(IDevice* device, const CoreCoord& virtual_core, const std::vector<uint32_t>& data) {
+void writeToCoreControlBuffer(
+    distributed::MeshDevice* mesh_device,
+    IDevice* device,
+    const CoreCoord& virtual_core,
+    const std::vector<uint32_t>& data,
+    bool force_slow_dispatch,
+    ContextId context_id) {
     ZoneScoped;
 
+    TT_ASSERT(context_id == extract_context_id(mesh_device, device));
+    const auto& hal = MetalContext::instance(context_id).hal();
     const HalProgrammableCoreType core_type = tt::llrt::get_core_type(device->id(), virtual_core);
-    profiler_msg_t* profiler_msg =
-        MetalContext::instance().hal().get_dev_addr<profiler_msg_t*>(core_type, HalL1MemAddrType::PROFILER);
-    if (useFastDispatch(device)) {
-        if (auto mesh_device = device->get_mesh_device()) {
+    DeviceAddr profiler_msg_addr = hal.get_dev_addr(core_type, HalL1MemAddrType::PROFILER);
+    DeviceAddr control_vector_addr =
+        profiler_msg_addr + hal.get_dev_msgs_factory(core_type).offset_of<dev_msgs::profiler_msg_t>(
+                                dev_msgs::profiler_msg_t::Field::control_vector);
+    if (useFastDispatch(mesh_device, device, context_id) && !force_slow_dispatch) {
+        if (mesh_device) {
             distributed::FDMeshCommandQueue& mesh_cq =
                 dynamic_cast<distributed::FDMeshCommandQueue&>(mesh_device->mesh_command_queue());
             const distributed::MeshCoordinate device_coord = mesh_device->get_view().find_device(device->id());
-            const distributed::DeviceMemoryAddress address = {
-                device_coord, virtual_core, reinterpret_cast<DeviceAddr>(profiler_msg->control_vector)};
+            const distributed::DeviceMemoryAddress address = {device_coord, virtual_core, control_vector_addr};
             mesh_cq.enqueue_write_shard_to_core(
                 address, data.data(), kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE, true);
         } else {
-            dynamic_cast<HWCommandQueue&>(device->command_queue())
-                .enqueue_write_to_core(
-                    virtual_core,
-                    data.data(),
-                    reinterpret_cast<DeviceAddr>(profiler_msg->control_vector),
-                    kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE,
-                    true);
+            TT_FATAL(false, "Fast dispatch write to control buffer requires mesh device support");
         }
     } else {
-        tt::llrt::write_hex_vec_to_core(
-            device->id(), virtual_core, data, reinterpret_cast<uint64_t>(profiler_msg->control_vector));
+        MetalContext::instance(context_id)
+            .get_cluster()
+            .write_core(device->id(), virtual_core, data, control_vector_addr);
     }
 }
 
-void DeviceProfiler::issueFastDispatchReadFromProfilerBuffer(IDevice* device) {
+void DeviceProfiler::issueFastDispatchReadFromProfilerBuffer(
+    distributed::MeshDevice* mesh_device, IDevice* device, uint8_t active_dram_buffer_index) {
     ZoneScoped;
-    TT_ASSERT(tt::DevicePool::instance().is_dispatch_firmware_active());
-    const DeviceAddr profiler_addr = MetalContext::instance().hal().get_dev_addr(HalDramMemAddrType::PROFILER);
+    TT_ASSERT(MetalContext::instance(context_id).device_manager()->is_dispatch_firmware_active());
+    const DeviceAddr profiler_addr = getProfilerDramBufferAddress(active_dram_buffer_index);
     uint32_t profile_buffer_idx = 0;
 
     const CoreCoord dram_grid_size = device->dram_grid_size();
     for (uint32_t x = 0; x < dram_grid_size.x; ++x) {
         for (uint32_t y = 0; y < dram_grid_size.y; ++y) {
             const CoreCoord dram_core = device->virtual_core_from_logical_core({x, y}, CoreType::DRAM);
-            if (auto mesh_device = device->get_mesh_device()) {
+            if (mesh_device) {
                 const distributed::MeshCoordinate device_coord = mesh_device->get_view().find_device(device_id);
                 dynamic_cast<distributed::FDMeshCommandQueue&>(mesh_device->mesh_command_queue())
                     .enqueue_read_shard_from_core(
                         distributed::DeviceMemoryAddress{device_coord, dram_core, profiler_addr},
                         &(profile_buffer[profile_buffer_idx]),
-                        profile_buffer_bank_size_bytes,
+                        getProfileBufferBankSizeBytes(),
                         true);
             } else {
-                dynamic_cast<HWCommandQueue&>(device->command_queue())
-                    .enqueue_read_from_core(
-                        dram_core,
-                        &(profile_buffer[profile_buffer_idx]),
-                        profiler_addr,
-                        profile_buffer_bank_size_bytes,
-                        true);
+                TT_FATAL(false, "Fast dispatch read from profiler buffer requires mesh device support");
             }
-            profile_buffer_idx += profile_buffer_bank_size_bytes / sizeof(uint32_t);
+            profile_buffer_idx += getProfileBufferBankSizeBytes() / sizeof(uint32_t);
         }
     }
 }
 
-void DeviceProfiler::issueSlowDispatchReadFromProfilerBuffer(IDevice* device) {
+void DeviceProfiler::issueSlowDispatchReadFromProfilerBuffer(IDevice* device, uint8_t active_dram_buffer_index) {
     ZoneScoped;
-    const DeviceAddr profiler_addr = MetalContext::instance().hal().get_dev_addr(HalDramMemAddrType::PROFILER);
+    const DeviceAddr profiler_addr = getProfilerDramBufferAddress(active_dram_buffer_index);
+    const uint32_t bank_size_bytes = getProfileBufferBankSizeBytes();
+    const uint32_t bank_size_words = bank_size_bytes / sizeof(uint32_t);
     uint32_t profile_buffer_idx = 0;
 
     const int num_dram_channels = device->num_dram_channels();
+    const auto& cluster = MetalContext::instance(context_id).get_cluster();
     for (int dram_channel = 0; dram_channel < num_dram_channels; ++dram_channel) {
-        std::vector<uint32_t> profile_buffer_bank_data(profile_buffer_bank_size_bytes / sizeof(uint32_t), 0);
-        tt::tt_metal::MetalContext::instance().get_cluster().read_dram_vec(
-            profile_buffer_bank_data.data(), profile_buffer_bank_size_bytes, device_id, dram_channel, profiler_addr);
-
-        std::copy(
-            profile_buffer_bank_data.begin(),
-            profile_buffer_bank_data.end(),
-            profile_buffer.begin() + profile_buffer_idx);
-        profile_buffer_idx += profile_buffer_bank_size_bytes / sizeof(uint32_t);
+        cluster.read_dram_vec(
+            &(profile_buffer[profile_buffer_idx]), bank_size_bytes, device_id, dram_channel, profiler_addr);
+        profile_buffer_idx += bank_size_words;
     }
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 void DeviceProfiler::issueFastDispatchReadFromL1DataBuffer(
-    IDevice* device, const CoreCoord& worker_core, std::vector<uint32_t>& core_l1_data_buffer) {
+    distributed::MeshDevice* mesh_device, const CoreCoord& worker_core, std::vector<uint32_t>& core_l1_data_buffer) {
     ZoneScoped;
 
-    TT_ASSERT(tt::DevicePool::instance().is_dispatch_firmware_active());
+    TT_ASSERT(MetalContext::instance(context_id).device_manager()->is_dispatch_firmware_active());
 
-    const Hal& hal = MetalContext::instance().hal();
+    const Hal& hal = MetalContext::instance(context_id).hal();
     const HalProgrammableCoreType core_type = tt::llrt::get_core_type(device_id, worker_core);
-    profiler_msg_t* profiler_msg = hal.get_dev_addr<profiler_msg_t*>(core_type, HalL1MemAddrType::PROFILER);
+    DeviceAddr profiler_msg_addr = hal.get_dev_addr(core_type, HalL1MemAddrType::PROFILER);
+    DeviceAddr buffer_addr =
+        profiler_msg_addr + hal.get_dev_msgs_factory(core_type).offset_of<dev_msgs::profiler_msg_t>(
+                                dev_msgs::profiler_msg_t::Field::buffer);
     const uint32_t num_risc_processors = hal.get_num_risc_processors(core_type);
     core_l1_data_buffer.resize(kernel_profiler::PROFILER_L1_VECTOR_SIZE * num_risc_processors);
-    if (auto mesh_device = device->get_mesh_device()) {
+    if (mesh_device) {
         const distributed::MeshCoordinate device_coord = mesh_device->get_view().find_device(device_id);
         dynamic_cast<distributed::FDMeshCommandQueue&>(mesh_device->mesh_command_queue())
             .enqueue_read_shard_from_core(
-                distributed::DeviceMemoryAddress{
-                    device_coord, worker_core, reinterpret_cast<DeviceAddr>(profiler_msg->buffer)},
+                distributed::DeviceMemoryAddress{device_coord, worker_core, buffer_addr},
                 core_l1_data_buffer.data(),
                 kernel_profiler::PROFILER_L1_BUFFER_SIZE * num_risc_processors,
                 true);
     } else {
-        dynamic_cast<HWCommandQueue&>(device->command_queue())
-            .enqueue_read_from_core(
-                worker_core,
-                core_l1_data_buffer.data(),
-                reinterpret_cast<DeviceAddr>(profiler_msg->buffer),
-                kernel_profiler::PROFILER_L1_BUFFER_SIZE * num_risc_processors,
-                true);
+        TT_FATAL(false, "Fast dispatch read from L1 buffer requires mesh device support");
     }
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 void DeviceProfiler::issueSlowDispatchReadFromL1DataBuffer(
-    IDevice* device, const CoreCoord& worker_core, std::vector<uint32_t>& core_l1_data_buffer) {
+    IDevice* /*device*/, const CoreCoord& worker_core, std::vector<uint32_t>& core_l1_data_buffer) {
     ZoneScoped;
 
-    const Hal& hal = MetalContext::instance().hal();
+    const Hal& hal = MetalContext::instance(context_id).hal();
     const HalProgrammableCoreType core_type = tt::llrt::get_core_type(device_id, worker_core);
-    profiler_msg_t* profiler_msg = hal.get_dev_addr<profiler_msg_t*>(core_type, HalL1MemAddrType::PROFILER);
-    core_l1_data_buffer = tt::llrt::read_hex_vec_from_core(
-        device_id,
-        worker_core,
-        reinterpret_cast<uint64_t>(profiler_msg->buffer),
-        kernel_profiler::PROFILER_L1_BUFFER_SIZE * hal.get_num_risc_processors(core_type));
+    DeviceAddr profiler_msg_addr = hal.get_dev_addr(core_type, HalL1MemAddrType::PROFILER);
+    DeviceAddr buffer_addr =
+        profiler_msg_addr + hal.get_dev_msgs_factory(core_type).offset_of<dev_msgs::profiler_msg_t>(
+                                dev_msgs::profiler_msg_t::Field::buffer);
+    core_l1_data_buffer = MetalContext::instance(context_id)
+                              .get_cluster()
+                              .read_core(
+                                  device_id,
+                                  worker_core,
+                                  buffer_addr,
+                                  kernel_profiler::PROFILER_L1_BUFFER_SIZE * hal.get_num_risc_processors(core_type));
 }
 
 void DeviceProfiler::readL1DataBufferForCore(
-    IDevice* device, const CoreCoord& virtual_core, std::vector<uint32_t>& core_l1_data_buffer) {
+    distributed::MeshDevice* mesh_device,
+    IDevice* device,
+    const CoreCoord& virtual_core,
+    std::vector<uint32_t>& core_l1_data_buffer,
+    bool force_slow_dispatch) {
     ZoneScoped;
-    if (useFastDispatch(device)) {
-        issueFastDispatchReadFromL1DataBuffer(device, virtual_core, core_l1_data_buffer);
+    if (useFastDispatch(mesh_device, device, context_id) && !force_slow_dispatch) {
+        issueFastDispatchReadFromL1DataBuffer(mesh_device, virtual_core, core_l1_data_buffer);
     } else {
         issueSlowDispatchReadFromL1DataBuffer(device, virtual_core, core_l1_data_buffer);
     }
 }
 
-void DeviceProfiler::readL1DataBuffers(IDevice* device, const std::vector<CoreCoord>& virtual_cores) {
+void DeviceProfiler::readL1DataBuffers(
+    distributed::MeshDevice* mesh_device,
+    IDevice* device,
+    const std::vector<CoreCoord>& virtual_cores,
+    bool force_slow_dispatch) {
     ZoneScoped;
 
     for (const CoreCoord& virtual_core : virtual_cores) {
         std::vector<uint32_t>& core_l1_data_buffer = core_l1_data_buffers[virtual_core];
-        readL1DataBufferForCore(device, virtual_core, core_l1_data_buffer);
+        readL1DataBufferForCore(mesh_device, device, virtual_core, core_l1_data_buffer, force_slow_dispatch);
     }
 }
 
-void DeviceProfiler::readControlBufferForCore(IDevice* device, const CoreCoord& virtual_core) {
+void DeviceProfiler::readControlBufferForCore(
+    distributed::MeshDevice* mesh_device, IDevice* device, const CoreCoord& virtual_core, bool force_slow_dispatch) {
     ZoneScoped;
+    const auto& hal = MetalContext::instance(context_id).hal();
     const HalProgrammableCoreType core_type = tt::llrt::get_core_type(device_id, virtual_core);
-    profiler_msg_t* profiler_msg =
-        MetalContext::instance().hal().get_dev_addr<profiler_msg_t*>(core_type, HalL1MemAddrType::PROFILER);
-    if (useFastDispatch(device)) {
-        if (auto mesh_device = device->get_mesh_device()) {
+    DeviceAddr profiler_msg = hal.get_dev_addr(core_type, HalL1MemAddrType::PROFILER);
+    DeviceAddr control_vector_addr =
+        profiler_msg + hal.get_dev_msgs_factory(core_type).offset_of<dev_msgs::profiler_msg_t>(
+                           dev_msgs::profiler_msg_t::Field::control_vector);
+    if (useFastDispatch(mesh_device, device, context_id) && !force_slow_dispatch) {
+        if (mesh_device) {
             distributed::FDMeshCommandQueue& mesh_cq =
                 dynamic_cast<distributed::FDMeshCommandQueue&>(mesh_device->mesh_command_queue());
             const distributed::MeshCoordinate device_coord = mesh_device->get_view().find_device(device_id);
-            const distributed::DeviceMemoryAddress address = {
-                device_coord, virtual_core, reinterpret_cast<DeviceAddr>(profiler_msg->control_vector)};
+            const distributed::DeviceMemoryAddress address = {device_coord, virtual_core, control_vector_addr};
             core_control_buffers[virtual_core].resize(kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE);
             mesh_cq.enqueue_read_shard_from_core(
                 address,
@@ -1037,70 +1398,104 @@ void DeviceProfiler::readControlBufferForCore(IDevice* device, const CoreCoord& 
                 kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE,
                 true);
         } else {
-            core_control_buffers[virtual_core].resize(kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE);
-            dynamic_cast<HWCommandQueue&>(device->command_queue())
-                .enqueue_read_from_core(
-                    virtual_core,
-                    core_control_buffers[virtual_core].data(),
-                    reinterpret_cast<DeviceAddr>(profiler_msg->control_vector),
-                    kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE,
-                    true);
+            TT_FATAL(false, "Fast dispatch read from control buffer requires mesh device support");
         }
     } else {
-        core_control_buffers[virtual_core] = tt::llrt::read_hex_vec_from_core(
-            device_id,
-            virtual_core,
-            reinterpret_cast<uint64_t>(profiler_msg->control_vector),
-            kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE);
+        core_control_buffers[virtual_core] =
+            MetalContext::instance(context_id)
+                .get_cluster()
+                .read_core(
+                    device_id, virtual_core, control_vector_addr, kernel_profiler::PROFILER_L1_CONTROL_BUFFER_SIZE);
     }
 }
 
-void DeviceProfiler::readControlBuffers(IDevice* device, const std::vector<CoreCoord>& virtual_cores) {
+void DeviceProfiler::readControlBuffers(
+    distributed::MeshDevice* mesh_device,
+    IDevice* device,
+    const std::vector<CoreCoord>& virtual_cores,
+    bool force_slow_dispatch) {
     ZoneScoped;
     for (const CoreCoord& virtual_core : virtual_cores) {
-        readControlBufferForCore(device, virtual_core);
+        readControlBufferForCore(mesh_device, device, virtual_core, force_slow_dispatch);
     }
 }
 
-void DeviceProfiler::resetControlBuffers(IDevice* device, const std::vector<CoreCoord>& virtual_cores) {
+void DeviceProfiler::resetControlBuffers(
+    distributed::MeshDevice* mesh_device,
+    IDevice* device,
+    const std::vector<CoreCoord>& virtual_cores,
+    bool force_slow_dispatch) {
     ZoneScoped;
     std::unordered_map<CoreCoord, std::vector<uint32_t>> core_control_buffer_resets;
+    const auto buffer_0_address = this->getProfilerDramBufferAddress(0);
     for (const CoreCoord& virtual_core : virtual_cores) {
         const std::vector<uint32_t>& control_buffer = core_control_buffers.at(virtual_core);
 
         std::vector<uint32_t>& core_control_buffer_reset = core_control_buffer_resets[virtual_core];
         core_control_buffer_reset.resize(kernel_profiler::PROFILER_L1_CONTROL_VECTOR_SIZE);
-        core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS] =
-            control_buffer[kernel_profiler::DRAM_PROFILER_ADDRESS];
+        core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_DEFAULT] =
+            control_buffer[kernel_profiler::DRAM_PROFILER_ADDRESS_DEFAULT];
         core_control_buffer_reset[kernel_profiler::FLAT_ID] = control_buffer[kernel_profiler::FLAT_ID];
         core_control_buffer_reset[kernel_profiler::CORE_COUNT_PER_DRAM] =
             control_buffer[kernel_profiler::CORE_COUNT_PER_DRAM];
+        // Preserve the dispatch-core tag across resets (set once in setControlBuffer);
+        // accumulate mode relies on it to keep dispatch cores on the classic path.
+        core_control_buffer_reset[kernel_profiler::PROFILER_DISPATCH_CORE] =
+            control_buffer[kernel_profiler::PROFILER_DISPATCH_CORE];
+        core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_BR_ER_0] = buffer_0_address;
+        core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_NC_0] = buffer_0_address;
+        core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_T0_0] = buffer_0_address;
+        core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_T1_0] = buffer_0_address;
+        core_control_buffer_reset[kernel_profiler::DRAM_PROFILER_ADDRESS_T2_0] = buffer_0_address;
+        this->active_dram_buffer_per_core_risc_map[virtual_core].clear();
     }
 
     for (const auto& [virtual_core, control_buffer_reset] : core_control_buffer_resets) {
-        writeToCoreControlBuffer(device, virtual_core, control_buffer_reset);
+        writeToCoreControlBuffer(
+            mesh_device, device, virtual_core, control_buffer_reset, force_slow_dispatch, context_id);
+    }
+
+    this->resetActiveDramBufferIndices();
+}
+
+void DeviceProfiler::readProfilerBuffer(
+    distributed::MeshDevice* mesh_device, IDevice* device, uint8_t active_dram_buffer_index, bool force_slow_dispatch) {
+    ZoneScoped;
+    if (useFastDispatch(mesh_device, device, context_id) && !force_slow_dispatch) {
+        issueFastDispatchReadFromProfilerBuffer(mesh_device, device, active_dram_buffer_index);
+    } else {
+        issueSlowDispatchReadFromProfilerBuffer(device, active_dram_buffer_index);
     }
 }
 
-void DeviceProfiler::readProfilerBuffer(IDevice* device) {
-    ZoneScoped;
-    if (useFastDispatch(device)) {
-        issueFastDispatchReadFromProfilerBuffer(device);
-    } else {
-        issueSlowDispatchReadFromProfilerBuffer(device);
-    }
+void DeviceProfiler::markTraceBegin(uint32_t trace_id) {
+    TT_ASSERT(!traces_being_recorded.contains(trace_id));
+    traces_being_recorded.insert(trace_id);
+}
+
+void DeviceProfiler::markTraceEnd(uint32_t trace_id) {
+    TT_ASSERT(traces_being_recorded.contains(trace_id));
+    traces_being_recorded.erase(trace_id);
+}
+
+void DeviceProfiler::markTraceReplay(uint32_t trace_id) { traces_replayed.push_back(trace_id); }
+
+void DeviceProfiler::addRuntimeIdToTrace(uint32_t trace_id, uint32_t runtime_id) {
+    TT_ASSERT(traces_being_recorded.contains(trace_id));
+    runtime_ids_per_trace[trace_id].insert(runtime_id);
 }
 
 void DeviceProfiler::readRiscProfilerResults(
     IDevice* device,
     const CoreCoord& worker_core,
     const ProfilerDataBufferSource data_source,
-    const std::optional<ProfilerOptionalMetadata>& metadata) {
+    const std::optional<ProfilerOptionalMetadata>& metadata,
+    const std::optional<std::map<CoreCoord, std::set<tracy::RiscType>>>& riscs_to_include) {
     ZoneScoped;
 
     if (data_source == ProfilerDataBufferSource::DRAM_AND_L1) {
-        readRiscProfilerResults(device, worker_core, ProfilerDataBufferSource::DRAM, metadata);
-        readRiscProfilerResults(device, worker_core, ProfilerDataBufferSource::L1, metadata);
+        readRiscProfilerResults(device, worker_core, ProfilerDataBufferSource::DRAM, metadata, riscs_to_include);
+        readRiscProfilerResults(device, worker_core, ProfilerDataBufferSource::L1, metadata, riscs_to_include);
         return;
     }
 
@@ -1109,23 +1504,34 @@ void DeviceProfiler::readRiscProfilerResults(
     const std::vector<uint32_t>& data_buffer =
         (data_source == ProfilerDataBufferSource::DRAM) ? profile_buffer : core_l1_data_buffers.at(worker_core);
 
-    const auto& rtoptions = tt::tt_metal::MetalContext::instance().rtoptions();
+    const auto& rtoptions = MetalContext::instance(context_id).rtoptions();
 
-    if (!rtoptions.get_profiler_trace_only()) {
+    // Skip the HOST_BUFFER_END_INDEX (DRAM flush count) early-out where it doesn't apply: trace-only /
+    // accumulate modes (data stays in L1 and the index may never advance), and the Quasar L1-only path.
+    if (!rtoptions.get_profiler_trace_only() && !rtoptions.get_profiler_accumulate() &&
+        data_source != ProfilerDataBufferSource::L1) {
         if ((control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_BR_ER] == 0) &&
             (control_buffer[kernel_profiler::HOST_BUFFER_END_INDEX_NC] == 0)) {
             return;
         }
     }
 
-    const uint32_t coreFlatID =
-        tt::tt_metal::MetalContext::instance().get_cluster().get_virtual_routing_to_profiler_flat_id(device_id).at(
-            worker_core);
-    const uint32_t startIndex = coreFlatID * MAX_RISCV_PER_CORE * PROFILER_FULL_HOST_VECTOR_SIZE_PER_RISC;
+    const uint32_t profiler_dram_bank_size_per_risc_bytes = get_profiler_dram_bank_size_per_risc_bytes();
+    const uint32_t profiler_dram_bank_vector_size_per_risc = profiler_dram_bank_size_per_risc_bytes / sizeof(uint32_t);
+
+    const uint32_t coreFlatID = MetalContext::instance(context_id)
+                                    .get_cluster()
+                                    .get_virtual_routing_to_profiler_flat_id(device_id)
+                                    .at(worker_core);
+    const uint32_t startIndex = coreFlatID * MetalContext::instance(context_id).hal().get_max_processors_per_core() *
+                                profiler_dram_bank_vector_size_per_risc;
 
     // translate worker core virtual coord to phys coordinates
-    auto phys_coord = getPhysicalAddressFromVirtual(device_id, worker_core);
-
+    const metal_SocDescriptor& soc_desc = MetalContext::instance(context_id).get_cluster().get_soc_desc(device_id);
+    // disable linting here; slicing is __intended__
+    // NOLINTBEGIN
+    const CoreCoord phys_coord = soc_desc.translate_coord_to(worker_core, CoordSystem::TRANSLATED, CoordSystem::NOC0);
+    // NOLINTEND
     // helper function to lookup opname from runtime id if metadata is available
     auto getOpNameIfAvailable = [&metadata](auto device_id, auto runtime_id) {
         return (metadata.has_value()) ? metadata->get_op_name(device_id, runtime_id) : "";
@@ -1135,25 +1541,44 @@ void DeviceProfiler::readRiscProfilerResults(
     int riscCount = 1;
 
     if (!rtoptions.get_profiler_trace_only() && CoreType == HalProgrammableCoreType::TENSIX) {
-        riscCount = 5;
+        riscCount = MetalContext::instance(context_id).hal().get_num_risc_processors(HalProgrammableCoreType::TENSIX);
     }
 
+    std::map<tracy::RiscType, std::set<tracy::TTDeviceMarker>>& device_markers_for_core =
+        device_markers_per_core_risc_map[phys_coord];
+
+    uint32_t deviceTraceCounterRead = 0;
     for (int riscEndIndex = 0; riscEndIndex < riscCount; riscEndIndex++) {
         uint32_t bufferEndIndex = control_buffer[riscEndIndex];
         if (data_source == ProfilerDataBufferSource::L1) {
             // Just grab the device end index
             bufferEndIndex = control_buffer[riscEndIndex + kernel_profiler::DEVICE_BUFFER_END_INDEX_BR_ER];
         }
-        uint32_t riscType;
+
+        tracy::RiscType riscType;
         if (rtoptions.get_profiler_trace_only() && CoreType == HalProgrammableCoreType::TENSIX) {
-            riscType = TRACE_RISC_ID;
+            riscType = tracy::RiscType::TENSIX_RISC_AGG;
         } else if (CoreType == HalProgrammableCoreType::TENSIX) {
-            riscType = riscEndIndex;
+            if (device_arch == tt::ARCH::QUASAR) {
+                // Map riscEndIndex to the corresponding QUASAR_* RiscType (contiguous from QUASAR_DM0), matching
+                // the device get_hw_thread_idx() ordering.
+                riscType =
+                    static_cast<tracy::RiscType>(static_cast<uint8_t>(tracy::RiscType::QUASAR_DM0) + riscEndIndex);
+            } else {
+                riscType = static_cast<tracy::RiscType>(riscEndIndex);
+            }
         } else {
-            riscType = ERISC_RISC_ID;
+            riscType = tracy::RiscType::ERISC;
         }
+
+        if (riscs_to_include.has_value()) {
+            if (!riscs_to_include->contains(worker_core) || !riscs_to_include->at(worker_core).contains(riscType)) {
+                continue;
+            }
+        }
+
         if (bufferEndIndex > 0) {
-            uint32_t bufferRiscShift = riscEndIndex * PROFILER_FULL_HOST_VECTOR_SIZE_PER_RISC + startIndex;
+            uint32_t bufferRiscShift = (riscEndIndex * profiler_dram_bank_vector_size_per_risc) + startIndex;
             if (data_source == ProfilerDataBufferSource::L1) {
                 // Shift by L1 buffer size only
                 bufferRiscShift = riscEndIndex * kernel_profiler::PROFILER_L1_VECTOR_SIZE;
@@ -1167,14 +1592,17 @@ void DeviceProfiler::readRiscProfilerResults(
                     device_id,
                     worker_core.x,
                     worker_core.y,
-                    tracy::riscName[riscEndIndex],
+                    enchantum::to_string(static_cast<tracy::RiscType>(riscEndIndex)),
                     bufferEndIndex);
                 TracyMessageC(warningMsg.c_str(), warningMsg.size(), tracy::Color::Tomato3);
                 log_warning(tt::LogMetal, "{}", warningMsg);
+                // Lets processDeviceMarkerData tolerate orphan ZONE_START markers.
+                this->had_dropped_markers.store(true, std::memory_order_relaxed);
             }
 
             uint32_t riscNumRead = 0;
             uint32_t coreFlatIDRead = 0;
+            deviceTraceCounterRead = 0;
             uint32_t runHostCounterRead = 0;
 
             bool newRunStart = false;
@@ -1184,6 +1612,16 @@ void DeviceProfiler::readRiscProfilerResults(
             uint32_t opTime_L = 0;
             std::string opname;
 
+            std::set<tracy::TTDeviceMarker>& device_markers_for_core_risc = device_markers_for_core[riscType];
+
+            // perf_counter_flush emits pre-sentinel TS_DATA; buffer until a run starts.
+            struct PreSentinelMarker {
+                uint32_t timer_id;
+                uint64_t timestamp;
+                uint64_t data;  // only valid for TS_DATA
+            };
+            std::vector<PreSentinelMarker> pre_sentinel_markers;
+
             for (int index = bufferRiscShift; index < (bufferRiscShift + bufferEndIndex);
                  index += kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE) {
                 if (!newRunStart && data_buffer.at(index) == 0 && data_buffer.at(index + 1) == 0) {
@@ -1191,26 +1629,73 @@ void DeviceProfiler::readRiscProfilerResults(
                     oneStartFound = true;
                     opTime_H = 0;
                     opTime_L = 0;
+                } else if (!oneStartFound) {
+                    // Pre-sentinel data: capture TS_DATA and advance past its 4-slot layout.
+                    uint32_t timer_id = (data_buffer.at(index) >> kernel_profiler::PROFILER_MARKER_TIMER_ID_SHIFT) &
+                                        kernel_profiler::PROFILER_MARKER_TIMER_ID_MASK;
+                    uint32_t time_H = data_buffer.at(index) & kernel_profiler::PROFILER_MARKER_TS_HIGH_MASK;
+                    if (timer_id || time_H) {
+                        kernel_profiler::PacketTypes pre_packet_type = get_packet_type(timer_id);
+                        if (pre_packet_type == kernel_profiler::TS_DATA) {
+                            uint32_t time_L = data_buffer.at(index + 1);
+                            int data_index = index + kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE;
+                            // Skip truncated TS_DATA at the end of this risc's region.
+                            if (data_index + 1 < bufferRiscShift + bufferEndIndex) {
+                                uint64_t data_H = data_buffer.at(data_index);
+                                uint64_t data_L = data_buffer.at(data_index + 1);
+                                uint64_t data = (data_H << 32) | data_L;
+                                uint64_t timestamp = (static_cast<uint64_t>(time_H) << 32) | time_L;
+                                pre_sentinel_markers.push_back({timer_id, timestamp, data});
+                            }
+                            // Skip the data payload slot (4 slots total with the loop step).
+                            index += kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE;
+                        }
+                    }
+                    continue;
                 } else if (newRunStart) {
                     newRunStart = false;
 
-                    // TODO(MO): Cleanup magic numbers
-                    riscNumRead = data_buffer.at(index) & 0x7;
-                    coreFlatIDRead = (data_buffer.at(index) >> 3) & 0xFF;
+                    riscNumRead = data_buffer.at(index) & kernel_profiler::PROFILER_ID_RISC_MASK;
+                    coreFlatIDRead = (data_buffer.at(index) >> kernel_profiler::PROFILER_ID_FLAT_SHIFT) &
+                                     kernel_profiler::PROFILER_ID_FLAT_MASK;
+                    if (!skipReadingDeviceTraceCounter()) {
+                        deviceTraceCounterRead = (data_buffer.at(index) >> kernel_profiler::PROFILER_ID_TRACE_SHIFT) &
+                                                 kernel_profiler::PROFILER_ID_TRACE_MASK;
+                    }
                     runHostCounterRead = data_buffer.at(index + 1);
-                    uint32_t base_program_id =
-                        tt::tt_metal::detail::DecodePerDeviceProgramID(runHostCounterRead).base_program_id;
+                    if (runHostCounterRead != 0) {
+                        runHostCounterRead = detail::EncodePerDeviceProgramID(runHostCounterRead, device_id);
+                    }
 
+                    const uint32_t base_program_id =
+                        detail::DecodePerDeviceProgramID(runHostCounterRead).base_program_id;
                     opname = getOpNameIfAvailable(device_id, base_program_id);
 
+                    // Attach pre-sentinel TS_DATA markers to this run.
+                    for (const auto& pre : pre_sentinel_markers) {
+                        readDeviceMarkerData(
+                            device_markers_for_core_risc,
+                            runHostCounterRead,
+                            deviceTraceCounterRead,
+                            opname,
+                            device_id,
+                            phys_coord,
+                            riscType,
+                            pre.data,
+                            pre.timer_id,
+                            pre.timestamp);
+                    }
+                    pre_sentinel_markers.clear();
+
                 } else if (oneStartFound) {
-                    uint32_t timer_id = (data_buffer.at(index) >> 12) & 0x7FFFF;
+                    uint32_t timer_id = (data_buffer.at(index) >> kernel_profiler::PROFILER_MARKER_TIMER_ID_SHIFT) &
+                                        kernel_profiler::PROFILER_MARKER_TIMER_ID_MASK;
                     kernel_profiler::PacketTypes packet_type = get_packet_type(timer_id);
 
                     switch (packet_type) {
                         case kernel_profiler::ZONE_START:
                         case kernel_profiler::ZONE_END: {
-                            uint32_t time_H = data_buffer.at(index) & 0xFFF;
+                            uint32_t time_H = data_buffer.at(index) & kernel_profiler::PROFILER_MARKER_TS_HIGH_MASK;
                             if (timer_id || time_H) {
                                 uint32_t time_L = data_buffer.at(index + 1);
 
@@ -1242,8 +1727,10 @@ void DeviceProfiler::readRiscProfilerResults(
                                     runHostCounterRead,
                                     index);
 
-                                readPacketData(
+                                readDeviceMarkerData(
+                                    device_markers_for_core_risc,
                                     runHostCounterRead,
+                                    deviceTraceCounterRead,
                                     opname,
                                     device_id,
                                     phys_coord,
@@ -1258,8 +1745,10 @@ void DeviceProfiler::readRiscProfilerResults(
 
                             uint32_t time_H = opTime_H;
                             uint32_t time_L = opTime_L;
-                            readPacketData(
+                            readDeviceMarkerData(
+                                device_markers_for_core_risc,
                                 runHostCounterRead,
+                                deviceTraceCounterRead,
                                 opname,
                                 device_id,
                                 phys_coord,
@@ -1267,31 +1756,37 @@ void DeviceProfiler::readRiscProfilerResults(
                                 sum,
                                 timer_id,
                                 (uint64_t(time_H) << 32) | time_L);
-
                             break;
                         }
                         case kernel_profiler::TS_DATA: {
-                            uint32_t time_H = data_buffer.at(index) & 0xFFF;
+                            uint32_t time_H = data_buffer.at(index) & kernel_profiler::PROFILER_MARKER_TS_HIGH_MASK;
                             uint32_t time_L = data_buffer.at(index + 1);
                             index += kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE;
                             uint32_t data_H = data_buffer.at(index);
                             uint32_t data_L = data_buffer.at(index + 1);
-                            readPacketData(
+                            uint64_t timestamp = (uint64_t(time_H) << 32) | time_L;
+                            uint64_t data = (uint64_t(data_H) << 32) | data_L;
+
+                            readDeviceMarkerData(
+                                device_markers_for_core_risc,
                                 runHostCounterRead,
+                                deviceTraceCounterRead,
                                 opname,
                                 device_id,
                                 phys_coord,
                                 riscType,
-                                (uint64_t(data_H) << 32) | data_L,
+                                data,
                                 timer_id,
-                                (uint64_t(time_H) << 32) | time_L);
+                                timestamp);
                             continue;
                         }
                         case kernel_profiler::TS_EVENT: {
-                            uint32_t time_H = data_buffer.at(index) & 0xFFF;
+                            uint32_t time_H = data_buffer.at(index) & kernel_profiler::PROFILER_MARKER_TS_HIGH_MASK;
                             uint32_t time_L = data_buffer.at(index + 1);
-                            readPacketData(
+                            readDeviceMarkerData(
+                                device_markers_for_core_risc,
                                 runHostCounterRead,
+                                deviceTraceCounterRead,
                                 opname,
                                 device_id,
                                 phys_coord,
@@ -1299,269 +1794,684 @@ void DeviceProfiler::readRiscProfilerResults(
                                 0,
                                 timer_id,
                                 (uint64_t(time_H) << 32) | time_L);
+                            break;
+                        }
+                        case kernel_profiler::TS_DATA_16B: {
+                            // Header
+                            uint32_t time_H = data_buffer.at(index) & kernel_profiler::PROFILER_MARKER_TS_HIGH_MASK;
+                            uint32_t time_L = data_buffer.at(index + 1);
+                            index += kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE;
+
+                            // First uint64_t data
+                            uint32_t data_H = data_buffer.at(index);
+                            uint32_t data_L = data_buffer.at(index + 1);
+                            index += kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE;
+
+                            // Second uint64_t data
+                            uint32_t trailer_H = data_buffer.at(index);
+                            uint32_t trailer_L = data_buffer.at(index + 1);
+
+                            uint64_t timestamp = (uint64_t(time_H) << 32) | time_L;
+                            uint64_t data = (uint64_t(data_H) << 32) | data_L;
+                            uint64_t trailer = (uint64_t(trailer_H) << 32) | trailer_L;
+
+                            readTsData16BMarkerData(
+                                device_markers_for_core_risc,
+                                runHostCounterRead,
+                                deviceTraceCounterRead,
+                                opname,
+                                device_id,
+                                phys_coord,
+                                riscType,
+                                data,
+                                {trailer},
+                                timer_id,
+                                timestamp);
+                            break;
+                        }
+                        default: {
+                            TT_THROW("Invalid packet type {}", packet_type);
+                            break;
                         }
                     }
                 }
             }
         }
     }
-}
 
-void DeviceProfiler::firstTimestamp(uint64_t timestamp) {
-    if (timestamp < smallest_timestamp) {
-        smallest_timestamp = timestamp;
+    if (!skipReadingDeviceTraceCounter()) {
+        // TODO: #30169, This assert should be modified to be == once we've incorporated sub-device association for
+        // traces. Currently, we don't know which sub-device a trace belongs to, and so the final device trace counter
+        // that we read might not be the last trace that has been executed by the host.
+        TT_ASSERT(deviceTraceCounterRead <= traces_replayed.size());
     }
 }
 
-ZoneDetails DeviceProfiler::getZoneDetails(uint16_t timer_id) const {
-    auto zone_details_iter = hash_to_zone_src_locations.find(timer_id);
-    if (zone_details_iter != hash_to_zone_src_locations.end()) {
-        return zone_details_iter->second;
-    } else {
-        return UnidentifiedZoneDetails;
-    }
+void DeviceProfiler::updateFirstTimestamp(uint64_t timestamp) {
+    smallest_timestamp = std::min(timestamp, smallest_timestamp);
 }
 
-void DeviceProfiler::readPacketData(
+tracy::MarkerDetails DeviceProfiler::getMarkerDetails(uint16_t timer_id) const {
+    auto marker_details_iter = hash_to_zone_src_locations.find(timer_id);
+    if (marker_details_iter != hash_to_zone_src_locations.end()) {
+        return marker_details_iter->second;
+    }
+    return tracy::UnidentifiedMarkerDetails;
+}
+
+std::pair<uint64_t, uint64_t> DeviceProfiler::getTraceIdAndCount(
+    uint32_t run_host_id, uint32_t device_trace_counter) const {
+    if (device_trace_counter == 0) {
+        return {tracy::TTDeviceMarker::INVALID_NUM, tracy::TTDeviceMarker::INVALID_NUM};
+    }
+
+    TT_ASSERT(device_trace_counter <= traces_replayed.size());
+    const uint32_t trace_id = traces_replayed[device_trace_counter - 1];
+
+    if (!runtime_ids_per_trace.contains(trace_id)) {
+        return {tracy::TTDeviceMarker::INVALID_NUM, tracy::TTDeviceMarker::INVALID_NUM};
+    }
+
+    const std::unordered_set<uint32_t>& runtime_ids = runtime_ids_per_trace.at(trace_id);
+    const uint32_t base_program_id = detail::DecodePerDeviceProgramID(run_host_id).base_program_id;
+    if (!runtime_ids.contains(base_program_id)) {
+        return {tracy::TTDeviceMarker::INVALID_NUM, tracy::TTDeviceMarker::INVALID_NUM};
+    }
+
+    uint64_t trace_id_count = 0;
+    for (uint32_t i = 0; i < device_trace_counter; ++i) {
+        if (traces_replayed[i] == trace_id) {
+            trace_id_count++;
+        }
+    }
+
+    return {trace_id, trace_id_count};
+}
+
+void DeviceProfiler::readDeviceMarkerData(
+    std::set<tracy::TTDeviceMarker>& device_markers,
     uint32_t run_host_id,
-    const std::string& opname,
-    chip_id_t device_id,
-    CoreCoord core,
-    int risc_num,
+    uint32_t device_trace_counter,
+    const std::string& op_name,
+    ChipId device_id,
+    const CoreCoord& physical_core,
+    tracy::RiscType risc_type,
     uint64_t data,
     uint32_t timer_id,
     uint64_t timestamp) {
     ZoneScoped;
 
-    const kernel_profiler::PacketTypes packet_type = get_packet_type(timer_id);
-    uint32_t t_id = timer_id & 0xFFFF;
     nlohmann::json meta_data;
+    add_program_sub_device_meta_data(meta_data, run_host_id);
+    const tracy::MarkerDetails marker_details = getMarkerDetails(timer_id);
+    const kernel_profiler::PacketTypes packet_type = get_packet_type(timer_id);
+    const auto [trace_id, trace_id_count] = getTraceIdAndCount(run_host_id, device_trace_counter);
 
-    ZoneDetails zone_details = getZoneDetails(timer_id);
-
-    if ((packet_type == kernel_profiler::ZONE_START) || (packet_type == kernel_profiler::ZONE_END)) {
-        tracy::TTDeviceEventPhase zone_phase = tracy::TTDeviceEventPhase::begin;
-        if (packet_type == kernel_profiler::ZONE_END) {
-            zone_phase = tracy::TTDeviceEventPhase::end;
-        }
-
-        // TODO(MO) Until #14847 avoid attaching opID as the zone function name except for B and E FW
-        // This is to avoid generating 5 to 10 times more source locations which is capped at 32K
-        uint32_t tracy_run_host_id = run_host_id;
-        if (!zone_details.zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::BRISC_FW)] &&
-            !zone_details.zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::ERISC_FW)]) {
-            tracy_run_host_id = 0;
-        }
-
-        const auto& rtoptions = tt::tt_metal::MetalContext::instance().rtoptions();
-        if (rtoptions.get_profiler_trace_only() && risc_num == TRACE_RISC_ID) {
-            if (zone_details.zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::BRISC_FW)] ||
-                zone_details.zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::NCRISC_FW)] ||
-                zone_details.zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::TRISC_FW)] ||
-                zone_details.zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::ERISC_FW)]) {
-                zone_details.zone_name = "TRACE-FW";
-            }
-            if (zone_details
-                    .zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::BRISC_KERNEL)] ||
-                zone_details
-                    .zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::NCRISC_KERNEL)] ||
-                zone_details
-                    .zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::TRISC_KERNEL)] ||
-                zone_details
-                    .zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::ERISC_KERNEL)]) {
-                zone_details.zone_name = "TRACE-KERNEL";
-            }
-        }
-
-        auto ret = device_events.emplace(
-            tracy_run_host_id,
-            device_id,
-            core.x,
-            core.y,
-            risc_num,
-            timer_id,
-            timestamp,
-            zone_details.source_line_num,
-            zone_details.source_file,
-            zone_details.zone_name,
-            zone_phase,
-            getDeviceEventColor(risc_num, zone_details.zone_name_keyword_flags));
-        this->current_zone_it = ret.first;
-
-        if (!ret.second) {
-            return;
-        }
-
-        device_cores.emplace(device_id, core);
-
-        // Reset the command subtype, in case it isn't set during the command.
-        this->current_dispatch_meta_data.cmd_subtype = "";
-    }
-
-    if (packet_type == kernel_profiler::TS_DATA) {
-        if (this->current_zone_it != device_events.end()) {
-            // Check if we are in a Tensix Dispatch zone. If so, we could have gotten dispatch meta data packets
-            // These packets can amend parent zone's info
-            const ZoneDetails current_zone_details = getZoneDetails(this->current_zone_it->timer_id);
-            if ((tracy::riscName[risc_num] == "BRISC" || tracy::riscName[risc_num] == "NCRISC") &&
-                this->current_zone_it->zone_phase == tracy::TTDeviceEventPhase::begin &&
-                current_zone_details
-                    .zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::DISPATCH)]) {
-                if (zone_details
-                        .zone_name_keyword_flags[static_cast<uint16_t>(ZoneDetails::ZoneNameKeyword::PROCESS_CMD)]) {
-                    this->current_dispatch_meta_data.cmd_type =
-                        fmt::format("{}", enchantum::to_string((CQDispatchCmdId)data));
-                    meta_data["dispatch_command_type"] = this->current_dispatch_meta_data.cmd_type;
-                } else if (zone_details.zone_name_keyword_flags[static_cast<uint16_t>(
-                               ZoneDetails::ZoneNameKeyword::RUNTIME_HOST_ID_DISPATCH)]) {
-                    this->current_dispatch_meta_data.worker_runtime_id = (uint32_t)data;
-                    meta_data["workers_runtime_id"] = this->current_dispatch_meta_data.worker_runtime_id;
-                } else if (zone_details.zone_name_keyword_flags[static_cast<uint16_t>(
-                               ZoneDetails::ZoneNameKeyword::PACKED_DATA_DISPATCH)]) {
-                    this->current_dispatch_meta_data.cmd_subtype = fmt::format(
-                        "{}{}",
-                        data & CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_MCAST ? "MCAST," : "",
-                        enchantum::to_string(static_cast<CQDispatchCmdPackedWriteType>(
-                            (data >> 1) << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT)));
-                    meta_data["dispatch_command_subtype"] = this->current_dispatch_meta_data.cmd_subtype;
-                } else if (zone_details.zone_name_keyword_flags[static_cast<uint16_t>(
-                               ZoneDetails::ZoneNameKeyword::PACKED_LARGE_DATA_DISPATCH)]) {
-                    this->current_dispatch_meta_data.cmd_subtype =
-                        fmt::format("{}", enchantum::to_string(static_cast<CQDispatchCmdPackedWriteLargeType>(data)));
-                    meta_data["dispatch_command_subtype"] = this->current_dispatch_meta_data.cmd_subtype;
-                }
-
-                std::string newZoneName = this->current_dispatch_meta_data.cmd_type;
-                if (tracy::riscName[risc_num] == "BRISC") {
-                    if (this->current_dispatch_meta_data.cmd_subtype != "") {
-                        newZoneName = fmt::format(
-                            "{}:{}",
-                            this->current_dispatch_meta_data.worker_runtime_id,
-                            this->current_dispatch_meta_data.cmd_subtype);
-                    } else {
-                        newZoneName = fmt::format(
-                            "{}:{}",
-                            this->current_dispatch_meta_data.worker_runtime_id,
-                            this->current_dispatch_meta_data.cmd_type);
-                    }
-                }
-
-                const tracy::TTDeviceEvent event = *this->current_zone_it;
-                device_events.erase(this->current_zone_it);
-                auto ret = device_events.emplace(
-                    this->current_dispatch_meta_data.worker_runtime_id,
-                    event.chip_id,
-                    event.core_x,
-                    event.core_y,
-                    event.risc,
-                    event.timer_id,
-                    event.timestamp,
-                    event.line,
-                    event.file,
-                    newZoneName,
-                    event.zone_phase,
-                    event.color);
-                this->current_zone_it = ret.first;
-            }
-        }
-    }
-
-    firstTimestamp(timestamp);
-
-    device_data_points.emplace_back(
+    const auto& [_, new_marker_inserted] = device_markers.emplace(
+        run_host_id,
+        trace_id,
+        trace_id_count,
         device_id,
-        core.x,
-        core.y,
-        tracy::riscName[risc_num],
-        t_id,
+        physical_core.x,
+        physical_core.y,
+        risc_type,
+        timer_id,
         timestamp,
         data,
-        run_host_id,
-        zone_details.zone_name,
-        opname,
-        packet_type,
-        zone_details.source_line_num,
-        zone_details.source_file,
+        tracy::TTDeviceMarker::INVALID_NUM,
+        op_name,
+        marker_details.source_line_num,
+        marker_details.source_file,
+        marker_details.marker_name,
+        get_marker_type_from_packet_type(packet_type),
+        marker_details.marker_name_keyword_flags,
         meta_data);
+
+    if (!new_marker_inserted) {
+        return;
+    }
+
+    device_tracy_contexts.try_emplace({device_id, physical_core}, nullptr);
+
+    updateFirstTimestamp(timestamp);
+
+#if defined(TRACY_ENABLE)
+    if ((timer_id & kernel_profiler::PROFILER_TIMER_STATIC_ID_MASK) == kernel_profiler::NOC_DEBUGGING_STATIC_ID) {
+        NOCDebugState* noc_debug_state = MetalContext::instance(context_id).noc_debug_state().get();
+        if (noc_debug_state) {
+            const metal_SocDescriptor& soc_desc =
+                MetalContext::instance(context_id).get_cluster().get_soc_desc(device_id);
+            // disable linting here; slicing is __intended__
+            // NOLINTBEGIN
+            const CoreCoord virtual_core =
+                soc_desc.translate_coord_to(physical_core, CoordSystem::NOC0, CoordSystem::TRANSLATED);
+            // NOLINTEND
+
+            NocDebuggingEventMetadata ev_md(data);
+            ScopedLockEvent scoped_ev{
+                static_cast<int8_t>(virtual_core.x),
+                static_cast<int8_t>(virtual_core.y),
+                static_cast<NocDebuggingEventMetadata::NocDebugEventType>(ev_md.event_type),
+                ev_md.getLockedAddressBase(),
+                ev_md.getNumBytes()};
+            noc_debug_state->push_event(device_id, timestamp, get_processor_id(risc_type), NOCDebugEvent{scoped_ev});
+        }
+    }
+#endif
+}
+
+void DeviceProfiler::readTsData16BMarkerData(
+    std::set<tracy::TTDeviceMarker>& device_markers,
+    uint32_t run_host_id,
+    uint32_t device_trace_counter,
+    const std::string& op_name,
+    ChipId device_id,
+    const CoreCoord& physical_core,
+    tracy::RiscType risc_type,
+    uint64_t data,
+    const std::vector<uint64_t>& trailer_data,
+    uint32_t timer_id,
+    uint64_t timestamp) {
+    ZoneScoped;
+
+    nlohmann::json meta_data;
+#if defined(TRACY_ENABLE)
+    std::optional<NOCDebugEvent> noc_debug_event;
+    if ((timer_id & kernel_profiler::PROFILER_TIMER_STATIC_ID_MASK) == kernel_profiler::NOC_TRACING_STATIC_ID) {
+        using EMD = KernelProfilerNocEventMetadata;
+
+        EMD event_metadata(data);
+        auto event_contents = event_metadata.getContents();
+
+        // Local Noc Event is expected to have one trailer with dst_addr
+        if (!std::holds_alternative<EMD::LocalNocEvent>(event_contents)) {
+            TT_THROW("TS_DATA_16B marker contains unexpected event contents {:#X}", event_metadata.asU64());
+        }
+
+        const uint32_t total_data_size = trailer_data.size() + 1;
+        if (total_data_size != kernel_profiler::TimestampedDataSize<kernel_profiler::PacketTypes::TS_DATA_16B>::size) {
+            TT_THROW(
+                "TS_DATA_16B marker expected {} trailers, got {}",
+                kernel_profiler::TimestampedDataSize<kernel_profiler::PacketTypes::TS_DATA_16B>::size,
+                total_data_size);
+        }
+
+        EMD trailer_metadata(trailer_data[0]);
+        const auto& trailer = trailer_metadata.getLocalNocEventDstTrailer();
+        meta_data["dst_addr"] = trailer.getDstAddr();
+        meta_data["src_addr"] = trailer.getSrcAddr();
+        meta_data["noc_status_counter"] = static_cast<uint32_t>(trailer.counter_value);
+
+        auto& noc_debug_state = MetalContext::instance(context_id).noc_debug_state();
+        if (noc_debug_state) {
+            EMD::LocalNocEvent local_noc_event = std::get<EMD::LocalNocEvent>(event_contents);
+            const metal_SocDescriptor& soc_desc =
+                MetalContext::instance(context_id).get_cluster().get_soc_desc(device_id);
+            // disable linting here; slicing is __intended__
+            // NOLINTBEGIN
+            const CoreCoord virtual_core =
+                soc_desc.translate_coord_to(physical_core, CoordSystem::NOC0, CoordSystem::TRANSLATED);
+            // NOLINTEND
+            noc_debug_event =
+                make_noc_debug_event(virtual_core, local_noc_event, trailer_metadata.getLocalNocEventDstTrailer());
+        }
+    }
+#endif
+
+    const tracy::MarkerDetails marker_details = getMarkerDetails(timer_id);
+    const kernel_profiler::PacketTypes packet_type = get_packet_type(timer_id);
+    const auto [trace_id, trace_id_count] = getTraceIdAndCount(run_host_id, device_trace_counter);
+
+    const auto& [_, new_marker_inserted] = device_markers.emplace(
+        run_host_id,
+        trace_id,
+        trace_id_count,
+        device_id,
+        physical_core.x,
+        physical_core.y,
+        risc_type,
+        timer_id,
+        timestamp,
+        data,
+        trailer_data[0],
+        op_name,
+        marker_details.source_line_num,
+        marker_details.source_file,
+        marker_details.marker_name,
+        get_marker_type_from_packet_type(packet_type),
+        marker_details.marker_name_keyword_flags,
+        meta_data);
+
+    if (!new_marker_inserted) {
+        return;
+    }
+
+#if defined(TRACY_ENABLE)
+    // Only push NOC debug events if this is a new marker.
+    if (noc_debug_event.has_value()) {
+        MetalContext::instance(context_id)
+            .noc_debug_state()
+            ->push_event(device_id, timestamp, get_processor_id(risc_type), *noc_debug_event);
+    }
+#endif
+
+    device_tracy_contexts.try_emplace({device_id, physical_core}, nullptr);
+
+    updateFirstTimestamp(timestamp);
+}
+
+struct DispatchMetaData {
+    // Dispatch command queue command type
+    std::string cmd_type;
+
+    // Worker's runtime id
+    uint32_t worker_runtime_id = 0;
+
+    // dispatch command subtype.
+    std::string cmd_subtype;
+};
+
+// NOLINTNEXTLINE(readability-make-member-function-const)
+void DeviceProfiler::processDeviceMarkerData(std::set<tracy::TTDeviceMarker>& device_markers) {
+    DispatchMetaData current_dispatch_meta_data;
+    std::stack<std::set<tracy::TTDeviceMarker>::iterator> start_marker_stack;
+
+    auto updateDeviceMarker = [&](const tracy::TTDeviceMarker& updated_marker,
+                                  const std::set<tracy::TTDeviceMarker>::iterator& original_marker_it)
+        -> std::pair<std::set<tracy::TTDeviceMarker>::iterator, std::set<tracy::TTDeviceMarker>::iterator> {
+        const auto& next_device_marker_it = device_markers.erase(original_marker_it);
+        const auto& [device_marker_it, _] = device_markers.insert(updated_marker);
+        TT_ASSERT(std::next(device_marker_it) == next_device_marker_it);
+        return {device_marker_it, next_device_marker_it};
+    };
+
+    auto device_marker_it = device_markers.begin();
+    while (device_marker_it != device_markers.end()) {
+        tracy::TTDeviceMarker marker = *device_marker_it;
+        tracy::MarkerDetails marker_details = this->getMarkerDetails(marker.marker_id);
+
+        auto next_device_marker_it = std::next(device_marker_it);
+
+        if (isMarkerAZoneEndpoint(marker)) {
+            if (MetalContext::instance(context_id).rtoptions().get_profiler_trace_only() &&
+                marker.risc == tracy::RiscType::TENSIX_RISC_AGG) {
+                if (marker_details.marker_name_keyword_flags[static_cast<uint16_t>(
+                        tracy::MarkerDetails::MarkerNameKeyword::_FW)]) {
+                    marker.marker_name = "TRACE-FW";
+                    const auto& ret = updateDeviceMarker(marker, device_marker_it);
+                    device_marker_it = ret.first;
+                    next_device_marker_it = ret.second;
+                }
+                if (marker_details.marker_name_keyword_flags[static_cast<uint16_t>(
+                        tracy::MarkerDetails::MarkerNameKeyword::_KERNEL)]) {
+                    marker.marker_name = "TRACE-KERNEL";
+                    const auto& ret = updateDeviceMarker(marker, device_marker_it);
+                    device_marker_it = ret.first;
+                    next_device_marker_it = ret.second;
+                }
+            }
+
+            // Reset the command subtype, in case it isn't set during the command.
+            current_dispatch_meta_data.cmd_subtype = "";
+
+            if (marker.marker_type == tracy::TTDeviceMarkerType::ZONE_START) {
+                start_marker_stack.push(device_marker_it);
+            } else if (marker.marker_type == tracy::TTDeviceMarkerType::ZONE_END) {
+                if (start_marker_stack.empty()) {
+                    // Orphan ZONE_END from a dropped-marker run; skip instead of fatal.
+                    if (!this->had_dropped_markers.load(std::memory_order_relaxed)) {
+                        TT_FATAL(
+                            false,
+                            "End marker found without a corresponding start marker.\nEnd marker: {}",
+                            marker.to_string());
+                    }
+                    device_marker_it = next_device_marker_it;
+                    continue;
+                }
+
+                const auto& start_marker_it = start_marker_stack.top();
+
+                if (!MetalContext::instance(context_id).rtoptions().get_profiler_trace_only()) {
+                    if (start_marker_it->marker_id != marker.marker_id) {
+                        if (!this->had_dropped_markers.load(std::memory_order_relaxed)) {
+                            TT_FATAL(
+                                false,
+                                "Start and end marker IDs do not match.\nStart marker: {}\nEnd marker: {}",
+                                start_marker_it->to_string(),
+                                marker.to_string());
+                        }
+                        // Stack is misaligned due to drops; skip this end without popping.
+                        device_marker_it = next_device_marker_it;
+                        continue;
+                    }
+
+                    if (start_marker_it->marker_name != marker.marker_name) {
+                        marker.marker_name = start_marker_it->marker_name;
+                        const auto& ret = updateDeviceMarker(marker, device_marker_it);
+                        device_marker_it = ret.first;
+                        next_device_marker_it = ret.second;
+                    }
+                } else {
+                    TT_FATAL(
+                        start_marker_it->marker_name == marker.marker_name,
+                        "Start and end marker names do not match.\nStart marker: {}\nEnd marker: {}",
+                        start_marker_it->to_string(),
+                        marker.to_string());
+                }
+                start_marker_stack.pop();
+            }
+        } else if (isMarkerATimestampedDatapoint(marker)) {
+            if (!start_marker_stack.empty()) {
+                auto curr_zone_start_marker_it = start_marker_stack.top();
+                TT_ASSERT(curr_zone_start_marker_it->marker_type == tracy::TTDeviceMarkerType::ZONE_START);
+
+                // Check if we are in a Tensix Dispatch zone. If so, we could have gotten dispatch meta data packets
+                // These packets can amend parent zone's info
+                const tracy::MarkerDetails curr_zone_start_marker_details =
+                    getMarkerDetails(curr_zone_start_marker_it->marker_id);
+                if ((marker.risc == tracy::RiscType::BRISC || marker.risc == tracy::RiscType::NCRISC) &&
+                    curr_zone_start_marker_details.marker_name_keyword_flags[static_cast<uint16_t>(
+                        tracy::MarkerDetails::MarkerNameKeyword::DISPATCH)]) {
+                    if (marker_details.marker_name_keyword_flags[static_cast<uint16_t>(
+                            tracy::MarkerDetails::MarkerNameKeyword::PROCESS_CMD)]) {
+                        current_dispatch_meta_data.cmd_type =
+                            fmt::format("{}", enchantum::to_string((CQDispatchCmdId)marker.data));
+                        marker.meta_data["dispatch_command_type"] = current_dispatch_meta_data.cmd_type;
+                    } else if (marker_details.marker_name_keyword_flags[static_cast<uint16_t>(
+                                   tracy::MarkerDetails::MarkerNameKeyword::RUNTIME_HOST_ID_DISPATCH)]) {
+                        current_dispatch_meta_data.worker_runtime_id = (uint32_t)marker.data;
+                        marker.meta_data["workers_runtime_id"] = current_dispatch_meta_data.worker_runtime_id;
+                    } else if (marker_details.marker_name_keyword_flags[static_cast<uint16_t>(
+                                   tracy::MarkerDetails::MarkerNameKeyword::PACKED_DATA_DISPATCH)]) {
+                        current_dispatch_meta_data.cmd_subtype = fmt::format(
+                            "{}{}",
+                            marker.data & CQ_DISPATCH_CMD_PACKED_WRITE_FLAG_MCAST ? "MCAST;" : "",
+                            enchantum::to_string(static_cast<CQDispatchCmdPackedWriteType>(
+                                (marker.data >> 1) << CQ_DISPATCH_CMD_PACKED_WRITE_TYPE_SHIFT)));
+                        marker.meta_data["dispatch_command_subtype"] = current_dispatch_meta_data.cmd_subtype;
+                    } else if (marker_details.marker_name_keyword_flags[static_cast<uint16_t>(
+                                   tracy::MarkerDetails::MarkerNameKeyword::PACKED_LARGE_DATA_DISPATCH)]) {
+                        current_dispatch_meta_data.cmd_subtype = fmt::format(
+                            "{}", enchantum::to_string(static_cast<CQDispatchCmdPackedWriteLargeType>(marker.data)));
+                        marker.meta_data["dispatch_command_subtype"] = current_dispatch_meta_data.cmd_subtype;
+                    }
+
+                    std::string new_marker_name = current_dispatch_meta_data.cmd_type;
+                    if (marker.risc == tracy::RiscType::BRISC) {
+                        if (!current_dispatch_meta_data.cmd_subtype.empty()) {
+                            new_marker_name = fmt::format(
+                                "{}:{}",
+                                current_dispatch_meta_data.worker_runtime_id,
+                                current_dispatch_meta_data.cmd_subtype);
+                        } else {
+                            new_marker_name = fmt::format(
+                                "{}:{}",
+                                current_dispatch_meta_data.worker_runtime_id,
+                                current_dispatch_meta_data.cmd_type);
+                        }
+                    }
+
+                    const auto& marker_ret = updateDeviceMarker(marker, device_marker_it);
+                    device_marker_it = marker_ret.first;
+                    next_device_marker_it = marker_ret.second;
+
+                    tracy::TTDeviceMarker curr_zone_start_marker = *curr_zone_start_marker_it;
+                    curr_zone_start_marker.runtime_host_id = current_dispatch_meta_data.worker_runtime_id;
+                    curr_zone_start_marker.marker_name = curr_zone_start_marker.marker_name + ":" + new_marker_name;
+                    const auto& curr_zone_start_marker_ret =
+                        updateDeviceMarker(curr_zone_start_marker, curr_zone_start_marker_it);
+                    curr_zone_start_marker_it = curr_zone_start_marker_ret.first;
+
+                    start_marker_stack.pop();
+                    start_marker_stack.push(curr_zone_start_marker_it);
+                }
+
+                // If this is a performance counter, extract fields from data and store in marker meta_data
+                if (marker.marker_id == PERF_COUNTER_PROFILER_ID) {
+                    const PerfCounter perf_counter(marker.data, marker.data_high);
+                    const uint32_t counter_type_raw = perf_counter.counter_type;
+                    // Skip markers with out-of-range counter_type (stale/dropped data).
+                    if (!enchantum::contains<PerfCounterType>(counter_type_raw)) {
+                        log_warning(
+                            tt::LogMetal,
+                            "PerfCounter marker at device {} core {},{} risc {} run {} has "
+                            "out-of-range counter_type={} (raw data 0x{:x}); skipping enrichment.",
+                            marker.chip_id,
+                            marker.core_x,
+                            marker.core_y,
+                            enchantum::to_string(marker.risc),
+                            marker.runtime_host_id,
+                            counter_type_raw,
+                            marker.data);
+                    } else {
+                        marker.meta_data["counter type"] =
+                            enchantum::to_string(static_cast<PerfCounterType>(counter_type_raw));
+                        marker.meta_data["ref cnt"] = perf_counter.ref_cnt;
+                        marker.meta_data["value"] = perf_counter.counter_value;
+
+                        const auto& marker_ret = updateDeviceMarker(marker, device_marker_it);
+                        device_marker_it = marker_ret.first;
+                        next_device_marker_it = marker_ret.second;
+                    }
+                }
+            }
+        }
+
+        device_marker_it = next_device_marker_it;
+    }
+
+    if (!start_marker_stack.empty()) {
+        if (this->had_dropped_markers.load(std::memory_order_relaxed)) {
+            log_warning(
+                tt::LogMetal,
+                "{} start markers detected without corresponding end markers (some end markers were "
+                "dropped due to DRAM-buffer overflow; report will be partial). Marker at top of stack: {}",
+                start_marker_stack.size(),
+                start_marker_stack.top()->to_string());
+        } else {
+            TT_FATAL(
+                false,
+                "{} start markers detected without corresponding end markers. Marker at top of stack: {}",
+                start_marker_stack.size(),
+                start_marker_stack.top()->to_string());
+        }
+    }
 }
 
 void DeviceProfiler::setLastFDReadAsNotDone() { this->is_last_fd_read_done = false; }
 
 void DeviceProfiler::setLastFDReadAsDone() { this->is_last_fd_read_done = true; }
 
+uint32_t DeviceProfiler::getProfileBufferBankSizeBytes() const { return this->profile_buffer_bank_size_bytes; }
+
+void DeviceProfiler::setProfileBufferBankSizeBytes(uint32_t size, uint32_t num_dram_banks) {
+    this->profile_buffer_bank_size_bytes = size;
+    this->profile_buffer.resize(size * num_dram_banks / sizeof(uint32_t));
+}
+
+void DeviceProfiler::clearStateForDeviceReinit() {
+    this->core_control_buffers.clear();
+    this->core_l1_data_buffers.clear();
+    this->active_dram_buffer_per_core_risc_map.clear();
+    this->device_markers_per_core_risc_map.clear();
+}
+
+void DeviceProfiler::resetActiveDramBufferIndices() {
+    // Reset all active DRAM buffer indices to 0 for all cores and RISCs
+    // This keeps host state in sync when device-side profiler buffers are cleared
+    this->active_dram_buffer_per_core_risc_map.clear();
+}
+
+DeviceAddr DeviceProfiler::getProfilerDramBufferAddress(uint8_t active_dram_buffer_index) const {
+    const auto base_address = MetalContext::instance(context_id).hal().get_dev_addr(HalDramMemAddrType::PROFILER);
+    const auto offset = getProfileBufferBankSizeBytes() * active_dram_buffer_index;
+    return base_address + offset;
+}
+
 bool DeviceProfiler::isLastFDReadDone() const { return this->is_last_fd_read_done; }
 
-DeviceProfiler::DeviceProfiler(const IDevice* device, const bool new_logs) {
+DeviceProfiler::DeviceProfiler(const IDevice* device, const bool new_logs [[maybe_unused]]) :
+    device_arch(device->arch()),
+    device_id(device->id()),
+    context_id(extract_context_id(device)),
+    device_core_frequency(MetalContext::instance(context_id).get_cluster().get_device_aiclk(this->device_id)),
+    max_compute_cores(device->logical_grid_size().x * device->logical_grid_size().y) {
 #if defined(TRACY_ENABLE)
     ZoneScopedC(tracy::Color::Green);
-    this->device_id = device->id();
-    this->device_arch = device->arch();
-    this->device_core_frequency =
-        tt::tt_metal::MetalContext::instance().get_cluster().get_device_aiclk(this->device_id);
-    this->output_dir = std::filesystem::path(get_profiler_logs_dir());
-    std::filesystem::create_directories(this->output_dir);
-    std::filesystem::path log_path = this->output_dir / DEVICE_SIDE_LOG;
-
-    if (new_logs) {
-        std::filesystem::remove(log_path);
+    if (!getDeviceProfilerState(context_id)) {
+        return;
     }
 
+    this->device_logs_output_dir = std::filesystem::path(get_profiler_logs_dir());
+    TT_FATAL(
+        tt::filesystem::safe_create_directories(this->device_logs_output_dir),
+        "Could not create profiler output directory '{}'",
+        this->device_logs_output_dir);
+
+    if (new_logs) {
+        std::filesystem::path log_path = this->device_logs_output_dir / DEVICE_SIDE_LOG;
+        tt::filesystem::safe_remove(log_path);
+
+        std::filesystem::path device_perf_report_path = this->device_logs_output_dir / PROFILER_DEVICE_PERF_REPORT_NAME;
+        tt::filesystem::safe_remove(device_perf_report_path);
+    }
+
+    MetalContext::instance(context_id).profiler_state_manager()->device_programs_perf_analyses_map[this->device_id] =
+        {};
+
     const std::string noc_events_report_path =
-        tt::tt_metal::MetalContext::instance().rtoptions().get_profiler_noc_events_report_path();
+        MetalContext::instance(context_id).rtoptions().get_profiler_noc_events_report_path();
     if (!noc_events_report_path.empty()) {
         this->noc_trace_data_output_dir = std::filesystem::path(noc_events_report_path);
     } else {
-        this->noc_trace_data_output_dir = this->output_dir;
+        this->noc_trace_data_output_dir = this->device_logs_output_dir;
     }
 
     this->is_last_fd_read_done = false;
-    this->current_zone_it = this->device_events.begin();
-
-    const uint32_t approximate_num_device_profiler_events =
-        (MAX_RISCV_PER_CORE * PROFILER_FULL_HOST_VECTOR_SIZE_PER_RISC * device->compute_with_storage_grid_size().x *
-         device->compute_with_storage_grid_size().y) /
-        kernel_profiler::PROFILER_L1_MARKER_UINT32_SIZE;
-    this->device_events.reserve(approximate_num_device_profiler_events);
-    this->device_data_points.reserve(approximate_num_device_profiler_events);
-
-    this->device_cores.reserve(device->compute_with_storage_grid_size().x * device->compute_with_storage_grid_size().y);
+    this->device_tracy_contexts.reserve(
+        device->compute_with_storage_grid_size().x * device->compute_with_storage_grid_size().y);
 #endif
 }
 
-DeviceProfiler::~DeviceProfiler() {
+void DeviceProfiler::generateAnalysesForDeviceMarkers(
+    const std::vector<std::reference_wrapper<const tracy::TTDeviceMarker>>& device_markers) const {
 #if defined(TRACY_ENABLE)
     ZoneScoped;
-    auto t = std::thread([this]() { dumpDeviceResults(); });
-    pushTracyDeviceResults();
-    for (auto& tracyCtx : device_tracy_contexts) {
-        TracyTTDestroy(tracyCtx.second);
+
+    // Accumulate mode lacks per-program op IDs (zones from many invocations are interleaved), so a per-op perf report
+    // is meaningless -- skip it.
+    if (MetalContext::instance(context_id).rtoptions().get_profiler_accumulate()) {
+        return;
     }
-    t.join();
+
+    const std::filesystem::path analysis_configs_path =
+        std::filesystem::path(MetalContext::instance(context_id).rtoptions().get_root_dir()) /
+        "tt_metal/tools/profiler/cpp_device_analyses.json";
+    const std::vector<AnalysisConfig> analysis_configs = loadAnalysisConfigsFromJSON(analysis_configs_path);
+
+    const ProgramsPerfResults programs_perf_results =
+        generatePerfResultsForPrograms(analysis_configs, device_markers, *this->thread_pool);
+
+    std::vector<std::set<experimental::ProgramAnalysisData>>& device_programs_perf_analyses =
+        MetalContext::instance(context_id)
+            .profiler_state_manager()
+            ->device_programs_perf_analyses_map.at(this->device_id);
+    device_programs_perf_analyses.push_back(translateProgramsPerfResults(programs_perf_results));
+
+    writeProgramsPerfResultsToCSV(
+        programs_perf_results, this->device_logs_output_dir / PROFILER_DEVICE_PERF_REPORT_NAME);
+#endif
+}
+
+void DeviceProfiler::dumpDeviceResults(bool is_mid_run_dump) {
+#if defined(TRACY_ENABLE)
+    ZoneScoped;
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+
+    if (!this->thread_pool) {
+        this->thread_pool = create_device_bound_thread_pool(
+            context_id,
+            MetalContext::instance(context_id)
+                .profiler_state_manager()
+                ->calculate_optimal_num_threads_for_device_profiler_thread_pool());
+    }
+
+    this->initializeMissingTracyContexts(/*blocking=*/is_mid_run_dump);
+
+    if (getDeviceDebugDumpEnabled(context_id)) {
+        // This was not called before so call it now for the final dump
+        hash_to_zone_src_locations = generateZoneSourceLocationsHashes();
+    }
+
+    if (!is_mid_run_dump) {
+        for (auto& [core, _] : this->device_markers_per_core_risc_map) {
+            this->thread_pool->enqueue([this, core]() {
+                for (auto& [risc_num, device_markers] : this->device_markers_per_core_risc_map[core]) {
+                    this->processDeviceMarkerData(device_markers);
+                }
+            });
+        }
+
+        this->thread_pool->wait();
+    }
+
+    std::vector<std::reference_wrapper<const tracy::TTDeviceMarker>> device_markers_vec =
+        getSortedDeviceMarkersVector(this->device_markers_per_core_risc_map, *this->thread_pool);
+
+    if (MetalContext::instance(context_id).rtoptions().get_profiler_cpp_post_process()) {
+        this->generateAnalysesForDeviceMarkers(device_markers_vec);
+    }
+
+    this->thread_pool->enqueue([this]() { writeDeviceResultsToFiles(); });
+
+    this->pushTracyDeviceResults(device_markers_vec);
+
+    this->thread_pool->wait();
+
+    this->device_markers_per_core_risc_map.clear();
 #endif
 }
 
 void DeviceProfiler::freshDeviceLog() {
 #if defined(TRACY_ENABLE)
-    std::filesystem::path log_path = output_dir / DEVICE_SIDE_LOG;
-    std::filesystem::remove(log_path);
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+    std::filesystem::path log_path = device_logs_output_dir / DEVICE_SIDE_LOG;
+    tt::filesystem::safe_remove(log_path);
+
+    std::filesystem::path device_perf_report_path = device_logs_output_dir / PROFILER_DEVICE_PERF_REPORT_NAME;
+    tt::filesystem::safe_remove(device_perf_report_path);
 #endif
 }
 
 void DeviceProfiler::setOutputDir(const std::string& new_output_dir) {
 #if defined(TRACY_ENABLE)
-    std::filesystem::create_directories(new_output_dir);
-    output_dir = new_output_dir;
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+    TT_FATAL(
+        tt::filesystem::safe_create_directories(new_output_dir),
+        "Could not create profiler output directory '{}'",
+        new_output_dir);
+    device_logs_output_dir = new_output_dir;
 #endif
 }
 
 void DeviceProfiler::readResults(
+    distributed::MeshDevice* mesh_device,
     IDevice* device,
     const std::vector<CoreCoord>& virtual_cores,
     const ProfilerReadState state,
     const ProfilerDataBufferSource data_source,
-    const std::optional<ProfilerOptionalMetadata>& metadata) {
+    const std::optional<ProfilerOptionalMetadata>& /*metadata*/) {
 #if defined(TRACY_ENABLE)
     ZoneScoped;
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
 
     const std::string zone_name = fmt::format(
         "{}-{}-{}-{}", "readResults", device_id, enchantum::to_string(state), enchantum::to_string(data_source));
@@ -1569,29 +2479,33 @@ void DeviceProfiler::readResults(
 
     hash_to_zone_src_locations = generateZoneSourceLocationsHashes();
 
-    TT_ASSERT(doAllDispatchCoresComeAfterNonDispatchCores(device, virtual_cores));
+    TT_ASSERT(doAllDispatchCoresComeAfterNonDispatchCores(device, virtual_cores, context_id));
+
+    bool force_slow_dispatch = MetalContext::instance(context_id).rtoptions().get_experimental_noc_debug_dump_enabled();
+
+    constexpr uint8_t default_dram_buffer_index = 0;
 
     if (data_source == ProfilerDataBufferSource::DRAM) {
-        readControlBuffers(device, virtual_cores);
+        readControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
 
-        readProfilerBuffer(device);
+        readProfilerBuffer(mesh_device, device, default_dram_buffer_index, force_slow_dispatch);
 
-        resetControlBuffers(device, virtual_cores);
+        resetControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
     } else if (data_source == ProfilerDataBufferSource::L1) {
-        readControlBuffers(device, virtual_cores);
+        readControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
 
-        resetControlBuffers(device, virtual_cores);
+        resetControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
 
-        readL1DataBuffers(device, virtual_cores);
+        readL1DataBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
     } else {
         TT_ASSERT(data_source == ProfilerDataBufferSource::DRAM_AND_L1);
-        readControlBuffers(device, virtual_cores);
+        readControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
 
-        readProfilerBuffer(device);
+        readProfilerBuffer(mesh_device, device, default_dram_buffer_index, force_slow_dispatch);
 
-        readL1DataBuffers(device, virtual_cores);
+        readL1DataBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
 
-        resetControlBuffers(device, virtual_cores);
+        resetControlBuffers(mesh_device, device, virtual_cores, force_slow_dispatch);
     }
 #endif
 }
@@ -1601,43 +2515,27 @@ void DeviceProfiler::processResults(
     const std::vector<CoreCoord>& virtual_cores,
     const ProfilerReadState state,
     const ProfilerDataBufferSource data_source,
-    const std::optional<ProfilerOptionalMetadata>& metadata) {
+    const std::optional<ProfilerOptionalMetadata>& metadata,
+    const std::optional<std::map<CoreCoord, std::set<tracy::RiscType>>>& riscs_to_include) {
 #if defined(TRACY_ENABLE)
     ZoneScoped;
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
 
     const std::string zone_name = fmt::format(
         "{}-{}-{}-{}", "processResults", device_id, enchantum::to_string(state), enchantum::to_string(data_source));
     ZoneName(zone_name.c_str(), zone_name.size());
 
-    const auto& rtoptions = tt::tt_metal::MetalContext::instance().rtoptions();
-
-    const uint32_t num_device_data_points_before_reading = device_data_points.size();
-    if (rtoptions.get_profiler_noc_events_enabled()) {
-        log_warning(
-            tt::LogAlways, "Profiler NoC events are enabled; this can add 1-15% cycle overhead to typical operations!");
-    }
-
     for (const auto& virtual_core : virtual_cores) {
-        readRiscProfilerResults(device, virtual_core, data_source, metadata);
-    }
-
-    if (rtoptions.get_profiler_noc_events_enabled() &&
-        (state == ProfilerReadState::NORMAL || state == ProfilerReadState::LAST_FD_READ)) {
-        FabricRoutingLookup routing_lookup(device);
-        const std::unordered_map<RuntimeID, nlohmann::json::array_t> processed_events_by_op_name =
-            convertNocTracePacketsToJson(
-                device_data_points.begin() + num_device_data_points_before_reading,
-                device_data_points.end(),
-                device_id,
-                routing_lookup);
-        noc_trace_data.push_back(std::move(processed_events_by_op_name));
+        readRiscProfilerResults(device, virtual_core, data_source, metadata, riscs_to_include);
     }
 #endif
 }
 
 void DeviceProfiler::dumpRoutingInfo() const {
-    std::filesystem::create_directories(noc_trace_data_output_dir);
-    if (!std::filesystem::is_directory(noc_trace_data_output_dir)) {
+    tt::filesystem::safe_create_directories(noc_trace_data_output_dir);
+    if (!tt::filesystem::safe_is_directory(noc_trace_data_output_dir).value_or(false)) {
         log_error(
             tt::LogMetal,
             "Could not dump topology to '{}' because the directory path could not be created!",
@@ -1649,8 +2547,8 @@ void DeviceProfiler::dumpRoutingInfo() const {
 }
 
 void DeviceProfiler::dumpClusterCoordinates() const {
-    std::filesystem::create_directories(noc_trace_data_output_dir);
-    if (!std::filesystem::is_directory(noc_trace_data_output_dir)) {
+    tt::filesystem::safe_create_directories(noc_trace_data_output_dir);
+    if (!tt::filesystem::safe_is_directory(noc_trace_data_output_dir).value_or(false)) {
         log_error(
             tt::LogMetal,
             "Could not dump cluster coordinates to '{}' because the directory path could not be created!",
@@ -1668,22 +2566,46 @@ bool isSyncInfoNewer(const SyncInfo& old_info, const SyncInfo& new_info) {
          ((old_info.device_time / old_info.frequency) < (new_info.device_time / new_info.frequency))));
 }
 
-void DeviceProfiler::dumpDeviceResults() const {
+void DeviceProfiler::writeDeviceResultsToFiles() const {
 #if defined(TRACY_ENABLE)
     ZoneScoped;
+    if (!getDeviceProfilerState(context_id) ||
+        MetalContext::instance(context_id).rtoptions().get_profiler_disable_dump_to_files() ||
+        MetalContext::instance(context_id).rtoptions().get_experimental_noc_debug_dump_enabled()) {
+        return;
+    }
 
-    const std::filesystem::path log_path = output_dir / DEVICE_SIDE_LOG;
-    dumpDeviceResultsToCSV(device_data_points, device_arch, device_core_frequency, log_path);
+    std::scoped_lock lock(MetalContext::instance(context_id).profiler_state_manager()->log_file_write_mutex);
 
-    if (!noc_trace_data.empty()) {
-        dumpJsonNocTraces(noc_trace_data, device_id, noc_trace_data_output_dir);
+    const std::filesystem::path log_path = device_logs_output_dir / DEVICE_SIDE_LOG;
+    dumpDeviceResultsToCSV(
+        device_markers_per_core_risc_map, device_arch, device_core_frequency, max_compute_cores, log_path);
+
+    if (MetalContext::instance(context_id).rtoptions().get_profiler_noc_events_enabled()) {
+        log_warning(
+            tt::LogAlways, "Profiler NoC events are enabled; this can add 1-15% cycle overhead to typical operations!");
+        FabricRoutingLookup routing_lookup;
+        std::unordered_map<experimental::ProgramExecutionUID, nlohmann::json::array_t> noc_trace_data =
+            convertNocTracePacketsToJson(
+                device_markers_per_core_risc_map, device_id, routing_lookup, freq_scale, shift);
+
+        if (!noc_trace_data.empty()) {
+            dumpJsonNocTraces(noc_trace_data, device_id, noc_trace_data_output_dir);
+        }
     }
 #endif
 }
 
-void DeviceProfiler::pushTracyDeviceResults() {
+void DeviceProfiler::pushTracyDeviceResults(
+    std::vector<std::reference_wrapper<const tracy::TTDeviceMarker>>& device_markers_vec) {
 #if defined(TRACY_ENABLE)
     ZoneScoped;
+    if (!getDeviceProfilerState(context_id) ||
+        MetalContext::instance(context_id).rtoptions().get_profiler_disable_push_to_tracy() ||
+        // TODO: Quasar is CSV-only for now
+        device_arch == tt::ARCH::QUASAR) {
+        return;
+    }
 
     // If this device is root, it may have new sync info updated with syncDeviceHost
     for (auto& [core, info] : device_core_sync_info) {
@@ -1692,83 +2614,153 @@ void DeviceProfiler::pushTracyDeviceResults() {
         }
     }
 
-    // IMPORTANT: This function creates a vector of references to the TTDeviceEvent objects stored in the device_events
-    // unordered set. These are direct references to the original objects, not copies of the data.
-    // Thread safety warning: The device_events set MUST NOT be modified (no insertions, deletions, or rehashing) while
-    // these references are in use, as this could invalidate the references and cause undefined behavior.
-    std::vector<std::reference_wrapper<const tracy::TTDeviceEvent>> device_events_vec =
-        getDeviceEventsVector(device_events);
+    updateTracyContexts(device_markers_vec);
 
-    sortDeviceEvents(device_events_vec);
+    for (auto& marker_ref : device_markers_vec) {
+        std::reference_wrapper<const tracy::TTDeviceMarker>& marker_to_push_ref = marker_ref;
 
-    // Tracy contexts must be updated in order of their first timestamps
-    for (const auto& event_ref : device_events_vec) {
-        const tracy::TTDeviceEvent& event = event_ref.get();
-        auto device_core_it = device_cores.find({event.chip_id, {event.core_x, event.core_y}});
-        if (device_core_it != device_cores.end()) {
-            updateTracyContext(*device_core_it);
-            device_cores.erase(device_core_it);
-        }
-
-        if (device_cores.empty()) {
-            break;
-        }
-    }
-
-    for (auto& event_ref : device_events_vec) {
-        std::reference_wrapper<const tracy::TTDeviceEvent>& event_to_push_ref = event_ref;
-
-        const tracy::TTDeviceEvent& orig_event = event_ref.get();
-        tracy::TTDeviceEvent event_with_adjusted_timestamp;
-        const uint64_t adjusted_timestamp = orig_event.timestamp * this->freq_scale + this->shift;
-        if (adjusted_timestamp != orig_event.timestamp) {
-            event_with_adjusted_timestamp = tracy::TTDeviceEvent(
-                orig_event.run_num,
-                orig_event.chip_id,
-                orig_event.core_x,
-                orig_event.core_y,
-                orig_event.risc,
-                orig_event.timer_id,
+        const tracy::TTDeviceMarker& orig_marker = marker_ref.get();
+        tracy::TTDeviceMarker marker_with_adjusted_timestamp;
+        const uint64_t adjusted_timestamp = orig_marker.timestamp * this->freq_scale + this->shift;
+        if (adjusted_timestamp != orig_marker.timestamp) {
+            marker_with_adjusted_timestamp = tracy::TTDeviceMarker(
+                orig_marker.runtime_host_id,
+                orig_marker.trace_id,
+                orig_marker.trace_id_counter,
+                orig_marker.chip_id,
+                orig_marker.core_x,
+                orig_marker.core_y,
+                orig_marker.risc,
+                orig_marker.marker_id,
                 adjusted_timestamp,
-                orig_event.line,
-                orig_event.file,
-                orig_event.zone_name,
-                orig_event.zone_phase,
-                orig_event.color);
-            event_to_push_ref = std::cref(event_with_adjusted_timestamp);
+                orig_marker.data,
+                orig_marker.data_high,
+                orig_marker.op_name,
+                orig_marker.line,
+                orig_marker.file,
+                orig_marker.marker_name,
+                orig_marker.marker_type,
+                orig_marker.marker_name_keyword_flags,
+                orig_marker.meta_data);
+            marker_to_push_ref = std::cref(marker_with_adjusted_timestamp);
         }
 
-        const tracy::TTDeviceEvent& event_to_push = event_to_push_ref.get();
-        std::pair<chip_id_t, CoreCoord> device_core = {
-            event_to_push.chip_id, (CoreCoord){event_to_push.core_x, event_to_push.core_y}};
-        if (event_to_push.zone_phase == tracy::TTDeviceEventPhase::begin) {
-            TracyTTPushStartZone(device_tracy_contexts[device_core], event_to_push);
-        } else if (event_to_push.zone_phase == tracy::TTDeviceEventPhase::end) {
-            TracyTTPushEndZone(device_tracy_contexts[device_core], event_to_push);
+        const tracy::TTDeviceMarker& marker_to_push = marker_to_push_ref.get();
+        std::pair<ChipId, CoreCoord> device_core = {
+            marker_to_push.chip_id, (CoreCoord){marker_to_push.core_x, marker_to_push.core_y}};
+        if (marker_to_push.marker_type == tracy::TTDeviceMarkerType::ZONE_START) {
+            TracyTTPushStartMarker(device_tracy_contexts[device_core], marker_to_push);
+        } else if (marker_to_push.marker_type == tracy::TTDeviceMarkerType::ZONE_END) {
+            TracyTTPushEndMarker(device_tracy_contexts[device_core], marker_to_push);
         }
     }
-
-    device_events.clear();
 #endif
 }
 
 void DeviceProfiler::setSyncInfo(const SyncInfo& sync_info) { device_sync_info = sync_info; }
 
-void DeviceProfiler::updateTracyContext(std::pair<uint32_t, CoreCoord> device_core) {
+void DeviceProfiler::initializeMissingTracyContexts(bool blocking) {
 #if defined(TRACY_ENABLE)
-    const chip_id_t device_id = device_core.first;
-    CoreCoord worker_core = device_core.second;
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+    TT_ASSERT(this->thread_pool != nullptr);
 
-    if (device_tracy_contexts.find(device_core) == device_tracy_contexts.end()) {
-        // Create a new tracy context for this device core
-        auto tracyCtx = TracyTTContext();
-        std::string tracyTTCtxName = fmt::format("Device: {}, Core ({},{})", device_id, worker_core.x, worker_core.y);
+    for (const auto& [device_core, _] : device_tracy_contexts) {
+        if (device_tracy_contexts.at(device_core) == nullptr) {
+            this->thread_pool->enqueue(
+                [this, device_core]() { device_tracy_contexts.at(device_core) = TracyTTContext(); });
+        }
+    }
+
+    if (blocking) {
+        this->thread_pool->wait();
+    }
+#endif
+}
+
+void DeviceProfiler::updateTracyContexts(
+    const std::vector<std::reference_wrapper<const tracy::TTDeviceMarker>>& device_markers_vec) {
+#if defined(TRACY_ENABLE)
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+    std::unordered_set<std::pair<ChipId, CoreCoord>, pair_hash<ChipId, CoreCoord>> device_cores_to_update;
+    device_cores_to_update.reserve(device_tracy_contexts.size());
+
+    for (const auto& [device_core, _] : device_tracy_contexts) {
+        TT_ASSERT(device_tracy_contexts.at(device_core) != nullptr);
+        device_cores_to_update.insert(device_core);
+    }
+
+    // Tracy contexts must be updated in order of their first timestamps
+    for (const auto& marker_ref : device_markers_vec) {
+        const tracy::TTDeviceMarker& marker = marker_ref.get();
+        auto device_core_it =
+            device_cores_to_update.find({static_cast<ChipId>(marker.chip_id), {marker.core_x, marker.core_y}});
+        if (device_core_it != device_cores_to_update.end()) {
+            updateTracyContext(*device_core_it);
+            device_cores_to_update.erase(device_core_it);
+        }
+
+        if (device_cores_to_update.empty()) {
+            break;
+        }
+    }
+#endif
+}
+
+void DeviceProfiler::updateTracyContext(const std::pair<ChipId, CoreCoord>& device_core) {
+#if defined(TRACY_ENABLE)
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+    const ChipId device_id = device_core.first;
+    const CoreCoord worker_core = device_core.second;
+
+    // Accumulate uses the default calibration (device_time = smallest WORKER marker); don't use the rt anchor's
+    // dispatch-core cycle here -- different clock/bit-width yields out-of-range, off-screen zones.
+
+    if (!core_sync_info.contains(worker_core)) {
+        const metal_SocDescriptor& soc_desc = MetalContext::instance(context_id).get_cluster().get_soc_desc(device_id);
+        // disable linting here; slicing is __intended__
+        // NOLINTBEGIN
+        const CoreCoord logical_core =
+            soc_desc.translate_coord_to(worker_core, CoordSystem::NOC0, CoordSystem::LOGICAL);
+        // NOLINTEND
+        const std::string tracyTTCtxName = fmt::format(
+            "Device: {}, Logical ({},{}) Physical ({},{})",
+            device_id,
+            logical_core.x,
+            logical_core.y,
+            worker_core.x,
+            worker_core.y);
 
         double cpu_time = device_sync_info.cpu_time;
         double device_time = device_sync_info.device_time;
         double frequency = device_sync_info.frequency;
 
-        if (frequency == 0) {
+        if (realtime_sync_line.has_value() && smallest_timestamp != (1lu << 63)) {
+            // Anchor to the rt-profiler clock fit: keep device_time = smallest WORKER marker, but derive cpu_time from
+            // the fit (ratio = TracyGetTimerMul, the TSC->ns factor the fit used).
+            const double ratio = TracyGetTimerMul();
+            device_time = static_cast<double>(smallest_timestamp);
+            cpu_time = realtime_sync_line->host_anchor +
+                       (device_time - realtime_sync_line->device_anchor) / (realtime_sync_line->frequency * ratio);
+            frequency = realtime_sync_line->frequency;
+            device_sync_info = SyncInfo(cpu_time, device_time, frequency);
+            log_debug(
+                tt::LogMetal,
+                "Device {}, core {},{} anchored to realtime-profiler clock fit: smallest_ts={}, "
+                "device_anchor={:.0f}, cpu_time={:.0f}, freq={} GHz",
+                device_id,
+                worker_core.x,
+                worker_core.y,
+                smallest_timestamp,
+                realtime_sync_line->device_anchor,
+                cpu_time,
+                frequency);
+        } else if (frequency == 0) {
             cpu_time = TracyGetCpuTime();
             device_time = smallest_timestamp;
             frequency = device_core_frequency / 1000.0;
@@ -1791,11 +2783,12 @@ void DeviceProfiler::updateTracyContext(std::pair<uint32_t, CoreCoord> device_co
                 cpu_time);
         }
 
-        TracyTTContextPopulate(tracyCtx, cpu_time, device_time, frequency);
+        TracyTTCtx tracyCtx = device_tracy_contexts.at(device_core);
+        TT_ASSERT(tracyCtx != nullptr);
 
+        TracyTTContextPopulate(tracyCtx, cpu_time, device_time, frequency);
         TracyTTContextName(tracyCtx, tracyTTCtxName.c_str(), tracyTTCtxName.size());
 
-        device_tracy_contexts.emplace(device_core, tracyCtx);
         core_sync_info.emplace(worker_core, SyncInfo(cpu_time, device_time, frequency));
     } else {
         // Update the existing tracy context for this device core
@@ -1804,7 +2797,8 @@ void DeviceProfiler::updateTracyContext(std::pair<uint32_t, CoreCoord> device_co
             double cpu_time = device_sync_info.cpu_time;
             double device_time = device_sync_info.device_time;
             double frequency = device_sync_info.frequency;
-            auto tracyCtx = device_tracy_contexts.at(device_core);
+            TracyTTCtx tracyCtx = device_tracy_contexts.at(device_core);
+            TT_ASSERT(tracyCtx != nullptr);
             TracyTTContextCalibrate(tracyCtx, cpu_time, device_time, frequency);
             log_debug(
                 tt::LogMetal,
@@ -1821,8 +2815,255 @@ void DeviceProfiler::updateTracyContext(std::pair<uint32_t, CoreCoord> device_co
 #endif
 }
 
-bool getDeviceProfilerState() { return tt::tt_metal::MetalContext::instance().rtoptions().get_profiler_enabled(); }
+void DeviceProfiler::destroyTracyContexts() {
+#if defined(TRACY_ENABLE)
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+    TT_ASSERT(this->thread_pool != nullptr);
 
-}  // namespace tt_metal
+    for (const auto& [device_core, _] : device_tracy_contexts) {
+        TT_ASSERT(device_tracy_contexts.at(device_core) != nullptr);
+        this->thread_pool->enqueue([this, device_core]() { TracyTTDestroy(device_tracy_contexts.at(device_core)); });
+    }
 
-}  // namespace tt
+    this->thread_pool->wait();
+#endif
+}
+
+void DeviceProfiler::pollDebugDumpResults(
+    IDevice* device, const std::vector<CoreCoord>& virtual_cores, bool is_final_poll) {
+#if defined(TRACY_ENABLE)
+    ZoneScoped;
+    if (!getDeviceProfilerState(context_id)) {
+        return;
+    }
+
+    TT_ASSERT(device_id == device->id());
+
+    // Handle worker cores: use ping-pong DRAM buffer logic
+    if (virtual_cores.empty()) {
+        return;
+    }
+
+    auto* mesh_device = device->get_mesh_device().get();
+
+    readControlBuffers(mesh_device, device, virtual_cores, /*force_slow_dispatch=*/true);
+
+    // Not Stalled but have data
+    std::map<CoreCoord, std::vector<uint32_t>> temp_control_buffers;
+    std::map<CoreCoord, std::set<tracy::RiscType>> cores_with_data;
+
+    // Stalled because full
+    std::map<CoreCoord, std::vector<uint32_t>> temp_stalled_control_buffers;
+    std::map<CoreCoord, std::set<tracy::RiscType>> stalled_cores_with_data;
+
+    {
+        ZoneScopedN("pollDebugDumpResults-FindStalledCores");
+        for (const auto& virtual_core : virtual_cores) {
+            const auto& cluster = MetalContext::instance(context_id).get_cluster();
+            bool is_eth = cluster.is_ethernet_core(virtual_core, device->id());
+            const std::vector<uint32_t>& control_buffer = core_control_buffers.at(virtual_core);
+            auto& active_risc_map = this->active_dram_buffer_per_core_risc_map[virtual_core];
+
+            for (tracy::RiscType risc_type : enchantum::values_generator<tracy::RiscType>) {
+                if (risc_type == tracy::RiscType::TENSIX_RISC_AGG || risc_type == tracy::RiscType::NONE ||
+                    (is_eth && risc_type != tracy::RiscType::ERISC) ||
+                    (!is_eth && risc_type == tracy::RiscType::ERISC) ||
+                    // WH/BH and Quasar RiscTypes occupy disjoint enum ranges, and the Quasar DRAM profiler
+                    // buffer is unsupported for now.
+                    (static_cast<uint8_t>(risc_type) >= static_cast<uint8_t>(tracy::RiscType::QUASAR_DM0) &&
+                     static_cast<uint8_t>(risc_type) <= static_cast<uint8_t>(tracy::RiscType::QUASAR_NEO3_TRISC3))) {
+                    continue;
+                }
+
+                const uint8_t active_dram_buffer_index = active_risc_map[risc_type];
+
+                TT_ASSERT(active_dram_buffer_index < 2, "DRAM Buffer Index can only be 0 or 1");
+
+                const uint8_t control_buffer_dram_addr_index =
+                    risc_type_to_control_buffer_dram_address_offset(risc_type);
+                const uint8_t control_buffer_host_index_index =
+                    risc_type_to_control_buffer_host_index_offset(risc_type);
+                const DeviceAddr dram_buffer_address = control_buffer[control_buffer_dram_addr_index];
+
+                // Check if buffer has data by looking at HOST_BUFFER_END_INDEX
+                const uint32_t buffer_end_index = control_buffer[control_buffer_host_index_index];
+                const bool buffer_has_data = buffer_end_index > 0;
+
+                if (dram_buffer_address == kernel_profiler::DRAM_PROFILER_ADDRESS_STALLED) {
+                    auto [it, inserted] = temp_stalled_control_buffers.try_emplace(virtual_core, control_buffer);
+
+                    const uint8_t next_active_dram_buffer_index = 1 - active_dram_buffer_index;
+                    it->second[control_buffer_dram_addr_index] =
+                        this->getProfilerDramBufferAddress(next_active_dram_buffer_index);
+                    it->second[control_buffer_host_index_index] = 0;
+                    stalled_cores_with_data[virtual_core].insert(risc_type);
+
+                    // Note: Do not use the writeToCoreControlBuffer function as it will overwrite the entire control
+                    // buffer. We only want to update the fields for the stalled riscs.
+                    const auto dram_profiler_address_offset = control_buffer_dram_addr_index;
+                    const DeviceAddr addr = getControlVectorAddress(device, virtual_core, context_id) +
+                                            (dram_profiler_address_offset * sizeof(uint32_t));
+                    // Need to use write_reg to guarantee a single write to the control buffer
+                    // Host index will be updated by the risc once it receives the new dram address
+                    cluster.write_reg(
+                        &it->second[control_buffer_dram_addr_index], tt_cxy_pair(device->id(), virtual_core), addr);
+                } else if (buffer_has_data) {
+                    temp_control_buffers.try_emplace(virtual_core, control_buffer);
+                    cores_with_data[virtual_core].insert(risc_type);
+                } else {
+                    // Buffer has no data and is not stalled - nothing to do
+                    // This should match, otherwise it means something went out of sync with the host and device
+                    TT_ASSERT(
+                        dram_buffer_address == this->getProfilerDramBufferAddress(active_dram_buffer_index),
+                        "DRAM Buffer Address on risc {} virtual core {} is not valid. Host and Device state mismatch. "
+                        "DRAM "
+                        "buffer address on device: {}, "
+                        "Expected DRAM buffer address: {}, index: {}, "
+                        "Complementary DRAM buffer address if switched indices: {}",
+                        enchantum::to_string(risc_type),
+                        virtual_core.str(),
+                        dram_buffer_address,
+                        this->getProfilerDramBufferAddress(active_dram_buffer_index),
+                        active_dram_buffer_index,
+                        this->getProfilerDramBufferAddress(1 - active_dram_buffer_index));
+                }
+            }
+        }
+        // For final poll, merge NOT STALLED cores with data into stalled cores
+        if (is_final_poll) {
+            for (const auto& [virtual_core, risc_types] : cores_with_data) {
+                for (const auto& risc_type : risc_types) {
+                    stalled_cores_with_data[virtual_core].insert(risc_type);
+                    if (!temp_control_buffers.contains(virtual_core)) {
+                        temp_control_buffers[virtual_core] = core_control_buffers.at(virtual_core);
+                    }
+                    const uint8_t control_buffer_host_index_index =
+                        risc_type_to_control_buffer_host_index_offset(risc_type);
+                    temp_control_buffers[virtual_core][control_buffer_host_index_index] = 0;
+                }
+            }
+        }
+    }
+
+    // Figure out which DRAM profiler addresses need to be read
+    std::set<uint8_t> stalled_dram_buffer_indices;
+    std::vector<CoreCoord> virtual_cores_with_data;
+    virtual_cores_with_data.reserve(stalled_cores_with_data.size());
+    for (const auto& [virtual_core, risc_types] : stalled_cores_with_data) {
+        virtual_cores_with_data.push_back(virtual_core);
+        for (const auto& risc_type : risc_types) {
+            stalled_dram_buffer_indices.insert(this->active_dram_buffer_per_core_risc_map[virtual_core][risc_type]);
+        }
+    }
+
+    // Read DRAM
+    for (uint8_t buffer_index : stalled_dram_buffer_indices) {
+        TT_ASSERT(buffer_index < 2, "DRAM Buffer Index can only be 0 or 1");
+        readProfilerBuffer(mesh_device, device, buffer_index, /*force_slow_dispatch=*/true);
+
+        std::map<CoreCoord, std::set<tracy::RiscType>> cores_with_data_in_current_buffer;
+        for (const auto& [virtual_core, risc_types] : stalled_cores_with_data) {
+            for (const auto& risc_type : risc_types) {
+                if (this->active_dram_buffer_per_core_risc_map.at(virtual_core).at(risc_type) == buffer_index) {
+                    cores_with_data_in_current_buffer[virtual_core].insert(risc_type);
+                }
+            }
+        }
+
+        std::vector<CoreCoord> virtual_cores_for_current_buffer;
+        virtual_cores_for_current_buffer.reserve(cores_with_data_in_current_buffer.size());
+        for (const auto& [virtual_core, risc_types] : cores_with_data_in_current_buffer) {
+            virtual_cores_for_current_buffer.push_back(virtual_core);
+        }
+
+        for (const auto& virtual_core : virtual_cores_for_current_buffer) {
+            readRiscProfilerResults(
+                device, virtual_core, ProfilerDataBufferSource::DRAM, {}, cores_with_data_in_current_buffer);
+        }
+    }
+
+    // Remaining L1 data not flushed to DRAM yet
+    if (is_final_poll) {
+        std::vector<CoreCoord> cores_with_l1_data;
+        cores_with_l1_data.reserve(virtual_cores.size());
+        std::map<CoreCoord, std::set<tracy::RiscType>> riscs_with_l1_data;
+
+        for (const auto& virtual_core : virtual_cores) {
+            bool is_eth = MetalContext::instance(context_id).get_cluster().is_ethernet_core(virtual_core, device->id());
+            bool core_has_l1_data = false;
+
+            for (tracy::RiscType risc_type : enchantum::values_generator<tracy::RiscType>) {
+                if (risc_type == tracy::RiscType::TENSIX_RISC_AGG || risc_type == tracy::RiscType::NONE ||
+                    (is_eth && risc_type != tracy::RiscType::ERISC) ||
+                    (!is_eth && risc_type == tracy::RiscType::ERISC) ||
+                    // WH/BH and Quasar RiscTypes occupy disjoint enum ranges, and the Quasar DRAM profiler
+                    // buffer is unsupported for now.
+                    (static_cast<uint8_t>(risc_type) >= static_cast<uint8_t>(tracy::RiscType::QUASAR_DM0) &&
+                     static_cast<uint8_t>(risc_type) <= static_cast<uint8_t>(tracy::RiscType::QUASAR_NEO3_TRISC3))) {
+                    continue;
+                }
+
+                const uint8_t control_buffer_device_index_index =
+                    risc_type_to_control_buffer_device_index_offset(risc_type);
+                const uint32_t device_buffer_end_index =
+                    core_control_buffers[virtual_core][control_buffer_device_index_index];
+
+                if (device_buffer_end_index > 0) {
+                    riscs_with_l1_data[virtual_core].insert(risc_type);
+                    core_has_l1_data = true;
+                }
+            }
+
+            if (core_has_l1_data) {
+                cores_with_l1_data.push_back(virtual_core);
+            }
+        }
+
+        // Read and process L1 buffers with unflushed data
+        if (!cores_with_l1_data.empty()) {
+            readL1DataBuffers(mesh_device, device, cores_with_l1_data, true);
+            for (const auto& virtual_core : cores_with_l1_data) {
+                readRiscProfilerResults(device, virtual_core, ProfilerDataBufferSource::L1, {}, riscs_with_l1_data);
+            }
+        }
+    }
+
+    // Commit the DeviceProfiler state updates on the host side
+    for (const auto& [virtual_core, risc_types] : stalled_cores_with_data) {
+        if (temp_stalled_control_buffers.contains(virtual_core)) {
+            this->core_control_buffers[virtual_core] = temp_stalled_control_buffers[virtual_core];
+            for (const auto& risc_type : risc_types) {
+                const uint8_t old_index = this->active_dram_buffer_per_core_risc_map[virtual_core][risc_type];
+                this->active_dram_buffer_per_core_risc_map[virtual_core][risc_type] = 1 - old_index;
+            }
+        } else if (temp_control_buffers.contains(virtual_core) && is_final_poll) {
+            // Non-stalled core that was merged into stalled_cores_with_data on final poll
+            // Update control buffer (with cleared host index) but don't switch buffer index
+            this->core_control_buffers[virtual_core] = temp_control_buffers[virtual_core];
+        }
+    }
+#endif
+}
+
+bool getDeviceProfilerState(ContextId context_id) {
+    auto& ctx = MetalContext::instance(context_id);
+
+    // Device profiler cannot be enabled on mock device.
+    if (ctx.get_cluster().is_mock_or_emulated()) {
+        return false;
+    }
+
+    return ctx.rtoptions().get_profiler_enabled();
+}
+
+bool getDeviceDebugDumpEnabled(ContextId context_id) {
+    return MetalContext::instance(context_id).rtoptions().get_experimental_noc_debug_dump_enabled();
+}
+
+}  // namespace tt::tt_metal
+
+#if !defined(TRACY_ENABLE) && defined(__clang__)
+#pragma clang diagnostic pop
+#endif

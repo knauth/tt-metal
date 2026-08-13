@@ -1,5 +1,7 @@
 #!/bin/bash
 
+TT_CACHE_HOME=/mnt/MLPerf/huggingface/tt_cache
+
 set -eo pipefail
 
 run_python_model_tests_grayskull() {
@@ -20,103 +22,50 @@ run_python_model_tests_grayskull() {
     # Fused ops unit tests
     pytest models/experimental/bert_large_performant/unit_tests/fused_ops/test_bert_large_fused_ln.py -k "in0_L1-out_L1 and batch_9"
     pytest models/experimental/bert_large_performant/unit_tests/fused_ops/test_bert_large_fused_softmax.py -k "in0_L1 and batch_9"
-
-    # Falcon tests
-    pytest models/demos/falcon7b_common/tests/unit_tests/test_falcon_matmuls_and_bmms_with_mixed_precision.py -k "seq_len_128 and in0_BFLOAT16-in1_BFLOAT8_B-out_BFLOAT16-weights_DRAM"
-    pytest models/demos/falcon7b_common/tests/unit_tests/test_falcon_matmuls_and_bmms_with_mixed_precision.py -k "seq_len_512 and in0_BFLOAT16-in1_BFLOAT8_B-out_BFLOAT16-weights_DRAM"
-    pytest models/demos/falcon7b_common/tests/unit_tests/test_falcon_attn_matmul.py
 }
 
 run_python_model_tests_wormhole_b0() {
-    # Falcon tests
-    # attn_matmul_from_cache is currently not used in falcon7b
-    pytest models/demos/falcon7b_common/tests/unit_tests/test_falcon_attn_matmul.py -k "not attn_matmul_from_cache"
-    # higher sequence lengths and different formats trigger memory issues
-    pytest models/demos/falcon7b_common/tests/unit_tests/test_falcon_matmuls_and_bmms_with_mixed_precision.py -k "seq_len_128 and in0_BFLOAT16-in1_BFLOAT8_B-out_BFLOAT16-weights_DRAM"
-    pytest models/demos/wormhole/resnet50/tests/test_resnet50_functional.py -k "pretrained_weight_false"
+    # DeepSeekV3
+    uv pip install -r models/demos/deepseek_v3/reference/deepseek/requirements.txt
+    MESH_DEVICE=AUTO pytest models/demos/deepseek_v3/tests/unit --timeout 60 --durations=0
 
-    # Yolov4
-    pytest models/demos/yolov4/tests/pcc/test_ttnn_yolov4.py -k "pretrained_weight_false"
+    # Generalized MoE gate op (ungrouped top-k + DeepSeek grouped)
+    pytest models/common/tests/modules/moe/test_generalized_moe_gate.py
 
-    # Yolov8
-    pytest models/demos/yolov8x/tests/pcc/test_yolov8x.py::test_yolov8x_640
-
-    # Yolov8s
-    pytest models/demos/yolov8s/tests/pcc/test_yolov8s.py::test_yolov8s_640
-
-    # Unet Shallow
-    pytest -svv models/experimental/functional_unet/tests/test_unet_model.py
-
-    # Mamba
-    pytest -svv models/demos/wormhole/mamba/tests/test_residual_block.py -k "pretrained_weight_false"
+    pytest models/demos/vision/classification/resnet50/wormhole/tests/test_resnet50_functional.py -k "pretrained_weight_false"
 
     # Mobilenetv2git
-    pytest -svv models/demos/mobilenetv2/tests/pcc/test_mobilenetv2.py
-
-    #Yolov10
-    pytest -svv models/demos/yolov10x/tests/pcc/test_ttnn_yolov10x.py::test_yolov10x
-
-    #Yolov7
-    pytest -svv models/demos/yolov7/tests/pcc/test_ttnn_yolov7.py
-
-    # ViT-base
-    pytest -svv models/demos/vit/tests/pcc/test_ttnn_optimized_sharded_vit_wh.py
-
+    pytest -svv models/demos/vision/classification/mobilenetv2/tests/pcc/test_mobilenetv2.py
 
     # Llama3.1-8B
-    llama8b=/mnt/MLPerf/tt_dnn-models/llama/Meta-Llama-3.1-8B-Instruct/
-    # Llama3.2-1B
-    llama1b=/mnt/MLPerf/tt_dnn-models/llama/Llama3.2-1B-Instruct/
-    # Llama3.2-3B
-    llama3b=/mnt/MLPerf/tt_dnn-models/llama/Llama3.2-3B-Instruct/
-    # Llama3.2-11B
-    llama11b=/mnt/MLPerf/tt_dnn-models/llama/Llama3.2-11B-Vision-Instruct/
+    llama8b=meta-llama/Llama-3.1-8B-Instruct
 
-    # Run all Llama3 tests for 8B, 1B, and 3B weights - dummy weights with tight PCC check
-    for llama_dir in  "$llama1b" "$llama3b" "$llama8b" "$llama11b"; do
-        LLAMA_DIR=$llama_dir pytest -n auto models/tt_transformers/tests/test_model.py -k "quick" ; fail+=$?
-        echo "LOG_METAL: Llama3 tests for $llama_dir completed"
-    done
+    # Run all Llama3 tests for 8B - dummy weights with tight PCC check
+    tt_cache=$TT_CACHE_HOME/$llama8b
+    HF_MODEL=$llama8b TT_CACHE_PATH=$tt_cache pytest models/tt_transformers/tests/test_model.py -k "quick" ; fail+=$?
+    echo "LOG_METAL: Llama3 tests for $llama8b completed"
 
-    # Mistral-7B-v0.3
-    mistral_weights=mistralai/Mistral-7B-Instruct-v0.3
-    HF_MODEL=$mistral_weights pytest -n auto models/tt_transformers/tests/test_model.py -k "quick" ; fail+=$?
 }
 
 run_python_model_tests_slow_runtime_mode_wormhole_b0() {
-    # Unet Shallow
-    export TTNN_CONFIG_OVERRIDES='{
-        "enable_fast_runtime_mode": false,
-        "enable_comparison_mode": true,
-        "comparison_mode_should_raise_exception": true,
-        "comparison_mode_pcc": 0.998
-    }'
-    pytest -svv models/experimental/functional_unet/tests/test_unet_model.py
+    echo "LOG_METAL: No slow runtime mode tests for wormhole_b0"
 }
 
 run_python_model_tests_blackhole() {
-    pytest models/demos/blackhole/stable_diffusion/tests
+    SD_HF_DOWNLOAD_OVERRIDE=1 pytest models/demos/vision/generative/stable_diffusion/blackhole/tests --timeout 420 --ignore=models/demos/vision/generative/stable_diffusion/blackhole/tests/test_perf.py
 
     # Llama3.1-8B
-    llama8b=/mnt/MLPerf/tt_dnn-models/llama/Meta-Llama-3.1-8B-Instruct/
+    llama8b=meta-llama/Llama-3.1-8B-Instruct
     # Run all Llama3 tests for 8B - dummy weights with tight PCC check
-    for llama_dir in "$llama8b"; do
-        LLAMA_DIR=$llama_dir pytest -n auto models/tt_transformers/tests/test_model.py -k "quick" ; fail+=$?
-        echo "LOG_METAL: Llama3 tests for $llama_dir completed"
+    for hf_model in "$llama8b"; do
+        tt_cache=$TT_CACHE_HOME/$hf_model
+        HF_MODEL=$hf_model TT_CACHE_PATH=$tt_cache pytest models/tt_transformers/tests/test_model.py -k "quick" --timeout 360 ; fail+=$?
+        echo "LOG_METAL: Llama3 tests for $hf_model completed"
     done
 
-    pytest models/demos/wormhole/resnet50/tests/test_resnet50_functional.py
-    pytest models/demos/yolov4/tests/pcc/test_ttnn_yolov4_bh.py
-    pytest models/experimental/functional_unet/tests/test_unet_model.py
+    pytest models/demos/vision/classification/resnet50/wormhole/tests/test_resnet50_functional.py --timeout 300
 }
 
 run_python_model_tests_slow_runtime_mode_blackhole() {
-    # Unet Shallow
-    export TTNN_CONFIG_OVERRIDES='{
-        "enable_fast_runtime_mode": false,
-        "enable_comparison_mode": true,
-        "comparison_mode_should_raise_exception": true,
-        "comparison_mode_pcc": 0.998
-    }'
-    pytest -svv models/experimental/functional_unet/tests/test_unet_model.py
+    echo "LOG_METAL: No slow runtime mode tests for blackhole"
 }

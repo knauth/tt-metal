@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -19,10 +19,11 @@
 #include "hal_types.hpp"
 #include "sub_device.hpp"
 #include "sub_device_types.hpp"
+#include <impl/context/context_types.hpp>
 #include <tt-metalium/mesh_trace_id.hpp>
 
 namespace tt::tt_metal::distributed {
-class MeshTraceBuffer;
+struct MeshTraceBuffer;
 }
 namespace tt::tt_metal {
 
@@ -32,9 +33,9 @@ class SubDeviceManager {
 public:
     // Constructor used for the default/global device
     SubDeviceManager(
-        IDevice* device, std::unique_ptr<Allocator>&& global_allocator, tt::stl::Span<const SubDevice> sub_devices);
+        IDevice* device, std::unique_ptr<AllocatorImpl>&& global_allocator, ttsl::Span<const SubDevice> sub_devices);
     // Constructor used for regular sub-devices
-    SubDeviceManager(tt::stl::Span<const SubDevice> sub_devices, DeviceAddr local_l1_size, IDevice* device);
+    SubDeviceManager(ttsl::Span<const SubDevice> sub_devices, DeviceAddr local_l1_size, IDevice* device);
 
     SubDeviceManager(const SubDeviceManager& other) = delete;
     SubDeviceManager& operator=(const SubDeviceManager& other) = delete;
@@ -56,19 +57,20 @@ public:
 
     const std::vector<std::pair<CoreRangeSet, uint32_t>>& get_core_go_message_mapping() const;
 
-    const std::unique_ptr<Allocator>& allocator(SubDeviceId sub_device_id) const;
-    std::unique_ptr<Allocator>& sub_device_allocator(SubDeviceId sub_device_id);
+    const std::unique_ptr<AllocatorImpl>& allocator(SubDeviceId sub_device_id) const;
+    std::unique_ptr<AllocatorImpl>& sub_device_allocator(SubDeviceId sub_device_id);
 
     std::shared_ptr<distributed::MeshTraceBuffer>& create_trace(const distributed::MeshTraceId& trace_id);
     void release_trace(const distributed::MeshTraceId& trace_id);
     std::shared_ptr<distributed::MeshTraceBuffer> get_trace(const distributed::MeshTraceId& trace_id);
+    DeviceAddr get_max_trace_high_water_mark() const;
 
     uint8_t num_sub_devices() const;
     bool has_allocations() const;
     DeviceAddr local_l1_size() const;
 
     const std::vector<SubDeviceId>& get_sub_device_stall_group() const;
-    void set_sub_device_stall_group(tt::stl::Span<const SubDeviceId> sub_device_ids);
+    void set_sub_device_stall_group(ttsl::Span<const SubDeviceId> sub_device_ids);
     void reset_sub_device_stall_group();
 
 private:
@@ -88,9 +90,10 @@ private:
     std::vector<SubDeviceId> sub_device_ids_;
     std::vector<SubDeviceId> sub_device_stall_group_;
     IDevice* device_;
+    tt::tt_metal::ContextId context_id_;
 
     DeviceAddr local_l1_size_;
-    std::vector<std::unique_ptr<Allocator>> sub_device_allocators_;
+    std::vector<std::unique_ptr<AllocatorImpl>> sub_device_allocators_;
 
     std::array<uint32_t, NumHalProgrammableCoreTypes> num_cores_{};
 

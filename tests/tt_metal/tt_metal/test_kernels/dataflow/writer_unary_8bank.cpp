@@ -1,41 +1,30 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dataflow_api.h"
-
-constexpr bool get_write_to_dram() {
-    if constexpr (kernel_compile_time_args.size() > 0) {
-        return get_compile_time_arg_val(0);
-    } else {
-        return true;
-    }
-}
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/circular_buffer.h"
+#include "api/dataflow/noc.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
-    uint32_t dst_addr  = get_arg_val<uint32_t>(0);
-    uint32_t num_tiles = get_arg_val<uint32_t>(2); // Index 2 to match with regular writer_unary
+    uint32_t dst_addr = get_arg_val<uint32_t>(0);
+    uint32_t num_tiles = get_arg_val<uint32_t>(2);  // Index 2 to match with regular writer_unary
 
-    constexpr uint32_t cb_id_out0 = 16;
     constexpr uint32_t onetile = 1;
+    constexpr uint32_t out_id = get_compile_time_arg_val(0);
+    constexpr auto dst_args = TensorAccessorArgs<1>();
+    constexpr uint32_t cb_id_out0 = out_id;
+    CircularBuffer cb(cb_id_out0);
     uint32_t tile_bytes = get_tile_size(cb_id_out0);
-    const DataFormat data_format = get_dataformat(cb_id_out0);
+    const auto s = TensorAccessor(dst_args, dst_addr);
 
-    constexpr bool write_to_dram = get_write_to_dram();
-
-    const InterleavedAddrGenFast<write_to_dram> s = {
-        .bank_base_address = dst_addr, .page_size = tile_bytes, .data_format = data_format};
+    Noc noc;
 
     for (uint32_t i = 0; i < num_tiles; i++) {
-        uint64_t dst_noc_addr = get_noc_addr(i, s);
-
-        cb_wait_front(cb_id_out0, onetile);
-        uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
-
-        noc_async_write_tile(i, s, l1_read_addr);
-
-        noc_async_write_barrier();
-
-        cb_pop_front(cb_id_out0, onetile);
+        cb.wait_front(onetile);
+        noc.async_write(cb, s, tile_bytes, {}, {.page_id = i});
+        noc.async_write_barrier();
+        cb.pop_front(onetile);
     }
 }

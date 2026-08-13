@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,33 +6,37 @@
 
 #include <optional>
 
-#include "ttnn/common/queue_id.hpp"
 #include "ttnn/tensor/tensor.hpp"
-#include "ttnn/run_operation.hpp"
-#include "ttnn/operations/core/core.hpp"
+#include "fast_reduce_nc_device_operation_types.hpp"
+#include "fast_reduce_nc_program_factory.hpp"
+#include "ttnn/types.hpp"
 
-namespace ttnn::operations::experimental::reduction::detail {
+namespace ttnn::experimental::prim {
 
 struct FastReduceNCDeviceOperation {
-    int32_t dim;
-    MemoryConfig output_mem_config;
-    const ttnn::DeviceComputeKernelConfig compute_kernel_config;
-    void validate_with_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    std::vector<ttnn::TensorSpec> compute_output_specs(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    std::vector<Tensor> create_output_tensors(
-        const std::vector<Tensor>& input_tensors, const std::vector<std::optional<Tensor>>& output_tensors) const;
-    tt::tt_metal::operation::ProgramWithCallbacks create_program(
-        const std::vector<Tensor>& inputs, std::vector<Tensor>& outputs) const;
+    using operation_attributes_t = FastReduceNCParams;
+    using tensor_args_t = FastReduceNCInputs;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
+    using tensor_return_value_t = Tensor;
+    using program_factory_t = std::variant<FastReduceNCProgramFactory>;
+
+    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
+
+    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
+    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
 };
 
-Tensor fast_reduce_nc(
-    QueueId queue_id,
-    const ttnn::Tensor& input,
-    tt::stl::Span<const int32_t> dims,
-    const std::optional<const ttnn::Tensor>& output = std::nullopt,
-    const MemoryConfig& output_mem_config = tt::tt_metal::operation::DEFAULT_OUTPUT_MEMORY_CONFIG,
-    std::optional<const ttnn::DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
+}  // namespace ttnn::experimental::prim
 
-}  // namespace ttnn::operations::experimental::reduction::detail
+namespace ttnn::prim {
+
+Tensor fast_reduce_nc(
+    const Tensor& input,
+    const int32_t& dim,
+    const std::optional<const Tensor>& output,
+    const MemoryConfig& output_mem_config,
+    const DeviceComputeKernelConfig& compute_kernel_config,
+    const std::optional<CoreRangeSet>& sub_core_grids = std::nullopt,
+    const std::optional<DataType>& output_dtype = std::nullopt);
+
+}  // namespace ttnn::prim

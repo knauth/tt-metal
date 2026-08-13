@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,7 +14,7 @@ from loguru import logger
 from tests.sweep_framework.sweep_utils.utils import gen_pytest_parametrize_args
 from tests.sweep_framework.sweep_utils.roofline_utils import get_run_return
 from tests.ttnn.utils_for_testing import start_measuring_time, stop_measuring_time
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 
 
 TIMEOUT = 15

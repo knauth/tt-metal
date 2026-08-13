@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -21,7 +21,14 @@ struct CacheTestParams {
     std::pair<int, int> pgm_ids;
     std::pair<int, int> pgm_sizes;
 };
+// NOLINTBEGIN(cppcoreguidelines-virtual-class-destructor)
 class RingbufferCacheRandomizedTestsFixture : public ::testing::TestWithParam<CacheTestParams> {
+public:
+    RingbufferCacheRandomizedTestsFixture(const RingbufferCacheRandomizedTestsFixture&) = delete;
+    RingbufferCacheRandomizedTestsFixture& operator=(const RingbufferCacheRandomizedTestsFixture&) = delete;
+    RingbufferCacheRandomizedTestsFixture(RingbufferCacheRandomizedTestsFixture&&) = delete;
+    RingbufferCacheRandomizedTestsFixture& operator=(RingbufferCacheRandomizedTestsFixture&&) = delete;
+
 protected:
     RingbufferCacheRandomizedTestsFixture() = default;
     ~RingbufferCacheRandomizedTestsFixture() override = default;
@@ -44,6 +51,7 @@ protected:
     auto get_valid_entry(size_t idx) const { return rb_cache_->valid_[idx]; }
     constexpr static auto invalid_entry_ = RingbufferCacheManager::invalid_cache_entry_;
 };
+// NOLINTEND(cppcoreguidelines-virtual-class-destructor)
 
 INSTANTIATE_TEST_SUITE_P(
     RingbufferCacheRandomSuite,
@@ -136,11 +144,8 @@ TEST_P(RingbufferCacheRandomizedTestsFixture, RandomizedQueries) {
     constexpr size_t num_iterations = 10'000'000;
     for (size_t i = 0; i < num_iterations; ++i) {
         pgm_id = dist_pgm_id(gen_pgm_id);
-        if (pgm_id_size_map.find(pgm_id) != pgm_id_size_map.end()) {
-            pgm_size = pgm_id_size_map[pgm_id];
-        } else {
-            pgm_size = dist_pgm_size(gen_pgm_size);
-            pgm_id_size_map[pgm_id] = pgm_size;
+        if (!pgm_id_size_map.contains(pgm_id)) {
+            pgm_id_size_map[pgm_id] = dist_pgm_size(gen_pgm_size);
         }
     }
 

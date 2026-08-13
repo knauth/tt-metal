@@ -1,11 +1,10 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     // expands to hlk_relu_config(nullptr, 1); for relu only
 
     uint32_t per_core_block_cnt = get_compile_time_arg_val(0);
@@ -15,7 +14,7 @@ void MAIN {
     for (uint32_t block_index = 0; block_index < per_core_block_cnt; block_index++) {
         cb_reserve_back(CBIndex::c_16, per_core_block_dim);
         for (uint32_t tile_index = 0; tile_index < per_core_block_dim; ++tile_index) {
-            acquire_dst();
+            tile_regs_acquire();
 
             // Pop tile after tile, copy to DST and pack
             cb_wait_front(CBIndex::c_0, 1);
@@ -26,6 +25,8 @@ void MAIN {
             // (except for relu because the llk is fused for relu)
             // "sfpu_gelu(0); pack_tile(0, CBIndex::c_16);"
 
+            tile_regs_commit();
+            tile_regs_wait();
             SFPI_OP_AND_PACK
             // comes from add_define in kernel config
             // Also is epxected to include pack_tile(0, CBIndex::c_16); for non-relu
@@ -33,11 +34,10 @@ void MAIN {
 
             cb_pop_front(CBIndex::c_0, 1);
 
-            release_dst();
+            tile_regs_release();
         }
         cb_push_back(CBIndex::c_16, per_core_block_dim);
     }
     DEINIT_RELU
     // expands to hlk_relu_config(nullptr, 0); for relu only
 }
-}  // namespace NAMESPACE

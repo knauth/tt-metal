@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -7,23 +7,24 @@
 #include "risc_common.h"
 #include "noc_overlay_parameters.h"
 #include "noc_nonblocking_api.h"
-#include "dev_msgs.h"
+#include "hostdev/dev_msgs.h"
 #include "stream_io_map.h"
-#include "firmware_common.h"
-#include "dataflow_api.h"
+#include "internal/firmware_common.h"
 #include "tools/profiler/kernel_profiler.hpp"
-#include "risc_attribs.h"
-#include "circular_buffer.h"
-#include "circular_buffer_init.h"
+#include "internal/risc_attribs.h"
+#include "internal/circular_buffer_interface.h"
+#include "internal/circular_buffer_init.h"
+#include "internal/hw_thread.h"
 #include "tdma_xmov.h"
 
-#include "debug/waypoint.h"
-#include "debug/dprint.h"
-#include "debug/stack_usage.h"
+#include "api/debug/waypoint.h"
+#include "api/debug/dprint.h"
+#include "api/debug/device_print.h"
+#include "internal/debug/stack_usage.h"
 // clang-format on
 
 tt_l1_ptr mailboxes_t* const mailboxes = (tt_l1_ptr mailboxes_t*)(MEM_MAILBOX_BASE);
-volatile tt_l1_ptr uint8_t* const ncrisc_run = &mailboxes->subordinate_sync.dm1;
+volatile tt_l1_ptr uint8_t* const ncrisc_run = mailboxes->subordinate_sync.map;
 
 uint8_t my_x[NUM_NOCS] __attribute__((used));
 uint8_t my_y[NUM_NOCS] __attribute__((used));
@@ -44,12 +45,21 @@ uint32_t tt_l1_ptr* rta_l1_base __attribute__((used));
 uint32_t tt_l1_ptr* crta_l1_base __attribute__((used));
 uint32_t tt_l1_ptr* sem_l1_base[ProgrammableCoreType::COUNT] __attribute__((used));
 
+#if defined(WATCHER_ENABLED) && !defined(WATCHER_DISABLE_ASSERT)
+uint32_t rta_count __attribute__((used));
+uint32_t crta_count __attribute__((used));
+#endif
+
 // These arrays are stored in local memory of FW, but primarily used by the kernel which shares
 // FW symbols. Hence mark these as 'used' so that FW compiler doesn't optimize it out.
-uint16_t dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] __attribute__((used));
+bank_noc_xy_t dram_bank_to_noc_xy[NUM_NOCS][NUM_DRAM_BANKS] __attribute__((used));
 int32_t bank_to_dram_offset[NUM_DRAM_BANKS] __attribute__((used));
-uint16_t l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS] __attribute__((used));
+bank_noc_xy_t l1_bank_to_noc_xy[NUM_NOCS][NUM_L1_BANKS] __attribute__((used));
 int32_t bank_to_l1_offset[NUM_L1_BANKS] __attribute__((used));
+
+// These arrays are used to store the worker logical to virtual coordinate mapping
+uint8_t worker_logical_col_to_virtual_col[round_up_to_mult_of_4(noc_size_x)] __attribute__((used));
+uint8_t worker_logical_row_to_virtual_row[round_up_to_mult_of_4(noc_size_y)] __attribute__((used));
 
 #if defined(PROFILE_KERNEL)
 namespace kernel_profiler {
@@ -64,7 +74,7 @@ uint32_t sumIDs[SUM_COUNT] __attribute__((used));
 extern "C" uint32_t wh_iram_trampoline(uint32_t status, uint32_t first_argument);
 #endif
 
-inline __attribute__((always_inline)) void notify_brisc_and_wait() {
+inline __attribute__((always_inline)) void wait_for_brisc_notification() {
     while (true) {
         uint8_t run_value = *ncrisc_run;
         if (run_value == RUN_SYNC_MSG_GO || run_value == RUN_SYNC_MSG_LOAD) {
@@ -103,6 +113,7 @@ int main(int argc, char* argv[]) {
     do_crt1((uint32_t tt_l1_ptr*)MEM_NCRISC_INIT_LOCAL_L1_BASE_SCRATCH);
 
     noc_bank_table_init(MEM_BANK_TO_NOC_SCRATCH);
+    noc_worker_logical_to_virtual_map_init(MEM_LOGICAL_TO_VIRTUAL_SCRATCH);
 
     risc_init();
 
@@ -114,14 +125,14 @@ int main(int argc, char* argv[]) {
     DeviceProfilerInit();
     while (1) {
         WAYPOINT("W");
-        notify_brisc_and_wait();
+        wait_for_brisc_notification();
         DeviceZoneScopedMainN("NCRISC-FW");
 
         uint32_t launch_msg_rd_ptr = mailboxes->launch_msg_rd_ptr;
         launch_msg_t* launch_msg = &(mailboxes->launch[launch_msg_rd_ptr]);
 
         uint32_t kernel_config_base =
-            firmware_config_init(mailboxes, ProgrammableCoreType::TENSIX, DISPATCH_CLASS_TENSIX_DM1);
+            firmware_config_init(mailboxes, ProgrammableCoreType::TENSIX, internal_::get_hw_thread_idx());
         int index = static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1);
 
         uint32_t kernel_lma = kernel_config_base + launch_msg->kernel_config.kernel_text_offset[index];
@@ -131,8 +142,23 @@ int main(int argc, char* argv[]) {
 #endif
         uint32_t tt_l1_ptr* cb_l1_base =
             (uint32_t tt_l1_ptr*)(kernel_config_base + launch_msg->kernel_config.local_cb_offset);
-        uint32_t local_cb_mask = launch_msg->kernel_config.local_cb_mask;
-        setup_local_cb_read_write_interfaces<true, true, false>(cb_l1_base, 0, local_cb_mask);
+        // Split 64-bit CB mask into 32-bit halves for efficient RISC-V processing
+        // Wormhole: lower half only (TRISC memory constraint), Blackhole: both halves
+
+#if defined(WATCHER_ENABLED) && !defined(WATCHER_DISABLE_CB_SANITIZE)
+        // Zero all CB interfaces so stale entries from previous programs
+        // don't cause false positives in the CB sanitize check.
+        for (uint32_t i = 0; i < NUM_CIRCULAR_BUFFERS; i++) {
+            get_local_cb_interface(i).fifo_size = 0;
+        }
+#endif
+        uint64_t local_cb_mask = launch_msg->kernel_config.local_cb_mask;
+        uint32_t local_cb_mask_low = static_cast<uint32_t>(local_cb_mask & 0xFFFFFFFFULL);
+        setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 0, local_cb_mask_low);
+#ifdef ARCH_BLACKHOLE
+        uint32_t local_cb_mask_upper = static_cast<uint32_t>(local_cb_mask >> 32);
+        setup_local_cb_read_write_interfaces<true, true, false, false>(cb_l1_base, 32, local_cb_mask_upper);
+#endif
 
 #if defined(ARCH_WORMHOLE)
         l1_to_ncrisc_iram_copy_wait();
@@ -161,8 +187,26 @@ int main(int argc, char* argv[]) {
 #endif
         record_stack_usage(stack_free);
         WAYPOINT("D");
+        DEVICE_PRINT_KERNEL_FINISHED();
 
         signal_ncrisc_completion();
+#if defined(ARCH_WORMHOLE)
+        // Ensure branch predictor will only ever predict into L1. Otherwise, the branch predictor may predict an IRAM
+        // address, which can cause an instruction to be fetched from IRAM while the mover is writing to IRAM, which can
+        // cause corruption.  See
+        // https://github.com/tenstorrent/tt-isa-documentation/blob/main/WormholeB0/TensixTile/BabyRISCV/InstructionRAM.md
+        // for more details.
+        // This loop unrolls to 54 instructions, taking 110 cycles (assuming all branches are mispredicted).
+        asm volatile(
+            ".rept 13\n"
+            "bne x0, x0, .\n"
+            "bne x0, x0, .\n"
+            "nop\n"
+            "nop\n"
+            ".endr\n"
+            "bne x0, x0, .\n"
+            "bne x0, x0, .");
+#endif
     }
 
     return 0;

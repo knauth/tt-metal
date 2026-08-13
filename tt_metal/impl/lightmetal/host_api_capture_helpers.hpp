@@ -1,10 +1,9 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "flatbuffers/flatbuffers.h"
 #include "lightmetal/lightmetal_capture.hpp"
 #include <tt-logger/tt-logger.hpp>
 #include <tt_stl/span.hpp>
@@ -14,14 +13,14 @@
 namespace tt::tt_metal {
 
 // Many forward decls and aliases to reduce includes.
-class CommandQueue;
+class HWCommandQueue;
 struct DataMovementConfig;
 struct ComputeConfig;
 struct EthernetConfig;
 
 class IDevice;
 struct BufferConfig;
-struct CircularBufferConfig;
+class CircularBufferConfig;
 using RuntimeArgs = std::vector<std::variant<Buffer*, uint32_t>>;
 
 //////////////////////////////////////////////////////////////
@@ -69,13 +68,13 @@ struct TraceScope {
 namespace tt::tt_metal {
 
 // Per Command type capture helper functions
-void CaptureReplayTrace(IDevice* device, uint8_t cq_id, uint32_t tid, bool blocking);
+void CaptureReplayTrace(IDevice* device, uint8_t cq_id, uint32_t trace_id, bool blocking);
 
-void CaptureEnqueueTrace(CommandQueue& cq, uint32_t tid, bool blocking);
+void CaptureEnqueueTrace(HWCommandQueue& cq, uint32_t trace_id, bool blocking);
 
-void CaptureLoadTrace(IDevice* device, uint8_t cq_id, uint32_t tid);
+void CaptureLoadTrace(IDevice* device, uint8_t cq_id, uint32_t trace_id);
 
-void CaptureReleaseTrace(IDevice* device, uint32_t tid);
+void CaptureReleaseTrace(IDevice* device, uint32_t trace_id);
 
 void CaptureBufferCreate(
     const std::shared_ptr<Buffer>& buffer,
@@ -92,20 +91,19 @@ void CaptureBufferDeallocate(const Buffer& buffer);
 void CaptureBufferDelete(const Buffer& buffer);
 
 void CaptureEnqueueWriteBuffer(
-    CommandQueue& cq,
+    HWCommandQueue& cq,
     std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>> buffer,
     HostDataType src,
     bool blocking);
 
 void CaptureEnqueueReadBuffer(
-    CommandQueue& cq,
+    HWCommandQueue& cq,
     std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>> buffer,
     void* dst,
     bool blocking);
 
-void CaptureFinish(CommandQueue& cq, tt::stl::Span<const SubDeviceId> sub_device_ids);
+void CaptureFinish(HWCommandQueue& cq, ttsl::Span<const SubDeviceId> sub_device_ids);
 void CaptureProgramConstructor(Program& program);
-void CaptureEnqueueProgram(CommandQueue& cq, Program& program, bool blocking);
 
 void CaptureCreateKernel(
     KernelHandle kernel_id,
@@ -118,19 +116,13 @@ void CaptureSetRuntimeArgsUint32(
     const Program& program,
     KernelHandle kernel_id,
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    tt::stl::Span<const uint32_t> runtime_args);
+    ttsl::Span<const uint32_t> runtime_args);
 
 void CaptureSetRuntimeArgsUint32VecPerCore(
     const Program& program,
     KernelHandle kernel_id,
     const std::vector<CoreCoord>& core_spec,
     const std::vector<std::vector<uint32_t>>& runtime_args);
-
-void CaptureSetRuntimeArgs(
-    IDevice* device,
-    const std::shared_ptr<Kernel>& kernel,
-    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    const std::shared_ptr<RuntimeArgs>& runtime_args);
 
 void CaptureCreateCircularBuffer(
     CBHandle& cb_handle,
@@ -139,7 +131,7 @@ void CaptureCreateCircularBuffer(
     const CircularBufferConfig& config);
 
 void CaptureLightMetalCompare(
-    CommandQueue& cq,
+    HWCommandQueue& cq,
     std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>> buffer,
     void* golden_data,
     bool is_user_data);

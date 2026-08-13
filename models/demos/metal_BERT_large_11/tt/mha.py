@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -187,11 +187,11 @@ class TtMultiHeadAttentionModel:
                 interleaved_str = f"interleaved_{model_config['QKV_INTERLEAVED']}_"
             qkv_weight_cache_path = str(
                 f"{tt_cache_path}/"
-                f"{layer_name}.qkv.weight_{interleaved_str}{model_config['OP1_FUSED_QKV_MM_WEIGHTS_DTYPE'].name}.bin"
+                f"{layer_name}.qkv.weight_{interleaved_str}{model_config['OP1_FUSED_QKV_MM_WEIGHTS_DTYPE'].name}.tensorbin"
             )
             qkv_bias_cache_path = str(
                 f"{tt_cache_path}/"
-                f"{layer_name}.qkv.bias_{interleaved_str}{model_config['OP1_FUSED_QKV_MM_BIAS_DTYPE'].name}.bin"
+                f"{layer_name}.qkv.bias_{interleaved_str}{model_config['OP1_FUSED_QKV_MM_BIAS_DTYPE'].name}_v2.tensorbin"
             )
 
         def compute_qkv_weight():
@@ -234,7 +234,7 @@ class TtMultiHeadAttentionModel:
             else:
                 qkv_bias_torch = torch.cat((qb, kb, vb), -1)
 
-            qkv_bias_torch = pad_weight(qkv_bias_torch)
+            qkv_bias_torch = qkv_bias_torch.reshape(1, 1, 1, -1)
 
             return ttnn.from_torch(
                 qkv_bias_torch,

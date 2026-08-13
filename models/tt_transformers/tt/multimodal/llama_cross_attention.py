@@ -1,11 +1,11 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
-from models.utility_functions import is_blackhole
+from models.tt_transformers.tt.common import Mode
 
 
 class TtLlamaCrossAttention(LightweightModule):
@@ -26,7 +26,6 @@ class TtLlamaCrossAttention(LightweightModule):
     ):
         super().__init__()
 
-        self.state_dict = state_dict
         self.mesh_device = mesh_device
         self.tt_ccl = tt_ccl
         self.num_devices = configuration.num_devices
@@ -67,7 +66,7 @@ class TtLlamaCrossAttention(LightweightModule):
 
         # TODO DRAM Shard the weights (see llama3 text)
         self.wq = ttnn.as_tensor(
-            self.state_dict[wq_str].transpose(-2, -1),
+            state_dict[wq_str].transpose(-2, -1),
             device=self.mesh_device,
             mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=-1),
             dtype=self.dtype,
@@ -77,7 +76,7 @@ class TtLlamaCrossAttention(LightweightModule):
         )
 
         self.wk = ttnn.as_tensor(
-            self.state_dict[wk_str].transpose(-2, -1),
+            state_dict[wk_str].transpose(-2, -1),
             device=self.mesh_device,
             mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=-1),
             dtype=self.dtype,
@@ -87,7 +86,7 @@ class TtLlamaCrossAttention(LightweightModule):
         )
 
         self.wv = ttnn.as_tensor(
-            self.state_dict[wv_str].transpose(-2, -1),
+            state_dict[wv_str].transpose(-2, -1),
             device=self.mesh_device,
             mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=-1),
             dtype=self.dtype,
@@ -97,7 +96,7 @@ class TtLlamaCrossAttention(LightweightModule):
         )
 
         self.wo = ttnn.as_tensor(
-            self.state_dict[wo_str].transpose(-2, -1),
+            state_dict[wo_str].transpose(-2, -1),
             device=self.mesh_device,
             mesh_mapper=ttnn.ShardTensorToMesh(self.mesh_device, dim=-2),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -184,7 +183,7 @@ class TtLlamaCrossAttention(LightweightModule):
                 transpose_k_heads=False,
             )
 
-        xk = self.k_norm(xk, mode="decode")
+        xk = self.k_norm(xk, mode=Mode.DECODE)
 
         k_cache, v_cache = xattn_cache
 
@@ -229,7 +228,7 @@ class TtLlamaCrossAttention(LightweightModule):
         xq = ttnn.transpose(xq, 1, 2)
         xq = ttnn.to_layout(xq, layout=ttnn.TILE_LAYOUT)
 
-        xq = self.q_norm(xq, mode="decode")
+        xq = self.q_norm(xq, mode=Mode.DECODE)
 
         xk, xv = xattn_cache
         cache_seq_len = xk.shape[-2]
@@ -288,34 +287,22 @@ class TtLlamaCrossAttention(LightweightModule):
 
         # All reduce
         if self.is_multichip:
-            # TODO: 26411
-            # Remove this blackhole condition once fabric CCLs are working on blackhole
-            if is_blackhole():
-                output = ttnn.reduce_scatter(
-                    output,
-                    dim=3,
-                    math_op=ttnn.ReduceType.Sum,
-                    num_links=1,
-                    topology=self.configuration.ccl_topology(),
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-            else:
-                output = ttnn.experimental.reduce_scatter_minimal_async(
-                    output,
-                    persistent_output_buffers=None,
-                    dim=3,
-                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_rs_semaphore_handles(),
-                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
-                    num_links=1,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    intermediate_memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    topology=self.configuration.ccl_topology(),
-                    chunks_per_sync=10,
-                    num_workers_per_link=2,
-                    num_buffers_per_channel=2,
-                )
+            output = ttnn.experimental.reduce_scatter_minimal_async(
+                output,
+                persistent_output_buffers=None,
+                dim=3,
+                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_rs_semaphore_handles(),
+                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+                num_links=1,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                intermediate_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=self.configuration.ccl_topology(),
+                chunks_per_sync=10,
+                num_workers_per_link=2,
+                num_buffers_per_channel=2,
+            )
 
-        return ttnn.to_memory_config(output, self.model_config["DECODE_RESIDUAL_MEMCFG"])
+        return ttnn.to_memory_config(output, self.configuration.get_residual_mem_config(Mode.DECODE, None))
 
     def forward_prefill(
         self,
@@ -357,7 +344,7 @@ class TtLlamaCrossAttention(LightweightModule):
             xq, xq, num_heads=self.n_local_heads, num_kv_heads=self.n_local_heads // 2, transpose_k_heads=False
         )
 
-        xq = self.q_norm(xq, mode="prefill")
+        xq = self.q_norm(xq, mode=Mode.PREFILL)
 
         program_config = ttnn.SDPAProgramConfig(
             compute_with_storage_grid_size=self.mesh_device.compute_with_storage_grid_size(),
@@ -397,32 +384,20 @@ class TtLlamaCrossAttention(LightweightModule):
 
         # Reduce-scatter
         if self.is_multichip:  # TODO use_fused_all_gather_matmul
-            # TODO: 26411
-            # Remove this blackhole condition once fabric CCLs are working on blackhole
-            if is_blackhole():
-                dense_out_reduced = ttnn.reduce_scatter(
-                    output,
-                    dim=3,
-                    math_op=ttnn.ReduceType.Sum,
-                    num_links=1,
-                    topology=self.configuration.ccl_topology(),
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                )
-            else:
-                dense_out_reduced = ttnn.experimental.reduce_scatter_minimal_async(
-                    output,
-                    persistent_output_buffers=None,
-                    dim=3,
-                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_rs_semaphore_handles(),
-                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
-                    num_links=1,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    intermediate_memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    topology=self.configuration.ccl_topology(),
-                    chunks_per_sync=10,
-                    num_workers_per_link=2,
-                    num_buffers_per_channel=2,
-                )
+            dense_out_reduced = ttnn.experimental.reduce_scatter_minimal_async(
+                output,
+                persistent_output_buffers=None,
+                dim=3,
+                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_rs_semaphore_handles(),
+                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+                num_links=1,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                intermediate_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=self.configuration.ccl_topology(),
+                chunks_per_sync=10,
+                num_workers_per_link=2,
+                num_buffers_per_channel=2,
+            )
             return dense_out_reduced
         else:
             return output
@@ -438,7 +413,7 @@ class TtLlamaCrossAttention(LightweightModule):
         vision_tokens=None,
         cross_page_table=None,
     ):
-        if mode == "prefill":
+        if mode == Mode.PREFILL:
             return self.forward_prefill(
                 x_11SH,
                 xattn_mask,

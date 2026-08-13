@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -15,6 +15,7 @@ from loguru import logger
 from models.demos.t3000.llama2_70b.demo.demo import build_generator, construct_arg
 from models.demos.t3000.llama2_70b.demo.eval import calculate_perplexity, wikitext_detokenizer
 from models.demos.t3000.llama2_70b.tt.llama_common import check_mesh_device, setup_llama_env
+from tests.tests_common.skip_reasons import LEGACY_CCL_SKIP
 
 
 @dataclass
@@ -42,7 +43,7 @@ def main(args, eval_data_args):
 
     # Dataset preparation
     dataset = datasets.load_dataset(
-        eval_data_args.dataset, eval_data_args.config, split=eval_data_args.split, ignore_verifications=True
+        eval_data_args.dataset, eval_data_args.config, split=eval_data_args.split, verification_mode="no_checks"
     )
     text = wikitext_detokenizer("\n".join(dataset["text"]))
     encodings = tokenizer.encode(text, bos=True, eos=False)  # not prepending bos
@@ -154,7 +155,7 @@ def test_LlamaModel_demo(
     top_k,
     temperature,
     # TT args
-    t3k_mesh_device,
+    mesh_device,
     n_devices,
     # Dataset args
     dataset,
@@ -167,12 +168,15 @@ def test_LlamaModel_demo(
     llama_version,
 ):
     logger.info("Running LlamaModel perplexity test")
+
+    if implementation == "tt" and n_devices > 1:
+        pytest.skip(LEGACY_CCL_SKIP)
     ## Get model config
     model_config, ckpt_dir, tokenizer_path, cache_path = setup_llama_env(
         llama_version=llama_version,
     )
 
-    check_mesh_device(t3k_mesh_device, model_config)
+    check_mesh_device(mesh_device, model_config)
 
     args = construct_arg(
         implementation=implementation,
@@ -186,7 +190,7 @@ def test_LlamaModel_demo(
         top_k=top_k,
         temperature=temperature,
         chat=False,
-        mesh_device=t3k_mesh_device,
+        mesh_device=mesh_device,
         n_devices=n_devices,
         cache_path=cache_path,
         decode_only=False,

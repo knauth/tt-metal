@@ -1,36 +1,18 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include <tt-metalium/work_split.hpp>
-#include <tt-metalium/util.hpp>
-#include "ttnn/operation.hpp"
+#include "concat_device_operation_types.hpp"
 
-namespace ttnn::operations::data_movement::detail {
+#include <tt-metalium/program_descriptors.hpp>
 
-// start is inclusive, end is exclusive
-struct PageRange {
-    uint32_t start;
-    uint32_t end;
+namespace ttnn::prim {
+
+struct ConcatProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const ConcatParams& operation_attributes, const ConcatInputs& tensor_args, Tensor& tensor_return_value);
 };
 
-struct CorePageRange {
-    CoreCoord core;
-    PageRange range;
-};
-
-tt::tt_metal::operation::ProgramWithCallbacks s2s_rm_concat_two_tensors_multi_core(
-    const std::vector<Tensor>& input_tensors, uint32_t dim, Tensor& output, unsigned int groups = 1);
-
-tt::tt_metal::operation::ProgramWithCallbacks s2i_rm_concat_multi_core(
-    const std::vector<Tensor>& input_tensors, uint32_t dim, Tensor& output);
-
-tt::tt_metal::operation::ProgramWithCallbacks sharded_concat_multi_core(
-    const std::vector<Tensor>& input_tensors, uint32_t dim, Tensor& output, unsigned int groups = 1);
-
-tt::tt_metal::operation::ProgramWithCallbacks concat_multi_core(
-    const std::vector<Tensor>& input_tensors, uint32_t dim, const Tensor& output);
-
-}  // namespace ttnn::operations::data_movement::detail
+}  // namespace ttnn::prim

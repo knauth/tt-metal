@@ -1,33 +1,47 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#pragma once
+
 // Sfpu golden functions
 #include <cmath>
+#include <numbers>
+#include <vector>
+#include <cstdint>
+#include <functional>
+#include <random>
+#include <map>
 
-float exponential(float x) { return std::exp(x); }
+#include <tt-metalium/bfloat16.hpp>
 
-float reciprocal(float x) { return 1 / x; }
+inline float exponential(float x) { return std::exp(x); }
 
-float gelu(float x) {
+inline float reciprocal(float x) { return 1 / x; }
+
+inline float gelu(float x) {
     static constexpr float alpha = M_2_SQRTPI * M_SQRT1_2;
     auto x3 = x * x * x;
     return x * 0.5 * (1.0 + tanhf(alpha * (x + 0.044715 * x3)));
 }
 
-float relu(float x) { return fmaxf(x, 0.0f); }
+inline float relu(float x) { return fmaxf(x, 0.0f); }
 
-float ref_sqrt(float x) { return sqrtf(x); }
+inline float ref_sqrt(float x) { return sqrtf(x); }
 
-float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
-float ref_log(float x) { return logf(x); }
+inline float ref_log(float x) { return logf(x); }
 
-float ref_log10(float x) { return ref_log(x) * 0.4342944819032518; }
+inline float ref_log10(float x) { return ref_log(x) * std::numbers::log10e; }
 
-float ref_log2(float x) { return ref_log(x) * 1.4426950408889634f; }
+inline float ref_log2(float x) { return ref_log(x) * std::numbers::log2e_v<float>; }
 
-float ref_tanh(float x) { return std::tanh(x); }
+inline float ref_tanh(float x) { return std::tanh(x); }
+
+inline std::vector<std::uint32_t> create_random_vector_of_bfloat16_0_2(size_t num_bytes, int seed) {
+    return create_random_vector_of_bfloat16(num_bytes, 2.0f, seed);  // 0.0f..2.0f
+}
 
 inline std::vector<std::uint32_t> create_random_vector_of_bfloat16_0_2_plus_1(uint32_t num_bytes, int seed) {
     return create_random_vector_of_bfloat16(num_bytes, 2.0f, seed, 1.0f);  // 0.0f..2.0f
@@ -40,15 +54,15 @@ int sgn(T val) {
 }
 }  // namespace helper
 
-float ref_sign(float x) { return helper::sgn(x); }
+inline float ref_sign(float x) { return helper::sgn(x); }
 
-float ref_square(float x) { return x * x; }
+inline float ref_square(float x) { return x * x; }
 
-float ref_abs(float x) { return std::abs(x); }
+inline float ref_abs(float x) { return std::abs(x); }
 
-float ref_identity(float x) { return x; }
+inline float ref_identity(float x) { return x; }
 
-std::vector<uint32_t> sfpu(const std::vector<uint32_t>& src, std::function<float(float)> sfpu_func) {
+inline std::vector<uint32_t> sfpu(const std::vector<uint32_t>& src, const std::function<float(float)>& sfpu_func) {
     std::vector<uint32_t> dst;
 
     for (uint32_t el : src) {
@@ -70,8 +84,27 @@ std::vector<uint32_t> sfpu(const std::vector<uint32_t>& src, std::function<float
     return dst;
 }
 
+inline std::vector<uint32_t> create_random_binary_vector_of_bfloat16(size_t num_bytes, int seed) {
+    auto rand_float = std::bind(std::uniform_real_distribution<float>(0, 1), std::mt19937(seed));
+
+    std::vector<std::uint32_t> vec(num_bytes / sizeof(std::uint32_t), 0);
+    for (std::uint32_t& num : vec) {
+        float num_1_float = rand_float();
+        float num_2_float = rand_float();
+
+        num_1_float = (num_1_float > 0.5);
+        num_2_float = (num_2_float > 0.5);
+
+        bfloat16 num_1_bfloat16 = bfloat16(num_1_float);
+        bfloat16 num_2_bfloat16 = bfloat16(num_2_float);
+
+        num = pack_two_bfloat16_into_uint32(std::pair<bfloat16, bfloat16>(num_1_bfloat16, num_2_bfloat16));
+    }
+    return vec;
+}
+
 // Helper functions
-std::vector<uint32_t> create_random_ones_and_twos_vector_of_bfloat16(uint32_t num_bytes, int seed) {
+inline std::vector<uint32_t> create_random_ones_and_twos_vector_of_bfloat16(uint32_t num_bytes, int seed) {
     // Used for reciprocal, since binary vectors are filled with 0s and 1s, and recip of 0 is undefined,
     // so then we just generate a vector of ones and twos
 
@@ -99,15 +132,23 @@ std::vector<uint32_t> create_random_ones_and_twos_vector_of_bfloat16(uint32_t nu
 }
 
 // Comparison functions
-bool equal_within_two_sig_figs(float a, float b) { return equal_within_n_sig_figs(a, b, 2); }
+inline bool equal_within_two_sig_figs(float a, float b) { return equal_within_n_sig_figs(a, b, 2); }
 
-bool equal_within_absolute_tolerance_of_0p03(float a, float b) { return equal_within_absolute_tolerance(a, b, 0.03); }
+inline bool equal_within_absolute_tolerance(float a, float b, float tol) { return std::abs(a - b) < tol; }
 
-bool is_close_0p015(float a, float b) { return is_close(a, b, 0.015f); }
+inline bool equal_within_absolute_tolerance_of_0p03(float a, float b) {
+    return equal_within_absolute_tolerance(a, b, 0.03);
+}
 
-bool is_close_rtol_0p06_atol_0p006(float a, float b) { return is_close(a, b, 0.06f, 0.006f); }
+inline bool is_close_0p015(float a, float b) { return is_close(a, b, 0.015f); }
 
-bool is_close_rtol_0p175_atol_0p1(float a, float b) { return is_close(a, b, 0.175f, 0.1f); }
+inline bool is_close_rtol_0p06_atol_0p006(float a, float b) { return is_close(a, b, 0.06f, 0.006f); }
+
+inline bool is_close_rtol_0p175_atol_0p1(float a, float b) { return is_close(a, b, 0.175f, 0.1f); }
+
+inline std::vector<std::uint32_t> create_random_vector_of_bfloat16_1_1(size_t num_bytes, int seed) {
+    return create_random_vector_of_bfloat16(num_bytes, 2.0f, seed, -1.0f);  // -1.0..1.0
+}
 
 // SFPU maps -> relevant kernels, golden functions, comparison functions
 static std::vector<std::string> sfpu_op = {

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import torch
@@ -7,7 +7,7 @@ from loguru import logger
 import ttnn
 from models.experimental.bert_tiny.tt.bert_attention import TtBertattention
 from transformers import BertForQuestionAnswering
-from models.utility_functions import (
+from models.common.utility_functions import (
     comp_pcc,
     comp_allclose,
 )
@@ -24,6 +24,7 @@ def test_bert_attention_inference(
     reset_seeds,
 ):
     model_name = str(model_location_generator("mrm8488/bert-tiny-finetuned-squadv2", model_subdir="Bert"))
+    # NOTE(transformers-5.x): `torchscript=` was removed from transformers configs in 5.x; drop it (a default no-op) when running this experimental model under 5.x.
     hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
     state_dict = hugging_face_reference_model.state_dict()
     encoder_idx = 0

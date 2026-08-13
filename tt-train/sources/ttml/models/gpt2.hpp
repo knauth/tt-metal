@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,8 +6,15 @@
 
 #include <yaml-cpp/yaml.h>
 
-#include "autograd/module_base.hpp"
+#include <optional>
+
+#include "models/base_transformer.hpp"
 #include "models/common/transformer_common.hpp"
+#include "modules/embedding_module.hpp"
+#include "modules/gpt_block.hpp"
+#include "modules/layer_norm_module.hpp"
+#include "modules/linear_module.hpp"
+#include "modules/module_base.hpp"
 
 namespace ttml::models::gpt2 {
 
@@ -36,19 +43,23 @@ struct TransformerConfig {
     Experimental experimental;
 };
 
-class Transformer : public ttml::autograd::ModuleBase {
+class Transformer : public BaseTransformer {
 private:
     RunnerType runner_type = RunnerType::Default;
-    std::shared_ptr<ttml::autograd::ModuleBase> tok_emb;
-    std::shared_ptr<ttml::autograd::ModuleBase> pos_emb;
-    std::vector<std::shared_ptr<ttml::autograd::ModuleBase>> blocks;
-    std::shared_ptr<ttml::autograd::ModuleBase> ln_fc;
-    std::shared_ptr<ttml::autograd::ModuleBase> fc;
+    std::shared_ptr<ttml::modules::Embedding> tok_emb;
+    std::shared_ptr<ttml::modules::ModuleBase> pos_emb;
+    std::vector<std::shared_ptr<ttml::modules::GPTBlock>> blocks;
+    std::shared_ptr<ttml::modules::LayerNormLayer> ln_fc;
+    std::shared_ptr<ttml::modules::LinearLayer> fc;
 
 public:
     explicit Transformer(const TransformerConfig& config);
-
-    ttml::autograd::TensorPtr operator()(const ttml::autograd::TensorPtr& x, const ttml::autograd::TensorPtr& mask);
+    virtual ~Transformer() = default;
+    void load_from_safetensors(const std::filesystem::path& model_path) override;
+    ttml::autograd::TensorPtr operator()(
+        const ttml::autograd::TensorPtr& x, const std::optional<ttml::autograd::TensorPtr>& mask) override;
+    ttml::autograd::TensorPtr operator()(
+        const ttml::autograd::TensorPtr& x, const ttml::autograd::TensorPtr& mask) override;
 };
 
 [[nodiscard]] TransformerConfig read_config(const YAML::Node& config);
@@ -56,4 +67,5 @@ public:
 [[nodiscard]] std::shared_ptr<Transformer> create(const TransformerConfig& config);
 [[nodiscard]] std::shared_ptr<Transformer> create(const YAML::Node& config);
 
+void load_model_from_safetensors(const std::filesystem::path& path, serialization::NamedParameters& parameters);
 }  // namespace ttml::models::gpt2

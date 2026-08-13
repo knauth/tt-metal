@@ -1,13 +1,13 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
 #include <cstdint>
-#include "assert.hpp"
+#include <tt_stl/assert.hpp>
 #include <tt_stl/aligned_allocator.hpp>
-#include <umd/device/device_api_metal.h>
+#include <umd/device/driver_atomics.hpp>
 
 #include <tt-metalium/vector_aligned.hpp>
 

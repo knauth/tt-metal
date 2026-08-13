@@ -1,18 +1,25 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include <utils.hpp>
+#pragma once
 
-namespace tt::tt_metal {
+#include <string>
+#include "impl/context/metal_context.hpp"
 
-namespace detail {
+namespace tt::tt_metal::detail {
+
+inline const std::string& get_reports_dir() {
+    static std::string outpath;
+    if (outpath.empty()) {
+        outpath = tt::tt_metal::MetalContext::instance().rtoptions().get_logs_dir() + "/generated/reports/";
+    }
+    return outpath;
+}
 
 inline const std::string& metal_reports_dir() {
-    static const std::string reports_path = tt::utils::get_reports_dir();
+    static const std::string reports_path = get_reports_dir();
     return reports_path;
 }
 
-}  // namespace detail
-
-}  // namespace tt::tt_metal
+}  // namespace tt::tt_metal::detail

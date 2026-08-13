@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -112,8 +112,8 @@ def gather_cos_sin(position_ids, cos, sin):
     return cos, sin
 
 
-def get_prefill_rot_mat(head_dim, max_seq_len, mesh_device, seq_len, scale_factor, start_pos=0):
-    cos, sin = precompute_freqs(head_dim, max_seq_len * 2, scale_factor=scale_factor)
+def get_prefill_rot_mat(head_dim, max_seq_len, mesh_device, seq_len, scale_factor, start_pos=0, theta=500000.0):
+    cos, sin = precompute_freqs(head_dim, max_seq_len * 2, theta=theta, scale_factor=scale_factor)
     cos_gathered, sin_gathered = gather_cos_sin(torch.arange(start_pos, start_pos + seq_len), cos, sin)
     assert cos_gathered.size() == (1, 1, seq_len, head_dim)
     assert sin_gathered.size() == (1, 1, seq_len, head_dim)
@@ -208,7 +208,7 @@ def num_to_core_range_set(x):
     )
 
 
-def copy_host_to_device(host_tensors, device_tensors=None, mesh_device=None):
+def copy_host_to_device(host_tensors, device_tensors=None, shard_specs=None, mesh_device=None):
     """
     Helper function which copies host tensors to device tensors.
     If no device_tensors are provided, it creates new device tensors and returns them.
@@ -217,7 +217,10 @@ def copy_host_to_device(host_tensors, device_tensors=None, mesh_device=None):
         assert mesh_device is not None, "mesh_device is required when device_tensors is None"
         ret = []
         for i in range(len(host_tensors)):
-            on_device = ttnn.to_device(host_tensors[i], device=mesh_device) if host_tensors[i] else None
+            if shard_specs and shard_specs[i] is not None:
+                on_device = host_tensors[i].to(mesh_device, shard_specs[i]) if host_tensors[i] else None
+            else:
+                on_device = ttnn.to_device(host_tensors[i], device=mesh_device) if host_tensors[i] else None
             ret.append(on_device)
         return ret
     else:

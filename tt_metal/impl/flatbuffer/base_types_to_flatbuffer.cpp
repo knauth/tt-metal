@@ -1,16 +1,23 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "flatbuffer/base_types_to_flatbuffer.hpp"
+#include <tt_stl/assert.hpp>
 
 namespace tt::tt_metal {
 
-// Original types defined in data_types.hpp
+// Original types defined in kernel_types.hpp
 flatbuffer::DataMovementProcessor to_flatbuffer(DataMovementProcessor in) {
     switch (in) {
         case DataMovementProcessor::RISCV_0: return flatbuffer::DataMovementProcessor::RISCV_0;
         case DataMovementProcessor::RISCV_1: return flatbuffer::DataMovementProcessor::RISCV_1;
+        case DataMovementProcessor::RISCV_2: return flatbuffer::DataMovementProcessor::RISCV_2;
+        case DataMovementProcessor::RISCV_3: return flatbuffer::DataMovementProcessor::RISCV_3;
+        case DataMovementProcessor::RISCV_4: return flatbuffer::DataMovementProcessor::RISCV_4;
+        case DataMovementProcessor::RISCV_5: return flatbuffer::DataMovementProcessor::RISCV_5;
+        case DataMovementProcessor::RISCV_6: return flatbuffer::DataMovementProcessor::RISCV_6;
+        case DataMovementProcessor::RISCV_7: return flatbuffer::DataMovementProcessor::RISCV_7;
     }
     TT_THROW("Unsupported DataMovementProcessor to flatbuffer.");
 }
@@ -74,10 +81,22 @@ flatbuffer::DataFormat to_flatbuffer(tt::DataFormat input) {
         case tt::DataFormat::Bfp2_b: return flatbuffer::DataFormat::Bfp2_b;
         case tt::DataFormat::Lf8: return flatbuffer::DataFormat::Lf8;
         case tt::DataFormat::Fp8_e4m3: return flatbuffer::DataFormat::Fp8_e4m3;
+        case tt::DataFormat::MxFp4: return flatbuffer::DataFormat::MxFp4;
+        case tt::DataFormat::MxFp4_2x_A:
+        case tt::DataFormat::MxFp4_2x_B:
+            TT_THROW("MxFp4_2x is a register-only format and should not be serialized to flatbuffer.");
+        case tt::DataFormat::MxFp6P: return flatbuffer::DataFormat::MxFp6P;
+        case tt::DataFormat::MxFp6R: return flatbuffer::DataFormat::MxFp6R;
+        case tt::DataFormat::MxFp8R: return flatbuffer::DataFormat::MxFp8R;
+        case tt::DataFormat::MxFp8P: return flatbuffer::DataFormat::MxFp8P;
+        case tt::DataFormat::MxInt8: return flatbuffer::DataFormat::MxInt8;
+        case tt::DataFormat::MxInt4: return flatbuffer::DataFormat::MxInt4;
+        case tt::DataFormat::MxInt2: return flatbuffer::DataFormat::MxInt2;
         case tt::DataFormat::Int8: return flatbuffer::DataFormat::Int8;
         case tt::DataFormat::Tf32: return flatbuffer::DataFormat::Tf32;
         case tt::DataFormat::UInt8: return flatbuffer::DataFormat::UInt8;
         case tt::DataFormat::UInt16: return flatbuffer::DataFormat::UInt16;
+        case tt::DataFormat::Int16: return flatbuffer::DataFormat::Int16;
         case tt::DataFormat::Int32: return flatbuffer::DataFormat::Int32;
         case tt::DataFormat::UInt32: return flatbuffer::DataFormat::UInt32;
         case tt::DataFormat::RawUInt8: return flatbuffer::DataFormat::RawUInt8;

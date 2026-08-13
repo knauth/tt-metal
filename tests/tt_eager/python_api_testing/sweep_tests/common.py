@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -329,7 +329,7 @@ def shapes_and_datagen(
 
                 dim = random.randint(0, 3)
 
-                # Concatinating dim is different
+                # Concatenating dim is different
                 b_shape[dim] = shape[4 + dim]
 
                 return [a_shape, b_shape]

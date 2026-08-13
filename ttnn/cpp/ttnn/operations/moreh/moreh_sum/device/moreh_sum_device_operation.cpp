@@ -1,8 +1,10 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "moreh_sum_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+#include "ttnn/device_operation.hpp"
 
 #include <cstdint>
 
@@ -15,32 +17,32 @@ namespace ttnn::operations::moreh::moreh_sum {
 MorehSumOperation::program_factory_t MorehSumOperation::select_program_factory(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     // Case for int32
-    const auto input_rank = tensor_args.input.padded_shape().rank();
+    const auto input_rank = tensor_args.input.logical_shape().rank();
 
     if (tensor_args.input.dtype() == DataType::INT32) {
         if (operation_attributes.dim == input_rank - 1) {
             return MorehSumWIntFactory{};
-        } else if (operation_attributes.dim == input_rank - 2) {
-            return MorehSumHIntFactory{};
-        } else {
-            return MorehSumNCIntFactory{};
         }
+        if (operation_attributes.dim == input_rank - 2) {
+            return MorehSumHIntFactory{};
+        }
+        return MorehSumNCIntFactory{};
     }
 
     if (operation_attributes.dim == input_rank - 1) {
         return MorehSumWFactory{};
-    } else if (operation_attributes.dim == input_rank - 2) {
-        return MorehSumHFactory{};
-    } else {
-        return MorehSumNCFactory{};
     }
+    if (operation_attributes.dim == input_rank - 2) {
+        return MorehSumHFactory{};
+    }
+    return MorehSumNCFactory{};
 }
 
 void validate_tensors(
     const MorehSumOperation::operation_attributes_t& operation_attributes,
     const MorehSumOperation::tensor_args_t& tensor_args) {
     const auto& input = tensor_args.input;
-    auto& output = tensor_args.output;
+    const auto& output = tensor_args.output;
 
     check_tensor(input, "moreh_sum", "input", {DataType::BFLOAT16, DataType::INT32});
     check_tensor(output, "moreh_sum", "output", {DataType::BFLOAT16, DataType::INT32});
@@ -53,11 +55,6 @@ void validate_tensors(
 }
 
 void MorehSumOperation::validate_on_program_cache_miss(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    validate_tensors(operation_attributes, tensor_args);
-};
-
-void MorehSumOperation::validate_on_program_cache_hit(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     validate_tensors(operation_attributes, tensor_args);
 };
@@ -88,7 +85,7 @@ MorehSumOperation::spec_return_value_t MorehSumOperation::compute_output_specs(
         // e.g. (2, 64, 64) with dim 0 to be (1, 64, 64)
         output_shape[operation_attributes.dim] = 1;
     } else {
-        ttnn::SmallVector<uint32_t> shape;
+        ttsl::SmallVector<uint32_t> shape;
 
         // e.g. (2, 64, 64) with dim 1 to be (2, 1[32], 64)
         // e.g. (2, 64, 64) with dim 0 to be (64, 64)
@@ -105,7 +102,7 @@ MorehSumOperation::spec_return_value_t MorehSumOperation::compute_output_specs(
     }
 
     log_debug(tt::LogOp, "{}:{} output_shape {}", __func__, __LINE__, output_shape);
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         output_shape,
         TensorLayout(
             tensor_args.input.dtype(), PageConfig(tensor_args.input.layout()), operation_attributes.memory_config));
@@ -122,20 +119,23 @@ MorehSumOperation::tensor_return_value_t MorehSumOperation::create_output_tensor
     return create_device_tensor(compute_output_specs(operation_attributes, tensor_args), tensor_args.input.device());
 }
 
-std::tuple<MorehSumOperation::operation_attributes_t, MorehSumOperation::tensor_args_t> MorehSumOperation::invoke(
+}  // namespace ttnn::operations::moreh::moreh_sum
+
+namespace ttnn::prim {
+ttnn::operations::moreh::moreh_sum::MorehSumOperation::tensor_return_value_t moreh_sum(
     const Tensor& input,
-    const int64_t dim,
-    const bool keepdim,
+    int64_t dim,
+    bool keepdim,
     const std::optional<Tensor>& output,
     const std::optional<MemoryConfig>& memory_config,
     const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
-    return {
-        {
-            dim,
-            keepdim,
-            memory_config.value_or(input.memory_config()),
-            init_device_compute_kernel_config(input.device()->arch(), compute_kernel_config, MathFidelity::HiFi4),
-        },
-        {input, output}};
+    using OperationType = ttnn::operations::moreh::moreh_sum::MorehSumOperation;
+    auto operation_attributes = OperationType::operation_attributes_t{
+        dim,
+        keepdim,
+        memory_config.value_or(input.memory_config()),
+        init_device_compute_kernel_config(input.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi4)};
+    auto tensor_args = OperationType::tensor_args_t{input, output};
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
-}  // namespace ttnn::operations::moreh::moreh_sum
+}  // namespace ttnn::prim

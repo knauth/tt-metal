@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -29,6 +29,9 @@ public:
 
     static TensorToMesh create(const MeshDevice& mesh_device, const MeshMapperConfig& config);
 
+    // Shape-only overload for callers that do not hold a `MeshDevice` handle.
+    static TensorToMesh create(const MeshShape& mesh_shape, const MeshMapperConfig& config);
+
     // Maps a tensor onto a mesh.
     // The input tensor is expected to be host-side tensor consisting of 1 device shard (i.e., mapped to 1x1 mesh).
     // The output tensor will be a host-side tensor mapped to a mesh of the same shape as the mesh device.
@@ -38,13 +41,13 @@ public:
     // materialized.
     template <typename T>
     Tensor operator()(
-        tt::stl::Span<T> buffer,
+        ttsl::Span<T> buffer,
         const ttnn::Shape& shape,
         const tt::tt_metal::MemoryPin& buffer_pin,
         const tt::tt_metal::TensorLayout& layout,
         T pad_value = 0) const;
 
-    tt::tt_metal::DistributedTensorConfig config() const;
+    const MeshMapperConfig& config() const;
 
 private:
     class Impl;
@@ -57,6 +60,9 @@ private:
 // Creates an ND mesh mapper that distributes a tensor according to the `config`.
 std::unique_ptr<TensorToMesh> create_mesh_mapper(MeshDevice& mesh_device, const MeshMapperConfig& config);
 
+// Shape-only overload; the returned mapper retains no device-side state.
+std::unique_ptr<TensorToMesh> create_mesh_mapper(const MeshShape& mesh_shape, const MeshMapperConfig& config);
+
 // Creates a mapper that replicates a tensor across all devices.
 // Shorthand for specifying a MeshMapperConfig that replicates the tensor over the entire mesh.
 std::unique_ptr<TensorToMesh> replicate_tensor_to_mesh_mapper(MeshDevice& mesh_device);
@@ -64,7 +70,9 @@ std::unique_ptr<TensorToMesh> replicate_tensor_to_mesh_mapper(MeshDevice& mesh_d
 // Creates a mapper that shards a tensor along a single dimension.
 // Shorthand for specifying a MeshMapperConfig with 1D mesh shape, and sharding the tensor along a single dimension of
 // the tensor.
-std::unique_ptr<TensorToMesh> shard_tensor_to_mesh_mapper(MeshDevice& mesh_device, int dim);
+
+std::unique_ptr<TensorToMesh> shard_tensor_to_mesh_mapper(
+    MeshDevice& mesh_device, int dim, std::optional<int> cluster_axis = std::nullopt);
 
 // Composer interface used for aggregating a tensor distributed over a mesh.
 class MeshToTensor {
@@ -107,32 +115,32 @@ Tensor distribute_tensor(
     const Tensor& tensor,
     const TensorToMesh& mapper,
     std::optional<std::reference_wrapper<MeshDevice>> mesh_device = std::nullopt,
-    ttnn::QueueId cq_id = ttnn::DefaultQueueId);
+    std::optional<ttnn::QueueId> cq_id = std::nullopt);
 
 // Creates a distributed tensor from a span of logical data specified in `buffer`.
 // `global_shape` must match the size of `buffer`; shapes of shards will be derived automatically based on the `mapper`,
-// and the `shard_layout` will be applied subsequently. `buffer` may be re-used to create tensors directly, taking
+// and the `shard_layout` will be applied subsequently. `buffer` may be reused to create tensors directly, taking
 // `buffer_pin` as the RAII to retain reference count to the object.
 template <typename T>
 Tensor create_distributed_tensor(
-    tt::stl::Span<T> buffer,
+    ttsl::Span<T> buffer,
     const ttnn::Shape& global_shape,
     const tt::tt_metal::MemoryPin& buffer_pin,
     const tt::tt_metal::TensorLayout& shard_layout,
     const TensorToMesh& mapper,
     std::optional<std::reference_wrapper<MeshDevice>> mesh_device = std::nullopt,
-    ttnn::QueueId cq_id = ttnn::DefaultQueueId,
+    std::optional<ttnn::QueueId> cq_id = std::nullopt,
     T pad_value = 0);
 
 // Overload for unowned spans of data.
 template <typename T>
 Tensor create_distributed_tensor(
-    tt::stl::Span<const T> buffer,
+    ttsl::Span<const T> buffer,
     const ttnn::Shape& global_shape,
     const tt::tt_metal::TensorLayout& shard_layout,
     const TensorToMesh& mapper,
     std::optional<std::reference_wrapper<MeshDevice>> mesh_device = std::nullopt,
-    ttnn::QueueId cq_id = ttnn::DefaultQueueId,
+    std::optional<ttnn::QueueId> cq_id = std::nullopt,
     T pad_value = 0);
 
 // Aggregates a multi-device tensor into a host tensor according to the `composer`.

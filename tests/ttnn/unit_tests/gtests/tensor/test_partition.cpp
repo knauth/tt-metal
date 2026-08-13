@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -21,26 +21,20 @@
 #include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <signal.h>
-#include <setjmp.h>
+#include <csignal>
+#include <csetjmp>
 
 #include "ttnn/tensor/xtensor/partition.hpp"
 #include "ttnn/tensor/xtensor/conversion_utils.hpp"
-namespace tt {
-namespace tt_metal {
-class Tensor;
-}  // namespace tt_metal
-}  // namespace tt
 
 namespace ttnn {
 namespace {
 
 using ::testing::SizeIs;
-using ::tt::tt_metal::Tensor;
-using ::ttnn::experimental::xtensor::chunk;
-using ::ttnn::experimental::xtensor::chunk_ndim;
-using ::ttnn::experimental::xtensor::concat;
-using ::ttnn::experimental::xtensor::concat_ndim;
+using ttnn::experimental::xtensor::chunk;
+using ttnn::experimental::xtensor::chunk_ndim;
+using ttnn::experimental::xtensor::concat;
+using ttnn::experimental::xtensor::concat_ndim;
 
 TEST(PartitionTest, ChunkBasicNonDivisible3) {
     // Create a 1D tensor: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -218,7 +212,7 @@ TEST(PartitionTest, EmptyInput) {
 }
 
 TEST(PartitionTest, ChunkDoesNotAccessData) {
-    //  Create a read-protected memory region, and point `tt::stl::Span` to it.
+    //  Create a read-protected memory region, and point `ttsl::Span` to it.
     //  `chunk` should not access the data, and should only calculate offsets and shapes.
     const long page_size = sysconf(_SC_PAGESIZE);
     ASSERT_NE(page_size, -1);
@@ -236,17 +230,17 @@ TEST(PartitionTest, ChunkDoesNotAccessData) {
     // Set up signal handler to verify segmentation faults.
     static sigjmp_buf jmp_env;
     struct Handler {
-        static void segfault_handler(int signum) { siglongjmp(jmp_env, /*val=*/1); }
+        static void segfault_handler(int /*signum*/) { siglongjmp(jmp_env, /*val=*/1); }
     };
-    struct sigaction old_action;
-    struct sigaction new_action;
+    struct sigaction old_action{};
+    struct sigaction new_action{};
     memset(&new_action, 0, sizeof(new_action));
     new_action.sa_handler = Handler::segfault_handler;
     sigemptyset(&new_action.sa_mask);
     new_action.sa_flags = 0;
     ASSERT_EQ(sigaction(SIGSEGV, &new_action, &old_action), 0);
 
-    tt::stl::Span<const uint8_t> protected_span(static_cast<uint8_t*>(mapped_mem), total_size);
+    ttsl::Span<const uint8_t> protected_span(static_cast<uint8_t*>(mapped_mem), total_size);
     auto xexpr = xt::adapt(
         protected_span.data(), total_size, xt::no_ownership(), std::vector<size_t>(shape.cbegin(), shape.cend()));
 
@@ -267,7 +261,8 @@ TEST(PartitionTest, ChunkDoesNotAccessData) {
         for (const auto& chunked_xexpr : chunks) {
             EXPECT_THAT(chunked_xexpr, SizeIs(kDim0Size * page_size));
             EXPECT_EQ(
-                experimental::xtensor::get_shape_from_xarray(chunked_xexpr), ttnn::Shape({kDim0Size, 1, page_size}));
+                ttnn::experimental::xtensor::get_shape_from_xarray(chunked_xexpr),
+                ttnn::Shape({kDim0Size, 1, page_size}));
         }
     } else {
         FAIL() << "segfault occurred when calling `chunk`";
@@ -359,7 +354,7 @@ TEST(PartitionTest, ChunkNdimFewerChunksThanRequested) {
 
     for (size_t i = 0; i < 3; ++i) {
         for (size_t j = 0; j < 4; ++j) {
-            size_t chunk_idx = i * 4 + j;
+            size_t chunk_idx = (i * 4) + j;
             EXPECT_FLOAT_EQ(chunks[chunk_idx](0, 0), tensor(i, j));
         }
     }
@@ -594,7 +589,7 @@ TEST(PartitionTest, ConcatNdimThreeDimensions) {
     // Create 8 small tensors of shape (1, 1, 2)
     std::vector<xt::xarray<int>> expressions;
     for (int i = 0; i < 8; ++i) {
-        xt::xarray<int> tensor = {{{i * 2, i * 2 + 1}}};
+        xt::xarray<int> tensor = {{{i * 2, (i * 2) + 1}}};
         expressions.push_back(tensor);
     }
 
@@ -661,7 +656,7 @@ TEST(PartitionTest, ConcatNdimRowMajorOrder) {
     // Create 6 small tensors of shape (1, 2)
     std::vector<xt::xarray<int>> expressions;
     for (int i = 0; i < 6; ++i) {
-        xt::xarray<int> tensor = {{i * 2, i * 2 + 1}};
+        xt::xarray<int> tensor = {{i * 2, (i * 2) + 1}};
         expressions.push_back(tensor);
     }
 

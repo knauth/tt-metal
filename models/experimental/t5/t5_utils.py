@@ -1,8 +1,8 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import torch
-from models.generation_utils import pad_input_32, get_logits_processor
+from models.common.generation_utils import pad_input_32, get_logits_processor
 
 
 def run_generate(

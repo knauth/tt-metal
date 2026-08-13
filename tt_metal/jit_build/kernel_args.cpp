@@ -1,9 +1,9 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include <assert.hpp>
-#include <utils.hpp>
+#include <tt_stl/assert.hpp>
+#include "jit_build_utils.hpp"
 #include <cstddef>
 #include <fstream>
 #include <map>
@@ -38,7 +38,7 @@ void log_kernel_defines_and_args(
     str_replace_all(defines_as_csv, " ", "");
     str_replace_all(defines_as_csv, ",", ", ");
 
-    if (kernel_defines_and_args_.find(out_dir) == kernel_defines_and_args_.end()) {
+    if (!kernel_defines_and_args_.contains(out_dir)) {
         kernel_defines_and_args_[out_dir] = defines_as_csv;
     } else {
         if (kernel_defines_and_args_[out_dir] != defines_as_csv) {
@@ -54,7 +54,7 @@ void log_kernel_defines_and_args(
 
 void dump_kernel_defines_and_args(const string& out_kernel_root_path) {
     // Make sure the directory exists
-    tt::utils::create_file(out_kernel_root_path);
+    tt::jit_build::utils::create_file(out_kernel_root_path);
 
     string kernel_args_csv = out_kernel_root_path + "kernel_args.csv";
 

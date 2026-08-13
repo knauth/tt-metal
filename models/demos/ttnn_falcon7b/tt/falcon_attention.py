@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,7 +6,7 @@ import math
 from typing import Optional, Tuple
 
 import ttnn
-from models.utility_functions import is_wormhole_b0, nearest_32
+from models.common.utility_functions import is_wormhole_b0, nearest_32
 
 from .falcon_rotary_embedding import TtFalconRotaryEmbedding
 
@@ -109,6 +109,7 @@ class TtFalconAttention:
             num_kv_heads=1,
             transpose_key=False,
             memory_config=self.model_config["CREATE_QKV_HEADS_OUTPUT_MEMCFG"],
+            use_falcon7b_backend=True,
         )
         ttnn.deallocate(fused_query_key_value)
 

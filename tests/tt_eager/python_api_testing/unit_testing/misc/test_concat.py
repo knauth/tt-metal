@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,7 +9,7 @@ import sys
 import torch
 
 import ttnn
-from models.utility_functions import print_diff_argmax, skip_for_blackhole
+from models.common.utility_functions import print_diff_argmax, skip_for_blackhole
 import pytest
 from loguru import logger
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -25,11 +25,6 @@ def is_wormhole_b0():
     return "wormhole_b0" in ARCH_NAME
 
 
-def is_grayskull():
-    ARCH_NAME = os.getenv("ARCH_NAME")
-    return "grayskull" in ARCH_NAME
-
-
 class TestSuiteType(Enum):
     BUILD_KERNELS_FOR_RISCV = auto()
     LLRT = auto()
@@ -44,10 +39,6 @@ TestEntry = namedtuple("TestEntry", ["test_name", "executable_name", "extra_para
 
 def void_for_whb0(x):
     return (not is_wormhole_b0()) and x or None
-
-
-def void_for_gs(x):
-    return (not is_grayskull()) and x or None
 
 
 def void_for_bh(x):
@@ -83,7 +74,13 @@ def is_test_suite_type_that_uses_silicon(test_suite_type: TestSuiteType) -> bool
 
 def run_process_and_get_result(command, extra_env={}, capture_output=True):
     full_env = copy.deepcopy(os.environ)
-    full_env.update(extra_env)
+
+    # Handle None values in extra_env - remove keys with None values
+    for key, value in extra_env.items():
+        if value is None:
+            full_env.pop(key, None)  # Remove the key if it exists
+        else:
+            full_env[key] = value
 
     result = sp.run(command, shell=True, capture_output=capture_output, env=full_env)
 
@@ -203,7 +200,7 @@ def run_single_test(
     namespace: str,
     test_entry: TestEntry,
     timeout,
-    tt_arch="grayskull",
+    tt_arch="wormhole_b0",
     capture_output=False,
     build_full_path_to_test=default_build_full_path_to_test,
 ):
@@ -227,9 +224,7 @@ def run_single_test(
 
     if reset_tensix:
         logger.warning("Detected error on test that uses silicon - resetting")
-        if tt_arch == "grayskull":
-            run_process_and_get_result("tt-smi -tr all")
-        elif tt_arch == "wormhole_b0":
+        if tt_arch in ("wormhole_b0", "blackhole"):
             run_process_and_get_result("tt-smi -wr all wait")
         else:
             raise Exception(f"Unrecognized arch for tensix-reset: {tt_arch}")
@@ -272,12 +267,24 @@ def get_updated_device_params(device_params):
 
     dispatch_core_axis = new_device_params.pop("dispatch_core_axis", None)
     dispatch_core_type = new_device_params.pop("dispatch_core_type", None)
+    fabric_tensix_config = new_device_params.get("fabric_tensix_config", None)
 
-    if ttnn.device.is_blackhole() and dispatch_core_axis == ttnn.DispatchCoreAxis.ROW:
-        logger.warning("blackhole arch does not support DispatchCoreAxis.ROW, using DispatchCoreAxis.COL instead.")
-        dispatch_core_axis = ttnn.DispatchCoreAxis.COL
+    if ttnn.device.is_blackhole():
+        # Only when both fabric_config and fabric_tensix_config are set, we can use ROW dispatch, otherwise force to use COL dispatch
+        fabric_config = new_device_params.get("fabric_config", None)
+        if not (fabric_config and fabric_tensix_config):
+            # When not both are set, force COL dispatch
+            if dispatch_core_axis == ttnn.DispatchCoreAxis.ROW:
+                logger.warning(
+                    "ROW dispatch requires both fabric and tensix config, using DispatchCoreAxis.COL instead."
+                )
+                dispatch_core_axis = ttnn.DispatchCoreAxis.COL
+        elif fabric_config and fabric_tensix_config:
+            logger.warning(
+                f"Blackhole with fabric_config and fabric_tensix_config enabled, using fabric_tensix_config={fabric_tensix_config}"
+            )
 
-    dispatch_core_config = ttnn.DispatchCoreConfig(dispatch_core_type, dispatch_core_axis)
+    dispatch_core_config = ttnn.DispatchCoreConfig(dispatch_core_type, dispatch_core_axis, fabric_tensix_config)
     new_device_params["dispatch_core_config"] = dispatch_core_config
 
     return new_device_params

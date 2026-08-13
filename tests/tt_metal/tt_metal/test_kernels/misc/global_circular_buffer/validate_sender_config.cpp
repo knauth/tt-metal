@@ -1,21 +1,17 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
-#include "debug/assert.h"
-#include "debug/ring_buffer.h"
+#include "api/debug/assert.h"
+#include "api/debug/ring_buffer.h"
 
 #if defined(COMPILE_FOR_TRISC)
-#include "compute_kernel_api/common.h"
-
-namespace NAMESPACE {
-void MAIN {
+#include "api/compute/common.h"
 #else
-#include "dataflow_api.h"
-
-void kernel_main() {
+#include "api/dataflow/dataflow_api.h"
 #endif
+void kernel_main() {
 #if !defined(UCK_CHLKC_MATH)
     constexpr uint32_t remote_cb_id = get_compile_time_arg_val(0);
 
@@ -37,7 +33,8 @@ void kernel_main() {
     uint32_t num_receivers = get_arg_val<uint32_t>(arg_idx++);
     pass &= config_ptr[config_idx++] == num_receivers;
     ASSERT(pass);
-    pass &= remote_sender_cb_interface.num_receivers == num_receivers;
+    pass &=
+        remote_cb_num_receivers(remote_sender_cb_interface.num_receivers_and_remote_pages_sent_ptr) == num_receivers;
     ASSERT(pass);
     // fifo_start_addr
     uint32_t fifo_start_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -93,6 +90,3 @@ void kernel_main() {
     while (!pass);
 #endif
 }
-#if defined(COMPILE_FOR_TRISC)
-}  // namespace NAMESPACE
-#endif

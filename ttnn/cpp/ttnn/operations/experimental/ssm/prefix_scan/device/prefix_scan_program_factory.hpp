@@ -1,19 +1,19 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
 
-namespace ttnn::operations::experimental::ssm::detail {
+#include "prefix_scan_device_operation_types.hpp"
+#include "ttnn/tensor/tensor.hpp"
 
-tt::tt_metal::operation::ProgramWithCallbacks multi_core_ssm_prefix_scan(
-    const Tensor& a,
-    const Tensor& bx,
-    const Tensor& h,
-    Tensor& output,
-    MathFidelity math_fidelity,
-    CoreCoord compute_with_storage_grid_size);
+namespace ttnn::experimental::prim {
 
-}  // namespace ttnn::operations::experimental::ssm::detail
+struct PrefixScanProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const PrefixScanParams& operation_attributes, const PrefixScanInputs& tensor_args, Tensor& tensor_return_value);
+};
+
+}  // namespace ttnn::experimental::prim

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,7 +9,7 @@ import torch
 
 
 from tt_lib.utils import _nearest_32
-from models.utility_functions import comp_pcc
+from models.common.utility_functions import comp_pcc
 
 import ttnn
 
@@ -47,10 +47,6 @@ def test_run_average_pool(act_shape, dtype, device):
     out = ttnn.global_avg_pool2d(ttact)
 
     out = out.cpu().to(ttnn.ROW_MAJOR_LAYOUT)
-    out_shape = [batch_size, 1, 1, channels]
-    out_shape_padded = shape_padded(out_shape)
-    if out_shape != out_shape_padded:
-        out = out.unpad_from_tile(out_shape)
 
     out_pytorch = out.to_torch()
 
@@ -58,7 +54,7 @@ def test_run_average_pool(act_shape, dtype, device):
     act_channels_first = torch.permute(act, (0, 3, 1, 2))  # Torch operates on channels-first tensors
     golden_pytorch = torch.nn.AdaptiveAvgPool2d((1, 1))(act_channels_first)
 
-    ## test for equivalance
+    ## test for equivalence
     passing_pcc, output_pcc = comp_pcc(golden_pytorch, out_pytorch)
     print(f"Passing PCC = {passing_pcc}")
     print(f"Output PCC = {output_pcc}")

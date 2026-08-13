@@ -1,34 +1,45 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
+#include "ttnn/tensor/tensor.hpp"
+
+#include <cstdint>
 #include <optional>
 #include <tuple>
 #include <vector>
+#include "ttnn/types.hpp"
 
-#include "ttnn/decorators.hpp"
-
-namespace ttnn {
-namespace operations::reduction {
-
+namespace ttnn::operations::reduction::topk {
 struct ExecuteTopK {
     static std::vector<Tensor> invoke(
-        QueueId queue_id,
         const Tensor& input_tensor,
         uint32_t k,
         int8_t dim,
         bool largest,
         bool sorted,
-        const std::optional<MemoryConfig>& memory_config = std::nullopt,
-        const std::optional<CoreRangeSet>& sub_core_grids = std::nullopt,
+        const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt,
+        const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids = std::nullopt,
         const std::optional<Tensor>& indices_tensor = std::nullopt,
-        std::optional<std::tuple<Tensor, Tensor>> optional_output_tensors = std::nullopt);
+        std::optional<std::tuple<Tensor&, Tensor&>> preallocated_output_tensors = std::nullopt,
+        bool stable = false);
 };
+}  // namespace ttnn::operations::reduction::topk
 
-}  // namespace operations::reduction
+namespace ttnn {
 
-constexpr auto topk = ttnn::register_operation<"ttnn::topk", ttnn::operations::reduction::ExecuteTopK>();
+std::vector<Tensor> topk(
+    const Tensor& input_tensor,
+    uint32_t k,
+    int8_t dim,
+    bool largest,
+    bool sorted,
+    const std::optional<tt::tt_metal::MemoryConfig>& memory_config = std::nullopt,
+    const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids = std::nullopt,
+    const std::optional<Tensor>& indices_tensor = std::nullopt,
+    std::optional<std::tuple<Tensor&, Tensor&>> preallocated_output_tensors = std::nullopt,
+    bool stable = false);
 
 }  // namespace ttnn

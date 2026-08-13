@@ -1,17 +1,23 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import pathlib
 import pickle
 import os
 from datetime import datetime
 from typing import Optional, Union
 
+import yaml
 from loguru import logger
 
-from infra.data_collection.github.workflows import is_job_hanging_from_job_log
-from infra.data_collection.models import InfraErrorV1, TestErrorV1
+from infra.data_collection.github.workflows import (
+    is_job_hanging_from_job_log,
+    get_civ2_node_name_and_serial_from_annotations,
+    get_civ2_node_name_and_serial_from_job_log,
+)
+from infra.data_collection.models import InfraErrorV1, TestErrorV1, CodeQualityErrorV1
 from infra.data_collection.pydantic_models import CompleteBenchmarkRun
 
 
@@ -66,6 +72,7 @@ def get_pipeline_row_from_github_info(github_runner_environment, github_pipeline
     github_pipeline_link = github_pipeline_json["html_url"]
 
     pipeline_status = github_pipeline_json["conclusion"]
+    workflow_attempt = github_pipeline_json["run_attempt"]
 
     return {
         "github_pipeline_id": github_pipeline_id,
@@ -83,6 +90,7 @@ def get_pipeline_row_from_github_info(github_runner_environment, github_pipeline
         "orchestrator": orchestrator,
         "github_pipeline_link": github_pipeline_link,
         "pipeline_status": pipeline_status,
+        "workflow_attempt": workflow_attempt,
     }
 
 
@@ -95,6 +103,11 @@ def return_first_string_starts_with(starting_string, strings):
 
 def get_job_failure_signature_(github_job, failure_description, workflow_outputs_dir) -> Optional[Union[InfraErrorV1]]:
     error_snippet_to_signature_mapping = {
+        # Actions runner timing out downloading a custom action/repo tarball from codeload.github.com
+        # (same root cause as the ACTION_DOWNLOAD_FAILURE cases below, just the timeout variant instead
+        # of an explicit error) — must be checked before the generic "has timed out" job-timeout snippet,
+        # which would otherwise swallow this and misroute it through hang detection
+        "download has timed out": str(InfraErrorV1.ACTION_DOWNLOAD_FAILURE),
         "has timed out": str(InfraErrorV1.JOB_UNIT_TIMEOUT_FAILURE),
         "exceeded the maximum execution time": str(InfraErrorV1.JOB_CUMULATIVE_TIMEOUT_FAILURE),
         "lost communication with the server": str(InfraErrorV1.RUNNER_COMM_FAILURE),
@@ -102,6 +115,44 @@ def get_job_failure_signature_(github_job, failure_description, workflow_outputs
         "No space left on device": str(InfraErrorV1.DISK_SPACE_FAILURE),
         "API rate limit exceeded": str(InfraErrorV1.API_RATE_LIMIT_FAILURE),
         "Tenstorrent cards seem to be in use": str(InfraErrorV1.RUNNER_CARD_IN_USE_FAILURE),
+        "Error response from daemon": str(InfraErrorV1.DOCKER_REGISTRY_FAILURE),
+        "Failed to CreateArtifact": str(InfraErrorV1.ARTIFACT_UPLOAD_FAILURE),
+        "device timeout, potential hang detected, the device is unrecoverable": str(InfraErrorV1.TT_TRIAGE_JOB_HANG),
+        # Git checkout / submodule clone failures (transient GitHub infra issues)
+        "fatal: clone of": str(InfraErrorV1.CHECKOUT_FAILURE),
+        "Failed to clone": str(InfraErrorV1.CHECKOUT_FAILURE),
+        "could not read Username": str(InfraErrorV1.CHECKOUT_FAILURE),
+        "terminal prompts disabled": str(InfraErrorV1.CHECKOUT_FAILURE),
+        "Fetched in submodule path": str(InfraErrorV1.CHECKOUT_FAILURE),
+        # Docker daemon rejects a container operation with a null id (distinct from registry/pull failures above)
+        "Value cannot be null. (Parameter 'ContainerId')": str(InfraErrorV1.DOCKER_CONTAINER_ID_NULL_FAILURE),
+        # GitHub Actions runner failing to download a custom action's tarball from codeload.github.com
+        # (e.g. actions/checkout itself), distinct from a `git clone` failure of the repo under test
+        "Failed to download archive": str(InfraErrorV1.ACTION_DOWNLOAD_FAILURE),
+        "Failed to download action": str(InfraErrorV1.ACTION_DOWNLOAD_FAILURE),
+        # phoenix-actions/test-reporting surfacing a real test failure as a .github-path annotation
+        "Failed tests were found and 'fail-on-error'": str(InfraErrorV1.TEST_REPORTER_FAILURE),
+        "No test report files were found": str(InfraErrorV1.TEST_REPORTER_NO_REPORTS_FAILURE),
+        "/usr/bin/git' failed with exit code 128": str(InfraErrorV1.GIT_PROCESS_FAILURE),
+        "Failed to FinalizeArtifact": str(InfraErrorV1.ARTIFACT_FINALIZE_FAILURE),
+        # Artifact/workflow-run record expired or was cleaned up server-side, distinct from the
+        # transient ECONNRESET case below — must be checked first since both share the same prefix
+        "Failed to GetSignedArtifactURL: Received non-retryable error: Failed request: (404) Not Found": str(
+            InfraErrorV1.ARTIFACT_DOWNLOAD_NOT_FOUND_FAILURE
+        ),
+        # Match the connection-specific portion, not the bare operation name: a 403/500/malformed
+        # GetSignedArtifactURL is a different failure mode and must not land in the connection bucket
+        "Failed to GetSignedArtifactURL: Unable to make request": str(
+            InfraErrorV1.ARTIFACT_DOWNLOAD_CONNECTION_FAILURE
+        ),
+        # Match the 403-specific portion: a ListArtifacts ECONNRESET is a connection error, not a
+        # forbidden error, and should not be swallowed by the operation name alone
+        "Failed to ListArtifacts: Received non-retryable error: Failed request: (403) Forbidden": str(
+            InfraErrorV1.ARTIFACT_DOWNLOAD_FORBIDDEN_FAILURE
+        ),
+        "Upload progress stalled.": str(InfraErrorV1.ARTIFACT_UPLOAD_STALLED_FAILURE),
+        "Request was cancelled.": str(InfraErrorV1.REQUEST_CANCELLED_FAILURE),
+        "We received a malformed request from your client": str(InfraErrorV1.GITHUB_API_MALFORMED_REQUEST_FAILURE),
     }
 
     # Check the mapping dictionary for specific failure signature types
@@ -133,6 +184,32 @@ def get_job_failure_signature_(github_job, failure_description, workflow_outputs
         if is_generic_setup_failure:
             return str(InfraErrorV1.GENERIC_SET_UP_FAILURE)
 
+    # If failure occurred in a checkout step, classify as checkout failure
+    for step in github_job.get("steps", []):
+        step_name = step.get("name", "")
+        step_conclusion = step.get("conclusion", "")
+
+        is_checkout_failure = "checkout" in step_name.lower() and step_conclusion == "failure"
+
+        if is_checkout_failure:
+            return str(InfraErrorV1.CHECKOUT_FAILURE)
+
+    # If failure occurred in clang-tidy step, classify as code quality failure
+    for step in github_job.get("steps", []):
+        step_name = step.get("name", "")
+        step_conclusion = step.get("conclusion", "")
+
+        is_clang_tidy_failure = "analyze code with clang-tidy" in step_name.lower() and step_conclusion == "failure"
+
+        if is_clang_tidy_failure:
+            return str(CodeQualityErrorV1.CLANG_TIDY_VIOLATION)
+
+    # Most generic step-failure message GitHub emits ("Process completed with exit code N").
+    # Checked only after the step-specific classifiers above so a checkout/clang-tidy step that
+    # fails with this generic annotation still gets its specific signature, not this fallback.
+    if "Process completed with exit code" in failure_description:
+        return str(InfraErrorV1.GENERIC_EXIT_CODE_FAILURE)
+
     # generic catch-all
     return str(InfraErrorV1.GENERIC_FAILURE)
 
@@ -151,26 +228,29 @@ def get_failure_signature_and_description_from_annotations(
     if job_id in github_job_id_to_annotations:
         annotation_info = github_job_id_to_annotations[job_id]
 
+        # First, look for test failures (prioritize these over infrastructure failures)
         for _annot in annotation_info:
-            if _annot["annotation_level"] == "failure":
-                # Unit test failure: a failure exists where the annotation path is not .github
-                if _annot["path"] != ".github":
-                    failure_description = _annot["path"]
-                    if ".py" in failure_description:
-                        failure_signature = str(TestErrorV1.PY_TEST_FAILURE)
-                    elif ".cpp" in failure_description:
-                        failure_signature = str(TestErrorV1.CPP_TEST_FAILURE)
-                    else:
-                        failure_signature = str(TestErrorV1.UNKNOWN_TEST_FAILURE)
-                    return failure_signature, failure_description
+            # Unit test failure: a failure exists where the annotation path is not .github
+            if _annot["annotation_level"] == "failure" and _annot["path"] != ".github":
+                failure_description = _annot["path"]
+                if ".py" in failure_description:
+                    failure_signature = str(TestErrorV1.PY_TEST_FAILURE)
+                elif ".cpp" in failure_description:
+                    failure_signature = str(TestErrorV1.CPP_TEST_FAILURE)
                 else:
-                    # Infrastructure error
-                    failure_description = _annot.get("message")
-                    if failure_description:
-                        failure_signature = get_job_failure_signature_(
-                            github_job, failure_description, workflow_outputs_dir
-                        )
-                        return failure_signature, failure_description
+                    failure_signature = str(TestErrorV1.UNKNOWN_TEST_FAILURE)
+                return failure_signature, failure_description
+
+        # If no test failures found, fall back to infrastructure failures
+        for _annot in annotation_info:
+            # Infrastructure error
+            if _annot["annotation_level"] == "failure" and _annot["path"] == ".github":
+                failure_description = _annot.get("message")
+                if failure_description:
+                    failure_signature = get_job_failure_signature_(
+                        github_job, failure_description, workflow_outputs_dir
+                    )
+                    return failure_signature, failure_description
     return failure_signature, failure_description
 
 
@@ -207,16 +287,36 @@ def get_job_row_from_github_job(github_job, github_job_id_to_annotations, workfl
     else:
         ubuntu_version = None
 
-    # Clean up ephemeral runner names
-    if host_name and (host_name.startswith("tt-beta") or host_name.startswith("tt-ubuntu")):
-        parts = host_name.split("-")
-        # Issue: https://github.com/tenstorrent/tt-metal/issues/21694
-        # Issue: https://github.com/tenstorrent/tt-metal/issues/26445
-        # Remove non-constant ephemeral runner suffix from tt-beta/tt-ubuntu runner names only if the second last part is "runner"
-        # We don't want to remove the suffix for non-ephemeral runners (e.g. tt-beta-ubuntu-2204-xlarge)
-        # E.g. tt-beta-ubuntu-2204-n150-large-stable-nk6pd-runner-5g5f9 -> tt-beta-ubuntu-2204-n150-large-stable-nk6pd
-        if len(parts) >= 2 and parts[-2] == "runner":
-            host_name = "-".join(parts[:-1])
+    # Resolve the host_name for CIv2 (tt-ubuntu) runners. The ephemeral runner identity is
+    # not useful for data analysis since it changes every pod, so prefer the physical
+    # <node name>_<serial> emitted by the job-start hook annotations, falling back to the
+    # job log when annotations are unavailable (e.g. not downloaded).
+    if host_name and host_name.startswith("tt-ubuntu"):
+        node_name, serial = get_civ2_node_name_and_serial_from_annotations(
+            github_job_id_to_annotations.get(github_job_id)
+        )
+        if not (node_name and serial):
+            log_node_name, log_serial = get_civ2_node_name_and_serial_from_job_log(
+                workflow_outputs_dir, github_job["run_id"], github_job_id
+            )
+            node_name = node_name or log_node_name
+            serial = serial or log_serial
+
+        if node_name and serial:
+            host_name = f"{node_name}_{serial}"
+        elif node_name:
+            # CPU-only runners have no card serial; the node name alone identifies the host
+            host_name = node_name
+        else:
+            # No node/serial info: strip the non-constant ephemeral suffix so host aggregation
+            # stays stable, but only when the second-last part is "runner" so we don't touch
+            # non-ephemeral runners (e.g. tt-ubuntu-2204-xlarge).
+            # E.g. tt-ubuntu-2204-n150-large-stable-nk6pd-runner-5g5f9 -> tt-ubuntu-2204-n150-large-stable-nk6pd
+            # Issues: https://github.com/tenstorrent/tt-metal/issues/21694
+            #         https://github.com/tenstorrent/tt-metal/issues/26445
+            parts = host_name.split("-")
+            if len(parts) >= 2 and parts[-2] == "runner":
+                host_name = "-".join(parts[:-1])
 
     # Cleanup GitHub-hosted runner names because we're sending the whole thing, which is unnecessary
     # and clogs up the data with 1000s of hosts
@@ -231,45 +331,7 @@ def get_job_row_from_github_job(github_job, github_job_id_to_annotations, workfl
         logger.warning(f"{github_job_id} is not completed, skipping this job")
         return None
 
-    # Best effort card type getting
-
-    get_overlap = lambda labels_a, labels_b: set(labels_a) & set(labels_b)
-    labels_have_overlap = lambda labels_a, labels_b: bool(get_overlap(labels_a, labels_b))
-
-    try:
-        detected_config = return_first_string_starts_with("config-", labels).replace("config-", "")
-    except Exception as e:
-        logger.error(e)
-        logger.info("Seems to have no config- label, so assuming no special config requested")
-        detected_config = None
-
-    if labels_have_overlap(["E150", "grayskull", "arch-grayskull"], labels):
-        detected_arch = "grayskull"
-    elif labels_have_overlap(["N150", "N300", "wormhole_b0", "arch-wormhole_b0", "config-t3000"], labels):
-        detected_arch = "wormhole_b0"
-    elif labels_have_overlap(["BH", "arch-blackhole"], labels):
-        detected_arch = "blackhole"
-    else:
-        detected_arch = None
-
-    single_cards_list = ("E150", "N150", "N300", "BH")
-    single_cards_overlap = get_overlap(single_cards_list, labels)
-
-    # In order of preference
-    if detected_config:
-        if not detected_arch:
-            # This will occur for jobs where runs-on: has a config-* label but doesn't have an arch-* or card-specific label
-            logger.warning(f"No arch label found for config {detected_config} in job label, unable to infer card type")
-            card_type = None
-        else:
-            card_type = f"{detected_config}-{detected_arch}"
-    elif single_cards_overlap:
-        logger.info(f"Detected overlap in single cards: {single_cards_overlap}")
-        card_type = list(single_cards_overlap)[0]
-    elif detected_arch:
-        card_type = detected_arch
-    else:
-        card_type = None
+    card_type = _card_type_from_job_labels(labels)
 
     job_submission_ts = github_job["created_at"]
 
@@ -332,6 +394,8 @@ def get_job_row_from_github_job(github_job, github_job_id_to_annotations, workfl
         "failure_signature": failure_signature,
         "failure_description": failure_description,
         "job_label": ",".join(labels),
+        "workflow_attempt": github_job.get("run_attempt"),
+        "steps": github_job.get("steps", []),
     }
 
 
@@ -345,11 +409,183 @@ def get_job_rows_from_github_info(workflow_outputs_dir, github_jobs_json, github
     return [x for x in job_rows if x is not None]
 
 
+def _get_repo_root() -> pathlib.Path:
+    """Return the repository root directory (parent of infra/)."""
+    return pathlib.Path(__file__).resolve().parents[3]
+
+
+@functools.lru_cache(maxsize=1)
+def _load_sku_config_skus() -> dict:
+    sku_config_path = _get_repo_root() / ".github" / "sku_config.yaml"
+    with open(sku_config_path) as f:
+        config = yaml.safe_load(f)
+    return config.get("skus") or {}
+
+
+@functools.lru_cache(maxsize=1)
+def _sku_config_sku_names() -> tuple[str, ...]:
+    return tuple(_load_sku_config_skus().keys())
+
+
+def _is_sku_name_prefix(prefix: str, sku_name: str) -> bool:
+    if sku_name == prefix:
+        return True
+    if len(prefix) >= len(sku_name) or not sku_name.startswith(prefix):
+        return False
+    return sku_name[len(prefix)] in "_-"
+
+
+@functools.lru_cache(maxsize=1)
+def _generic_runner_labels() -> frozenset[str]:
+    """
+    Runner labels from sim_* runs_on entries in sku_config.yaml.
+
+    These are shared CPU pools where strict sku_config matching cannot distinguish
+    sim tests from other jobs on the same label; card_type stores the label itself.
+    """
+    labels: set[str] = set()
+    for sku_name, sku_entry in _load_sku_config_skus().items():
+        if sku_name.startswith("sim_"):
+            labels.update(sku_entry.get("runs_on") or [])
+    return frozenset(labels)
+
+
+# Longest-first suffixes stripped when promoting a variant SKU to its root name.
+_CARD_TYPE_ROOT_SUFFIXES: tuple[str, ...] = (
+    "_civ2_viommu_prio",
+    "_civ2_viommu",
+    "_civ2_prio",
+    "_merge_gate",
+    "_civ2",
+    "_viommu",
+    "_perf",
+    "_prio",
+    "_iommu",
+    "-blitz",
+    "-mgd",
+)
+
+
+def _uses_generic_runner_labels(label_set: set[str]) -> bool:
+    return bool(label_set) and label_set <= _generic_runner_labels()
+
+
+def _card_type_from_generic_runner_labels(label_set: set[str]) -> Optional[str]:
+    """
+    Map sim_* shared CPU pools back to their runner label for card_type.
+
+    When job labels are only pools listed on sim_* SKUs in sku_config.yaml, return
+    the CPU runner label itself rather than a sim_* SKU name.
+    """
+    if not _uses_generic_runner_labels(label_set):
+        return None
+    return sorted(label_set)[0]
+
+
+@functools.lru_cache(maxsize=128)
+def _root_sku_for(sku_name: str) -> str:
+    known_skus = set(_sku_config_sku_names())
+    candidate = sku_name
+
+    while True:
+        promoted = False
+        for suffix in _CARD_TYPE_ROOT_SUFFIXES:
+            if not candidate.endswith(suffix):
+                continue
+            stripped = candidate[: -len(suffix)]
+            if stripped in known_skus:
+                candidate = stripped
+                promoted = True
+                break
+        if not promoted:
+            break
+
+    if candidate in known_skus:
+        return candidate
+
+    candidates = [name for name in known_skus if _is_sku_name_prefix(name, sku_name)]
+    if candidates:
+        return min(candidates, key=lambda name: (len(name), name))
+    return sku_name
+
+
+# Runner labels checked in order when strict sku_config matching fails.
+_CARD_TYPE_LABEL_FALLBACK: tuple[tuple[str, str], ...] = (
+    ("P300-viommu", "bh_p300"),
+    ("P300", "bh_p300"),
+    ("P150", "bh_p150"),
+    ("P100", "bh_p100"),
+    ("N300", "wh_n300"),
+    ("N150", "wh_n150"),
+)
+
+
+def _card_type_from_sku_config(labels: list[str]) -> Optional[str]:
+    """
+    Match job labels to a pipeline SKU from sku_config.yaml.
+
+    Every SKU whose runs_on labels are present on the job is a match (sim_* SKUs are
+    skipped). Matches are promoted to their root SKU via suffix stripping / sku_config
+    prefix lookup.
+    """
+    label_set = set(labels)
+    matching_skus: list[str] = []
+
+    for sku_name, sku_entry in _load_sku_config_skus().items():
+        if sku_name.startswith("sim_"):
+            continue
+
+        runs_on = sku_entry.get("runs_on") or []
+        if not runs_on:
+            continue
+
+        if frozenset(runs_on).issubset(label_set):
+            matching_skus.append(sku_name)
+
+    if not matching_skus:
+        return None
+
+    roots = {_root_sku_for(sku_name) for sku_name in matching_skus}
+    return sorted(roots)[0]
+
+
+def _card_type_fallback_from_job_labels(labels: list[str]) -> Optional[str]:
+    """
+    Best-effort card type when sku_config has no full runs_on match.
+
+    Maps a single hardware runner label to the corresponding root SKU.
+    """
+    label_set = set(labels)
+    for runner_label, card_type in _CARD_TYPE_LABEL_FALLBACK:
+        if runner_label in label_set:
+            return card_type
+    return None
+
+
+def _card_type_from_job_labels(labels: list[str]) -> Optional[str]:
+    label_set = set(labels)
+
+    card_type = _card_type_from_generic_runner_labels(label_set)
+    if card_type is not None:
+        logger.info(f"Matched job labels to generic runner label {card_type!r}")
+        return card_type
+
+    card_type = _card_type_from_sku_config(labels)
+    if card_type is None:
+        card_type = _card_type_fallback_from_job_labels(labels)
+        if card_type is not None:
+            logger.info(f"Matched job labels to SKU {card_type!r} via label fallback")
+            return card_type
+        return None
+
+    logger.info(f"Matched job labels to SKU {card_type!r}")
+    return card_type
+
+
 def get_github_partial_benchmark_data_filenames():
     logger.info("We are assuming generated/benchmark_data exists from previous passing test")
 
-    current_utils_path = pathlib.Path(__file__)
-    benchmark_data_dir = current_utils_path.parent.parent.parent.parent / "generated/benchmark_data"
+    benchmark_data_dir = _get_repo_root() / "generated/benchmark_data"
     assert benchmark_data_dir.exists()
     assert benchmark_data_dir.is_dir()
 
@@ -373,7 +609,62 @@ def get_github_runner_environment():
     }
 
 
-def create_json_with_github_benchmark_environment(github_partial_benchmark_data_filename):
+def _get_device_type_from_runner_environment(sku_from_test: Optional[str] = None) -> str:
+    """
+    Infer device/card type (wormhole_b0, blackhole) from runner environment.
+    RUNNER_NAME is a GitHub Actions env var that must be set.
+
+    When sku_from_test is provided (e.g. from workflow), look up sku_config for that SKU's
+    runs_on labels; if any label contains "blackhole" or "wormhole", return the arch.
+    """
+    assert "RUNNER_NAME" in os.environ, "RUNNER_NAME must be set (GitHub Actions env var)"
+    runner_name = os.environ["RUNNER_NAME"]
+    runner_lower = runner_name.lower()
+
+    # This assumes all CIv2 runner names start with tt-ubuntu
+    if runner_lower.startswith("tt-ubuntu"):
+        if "blackhole" in runner_lower or "bh-" in runner_lower or "p100" in runner_lower or "p150" in runner_lower:
+            return "blackhole"
+        if "n150" in runner_lower or "n300" in runner_lower or "wormhole" in runner_lower:
+            return "wormhole_b0"
+        return "unknown"
+
+    # Not tt-ubuntu: check .github/sku_config.yaml for arch from runs_on labels matching runner
+    if sku_from_test:
+        sku_config_path = _get_repo_root() / ".github" / "sku_config.yaml"
+        if sku_config_path.exists():
+            with open(sku_config_path) as f:
+                config = yaml.safe_load(f)
+            skus = config.get("skus") or {}
+
+            if sku_from_test in skus:
+                # Use sku_from_test from workflow: get runs_on labels for this SKU
+                runs_on = skus.get(sku_from_test, {}).get("runs_on") or []
+                for label in runs_on:
+                    label_lower = label.lower()
+                    # Only checks CIv1 style labels in sku_config for now
+                    if "blackhole" in label_lower:
+                        return "blackhole"
+                    if "wormhole" in label_lower:
+                        return "wormhole_b0"
+
+    # Failed to parse from CIv2 runner name and failed to parse from sku_config:
+    # Fallback to using ARCH_NAME env var
+    if "ARCH_NAME" in os.environ:
+        arch = os.environ["ARCH_NAME"]
+        if arch in ("wormhole_b0", "blackhole"):
+            return arch
+
+    logger.warning(
+        f"Could not infer device type from RUNNER_NAME={runner_name!r}. "
+        "Set ARCH_NAME env var (wormhole_b0, blackhole) for accurate benchmark data."
+    )
+    return "unknown"
+
+
+def create_json_with_github_benchmark_environment(
+    github_partial_benchmark_data_filename, sku_from_test: Optional[str] = None
+):
     assert "GITHUB_REPOSITORY" in os.environ
     git_repo_name = os.environ["GITHUB_REPOSITORY"]
 
@@ -406,17 +697,18 @@ def create_json_with_github_benchmark_environment(github_partial_benchmark_data_
     logger.warning("Hardcoded null for device_ip")
     device_ip = ""
 
-    assert "ARCH_NAME" in os.environ
-    device_type = os.environ["ARCH_NAME"]
-    assert device_type in ("grayskull", "wormhole_b0", "blackhole")
+    device_type = _get_device_type_from_runner_environment(sku_from_test=sku_from_test)
 
     logger.warning("Hardcoded null for device_memory_size")
     device_memory_size = ""
 
-    device_info = {"card_type": device_type, "dram_size": device_memory_size}
-
     with open(github_partial_benchmark_data_filename, "rb") as f:
         partial_benchmark_data = pickle.load(f)
+
+    existing_device_info = partial_benchmark_data.device_info or {}
+    device_info = existing_device_info | {"card_type": device_type, "dram_size": device_memory_size}
+    if sku_from_test:
+        device_info["sku"] = sku_from_test
 
     partial_benchmark_data = partial_benchmark_data.model_copy(
         update={

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -10,30 +10,61 @@
 #include <vector>
 #include <simde/x86/avx2.h>
 
-#include "assert.hpp"
+#include <tt_stl/assert.hpp>
 #include "blockfloat_common.hpp"
 #include "constants.hpp"
 #include "hal_types.hpp"
 #include "impl/context/metal_context.hpp"
 #include "math.hpp"
 #include "tile.hpp"
-#include "tracy/Tracy.hpp"
+#include "tt_metal/tools/profiler/tracy_debug_zones.hpp"
 #include "tt_backend_api_types.hpp"
 
-std::vector<uint32_t> pack_fp32_vec_as_bfp8_tiles(
-    tt::stl::Span<const float> fp32_vec,
-    bool row_major_input,
-    bool is_exp_a,
-    const std::optional<tt::tt_metal::Tile>& tile) {
-    return pack_fp32_vec_as_bfp_tiles<tt::DataFormat::Bfp8_b>(fp32_vec, row_major_input, is_exp_a, tile);
+template <typename T>
+std::vector<uint32_t> pack_as_bfp8_tiles(
+    ttsl::Span<const T> data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile) {
+    return pack_as_bfp_tiles<tt::DataFormat::Bfp8_b>(data, row_major_input, is_exp_a, tile);
 }
 
+template std::vector<uint32_t> pack_as_bfp8_tiles<bfloat16>(
+    ttsl::Span<const bfloat16> data,
+    bool row_major_input,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp8_tiles<float>(
+    ttsl::Span<const float> data,
+    bool row_major_input,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp8_tiles<int32_t>(
+    ttsl::Span<const int32_t> data,
+    bool row_major_input,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp8_tiles<uint32_t>(
+    ttsl::Span<const uint32_t> data,
+    bool row_major_input,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp8_tiles<int8_t>(
+    ttsl::Span<const int8_t> data, bool row_major_input, bool is_exp_a, const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp8_tiles<uint8_t>(
+    ttsl::Span<const uint8_t> data,
+    bool row_major_input,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile);
+template std::vector<uint32_t> pack_as_bfp8_tiles<uint16_t>(
+    ttsl::Span<const uint16_t> data,
+    bool row_major_input,
+    bool is_exp_a,
+    const std::optional<tt::tt_metal::Tile>& tile);
+
 std::vector<float> unpack_bfp8_tiles_into_float_vec(
-    tt::stl::Span<const uint32_t> bfp8_tiles,
+    ttsl::Span<const uint32_t> bfp8_tiles,
     bool row_major_output,
     bool is_exp_a,
     const std::optional<tt::tt_metal::Tile>& tile) {
-    ZoneScoped;
+    TTZoneScopedD(DATA_FORMAT);
 
     uint32_t l1_alignment = tt::tt_metal::MetalContext::instance().hal().get_alignment(tt::tt_metal::HalMemType::L1);
 
@@ -53,14 +84,23 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
     uint32_t num_bfp8_in_tile = num_tile_words + num_exp_words;
 
     // the exponent index will always be 0 when tile_HW == 16, between 0-1 when tile_HW == 32, and between 0-3 otherwise
-    uint32_t exp_bit_mask = (tile_HW == 16) ? 0x0 : (tile_HW == 32) ? 0x1 : 0x3;
+    uint32_t exp_bit_mask;
+    if (tile_HW == 16) {
+        exp_bit_mask = 0x0;
+    } else if (tile_HW == 32) {
+        exp_bit_mask = 0x1;
+    } else {
+        exp_bit_mask = 0x3;
+    }
 
     int num_elements_in_dword = 4;
-    uint32_t size_bytes = bfp8_tiles.size() * num_elements_in_dword;  // each uint32_t contains 4 BFP8 values
+    // 64-bit: counts/indices below overflow uint32 for tensors > 4 GB.
+    uint64_t size_bytes =
+        static_cast<uint64_t>(bfp8_tiles.size()) * num_elements_in_dword;  // each uint32_t contains 4 BFP8 values
     uint32_t single_bfp8_tile_size =
         tile.has_value() ? tile->get_tile_size(tt::DataFormat::Bfp8_b) : tile_size(tt::DataFormat::Bfp8_b);
     TT_ASSERT(size_bytes % single_bfp8_tile_size == 0);
-    uint32_t num_tiles = size_bytes / single_bfp8_tile_size;
+    uint64_t num_tiles = size_bytes / single_bfp8_tile_size;
 
     int data_index;
     int subtile_r;
@@ -77,10 +117,10 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
     uint32_t exp_word, sub_word_index;
 
     uint32_t num_float_in_tile = subtiles_in_tile_row * subtiles_in_tile_col * subtile_rows * subtile_cols;
-    uint32_t fp32_element_index = 0;
+    uint64_t fp32_element_index = 0;
     std::vector<float> float_vec;
     float_vec.resize(num_tiles * num_float_in_tile);
-    for (int tile_index = 0; tile_index < num_tiles; ++tile_index) {
+    for (uint64_t tile_index = 0; tile_index < num_tiles; ++tile_index) {
         for (int tr = 0; tr < subtiles_in_tile_row; ++tr) {
             for (int tc = 0; tc < subtiles_in_tile_col; ++tc) {
                 for (int i = 0; i < subtile_rows; ++i) {
@@ -90,15 +130,15 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
                         data_index =
                             (tr * (subtiles_in_tile_col * face_HW / 4) + tc * (face_HW / 4) + i * (face_W / 4) +
                              j / 4);  // Each uint32_t contains 4 BFP8 values. Divide data index by 4.
-                        int tile_and_data_index = data_index + (num_bfp8_in_tile * tile_index);
+                        int64_t tile_and_data_index = data_index + (num_bfp8_in_tile * tile_index);
 
-                        int exponent_index = (data_index >> 4) + (num_bfp8_in_tile * tile_index);
+                        int64_t exponent_index = (data_index >> 4) + (num_bfp8_in_tile * tile_index);
 
                         // Extract the uint32_t value that stores the shared exponent for this set
                         // of data. Each 32 bit word is shared amongst 64 datums
                         exp_word = bfp8_tiles[exponent_index];
 
-                        int num_exponent_words_skip = tile_index * num_exp_words;
+                        int64_t num_exponent_words_skip = tile_index * num_exp_words;
                         sub_word_index = ((tile_and_data_index - num_exponent_words_skip) >> 2) &
                                          exp_bit_mask;  // Extract the byte in which the shared exponent is stored. Each
                                                         // byte is shared amongst 16 datums.
@@ -147,14 +187,15 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
                         // Flush denormals to zero
                         // Check if shift > exp and mantissa is not zero
                         simde__m256i mask_shift_gt_exp = simde_mm256_cmpgt_epi32(shift_cnt, exp_vector);
-                        simde__m256i mask_nonzero_mantissa = simde_mm256_xor_si256(select_mask, simde_mm256_set1_epi32(-1));
+                        simde__m256i mask_nonzero_mantissa =
+                            simde_mm256_xor_si256(select_mask, simde_mm256_set1_epi32(-1));
                         simde__m256i mask_denormal = simde_mm256_and_si256(mask_shift_gt_exp, mask_nonzero_mantissa);
 
                         exp_vector = simde_mm256_blendv_epi8(
                             simde_mm256_sub_epi32(exp_vector, simde_mm256_add_epi32(rebias_offset, shift_cnt)),
                             simde_mm256_setzero_si256(),
                             select_mask);  // Choose new (rebiased exponent) or keep previous exponent based on mantissa
-                                           // intiial condition
+                                           // initial condition
 
                         sign = simde_mm256_sll_epi32(sign, simde_mm_set_epi64x(0, 31));              // Shift sign
                         exp_vector = simde_mm256_sll_epi32(exp_vector, simde_mm_set_epi64x(0, 23));  // Shift exp
@@ -166,7 +207,7 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
                         // Zero out lanes where mask_denormal is true
                         man = simde_mm256_blendv_epi8(man, simde_mm256_setzero_si256(), mask_denormal);
 
-                        uint32_t float_data_index;
+                        uint64_t float_data_index;
                         if (row_major_output) {
                             float_data_index = subtile_c + (tile_W * subtile_r) + (tile_index * num_float_in_tile);
                         } else {
@@ -180,49 +221,4 @@ std::vector<float> unpack_bfp8_tiles_into_float_vec(
         }
     }
     return float_vec;
-}
-
-std::vector<uint32_t> create_random_vector_of_bfp8(
-    uint32_t num_bytes, bool is_exp_a, int rand_max_float, int seed, float offset) {
-    uint32_t single_bfp8_tile_size = tile_size(tt::DataFormat::Bfp8_b);
-    TT_ASSERT(num_bytes % single_bfp8_tile_size == 0);
-    uint32_t num_tiles = num_bytes / single_bfp8_tile_size;
-
-    auto rand_float = std::bind(std::uniform_real_distribution<float>(0, rand_max_float), std::mt19937(seed));
-
-    int packed_data_size = num_bytes / sizeof(float);
-    int num_float_in_tile = 1024;
-    int float_data_size = num_tiles * num_float_in_tile;
-
-    std::vector<float> fp32_vec(float_data_size, 0);
-    for (int i = 0; i < fp32_vec.size(); i++) {
-        fp32_vec.at(i) = rand_float() + offset;
-    }
-
-    std::vector<uint32_t> packed_result = pack_fp32_vec_as_bfp8_tiles(fp32_vec, /*row_major_input=*/true, is_exp_a);
-
-    TT_ASSERT(packed_result.size() == packed_data_size);
-
-    return packed_result;
-}
-
-std::vector<uint32_t> create_constant_vector_of_bfp8(uint32_t num_bytes, float value, bool is_exp_a) {
-    uint32_t single_bfp8_tile_size = tile_size(tt::DataFormat::Bfp8_b);
-    TT_ASSERT(num_bytes % single_bfp8_tile_size == 0);
-    uint32_t num_tiles = num_bytes / single_bfp8_tile_size;
-
-    int packed_data_size = num_bytes / sizeof(float);
-    int num_float_in_tile = 1024;
-    int float_data_size = num_tiles * num_float_in_tile;
-
-    std::vector<float> fp32_vec(float_data_size, 0);
-    for (int i = 0; i < fp32_vec.size(); i++) {
-        fp32_vec.at(i) = value;
-    }
-
-    std::vector<uint32_t> packed_result = pack_fp32_vec_as_bfp8_tiles(fp32_vec, /*row_major_input=*/true, is_exp_a);
-
-    TT_ASSERT(packed_result.size() == packed_data_size);
-
-    return packed_result;
 }

@@ -15,6 +15,7 @@ of the device at the time of the hang. Watcher functionality includes:
 - Logged "waypoints" indicate which piece of code last executed on each RISC V
 - Sanitized NOC transactions prevent transactions with invalid coordinates or addresses from being submitted to the
   hardware and stops the offending RISC V via a soft hang
+- Circular buffer out-of-bounds detection for NOC transactions that touch an active CB
 - Memory corruption detection at address 0 of L1
 - Kernel paths and names of the currently executing kernel
 - Flags which indicate which RISC Vs are executing in the current kernel
@@ -46,6 +47,8 @@ Watcher features can be disabled individually using the following environment va
    export TT_METAL_WATCHER_DISABLE_NOC_SANITIZE=1
    export TT_METAL_WATCHER_DISABLE_WAYPOINT=1
    export TT_METAL_WATCHER_DISABLE_STACK_USAGE=1
+   export TT_METAL_WATCHER_DISABLE_ETH_LINK_STATUS=1
+   export TT_METAL_WATCHER_DISABLE_CB_SANITIZE=1
 
    # This feature is opt-in, set the env var to enable it
    export TT_METAL_WATCHER_ENABLE_NOC_SANITIZE_LINKED_TRANSACTION=1
@@ -56,6 +59,9 @@ Watcher features can be disabled individually using the following environment va
    # If the above doesn't work, and dispatch kernels (cq_prefetch.cpp, cq_dispatch.cpp) are still too large, compile out
    # debug tools on dispatch kernels.
    export TT_METAL_WATCHER_DISABLE_DISPATCH=1
+
+   # Similarly, if ethernet kernels are too large, compile out debug tools on ethernet cores.
+   export TT_METAL_WATCHER_DISABLE_ETH=1
 
    # If you need to see the physical coordinates in the watcher log (note that physical coordinates are not expected
    # to be used in host-side code).
@@ -250,3 +256,70 @@ transactions on BRISC core at location 0,0:
 .. code-block::
 
     TT_METAL_WATCHER=1 TT_METAL_WATCHER_DEBUG_DELAY=10 TT_METAL_READ_DEBUG_DELAY_CORES=0,0 TT_METAL_WRITE_DEBUG_DELAY_CORES=0,0 TT_METAL_READ_DEBUG_DELAY_RISCVS=BR TT_METAL_WRITE_DEBUG_DELAY_RISCVS=BR ./build/test/tt_metal/test_eltwise_binary
+
+Eth Link
+--------
+Before issuing an ethernet transaction, Watcher can check that the link is up.
+
+.. code-block:: c++
+
+    #include "debug/eth_link_status.h"  // Required in all kernels checking eth link status
+
+    FORCE_INLINE void eth_send_packet(uint32_t q_num, uint32_t src_word_addr, uint32_t dest_word_addr, uint32_t num_words) {
+        WATCHER_CHECK_ETH_LINK_STATUS();
+        while (eth_txq_is_busy(q_num));
+        eth_txq_reg_write(q_num, ETH_TXQ_TRANSFER_START_ADDR, src_word_addr << 4);
+        eth_txq_reg_write(q_num, ETH_TXQ_DEST_ADDR, dest_word_addr << 4);
+        eth_txq_reg_write(q_num, ETH_TXQ_TRANSFER_SIZE_BYTES, num_words << 4);
+        eth_txq_reg_write(q_num, ETH_TXQ_CMD, ETH_TXQ_CMD_START_DATA);
+    }
+
+If the link is down, the kernel will hang and a message with the logical, virtual and noc0 coordinates of the ethernet core attempting the transaction will be printed:
+
+.. code-block::
+
+    Device 0 acteth core(x= 0,y= 4) virtual(x=24,y=25): Watcher detected that active eth link on virtual core (x=24,y=25) (noc0 core: CoreCoord: (3, 1, ETH, NOC0)) went down after training.
+
+Circular Buffer Out-of-Bounds
+-----------------------------
+When NOC sanitization is enabled, the Watcher also checks that NOC read and write transactions which
+touch an active circular buffer stay within that buffer's allocated region. This catches cases where a
+kernel issues a NOC transfer that starts inside a CB but extends past its end, which can silently corrupt
+adjacent L1 memory.
+
+This check runs on BRISC and NCRISC only. It is enabled by default when the Watcher is on and can be
+disabled independently:
+
+.. code-block::
+
+   export TT_METAL_WATCHER_DISABLE_CB_SANITIZE=1
+
+If a violation is detected, the offending RISC V is stopped and an error is reported. Example output:
+
+.. code-block::
+
+    Device 0 worker core(x= 1,y= 0) virtual(x= 2,y= 2): NCRISC using noc0
+    tried to unicast read 112 bytes to local L1[0x17bce0] from Tensix core
+    w/ virtual coords (x=7,y=2) L1[addr=0x0017bf40]
+    (NOC transaction overflows a circular buffer).
+
+HW Exceptions (Quasar only)
+---------------------------
+When a HW exception occurs, the core will hang. When the watcher is enabled, the core will hang and an error will be reported on host.
+The error message will include a code for the cause of the exception:
+
+- 0: misaligned PC
+- 1: PC address fault
+- 2: Illegal instruction
+- 3: `ebreak` or HW breakpoint
+- 4: misaligned load
+- 5: Load access fault
+- 6: misaligned store
+- 7: Store access fault
+
+The error message will also include the PC value when the exception happened and the faulting address or instruction.
+
+.. code-block::
+
+    Device 0 worker core(x= 0,y= 0) virtual(x= 0,y= 1): DM7 hardware fault occurred at PC 0x9934.
+    Cause: 0x4, faulting address or instruction: 0x00000002

@@ -1,16 +1,16 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
-
-#include <dataflow_api_addrgen.h>
 
 #include <cstdint>
 #include <cstring>
 
-#include "dataflow_api.h"
-#include "tt-train/sources/ttml/metal/ops/common/dataflow_utils.hpp"
+#include "api/dataflow/dataflow_api.h"
+#include "internal/dataflow/dataflow_api_addrgen.h"
+#include "tt-train/sources/ttml/metal/common/dataflow_utils.hpp"
 
 void kernel_main() {
+    using namespace tt::constants;
     uint32_t runtime_args_counter = 0U;
     uint32_t input_address = get_arg_val<uint32_t>(runtime_args_counter++);        // input buffer address
     uint32_t target_address = get_arg_val<uint32_t>(runtime_args_counter++);       // target buffer address
@@ -29,7 +29,6 @@ void kernel_main() {
     constexpr uint32_t block_size = get_compile_time_arg_val(0);
     constexpr uint32_t Wt = get_compile_time_arg_val(1);
     constexpr uint32_t mask_w = get_compile_time_arg_val(2);
-    constexpr uint32_t target_indexes_page_size = get_compile_time_arg_val(3);
     constexpr uint32_t tiled_H = get_compile_time_arg_val(4);
     constexpr uint32_t target_indexes_read_page_size = get_compile_time_arg_val(5);
 
@@ -76,13 +75,10 @@ void kernel_main() {
     cb_push_back(cb_scaler_idx, onetile);
 
     const uint32_t tile_bytes = get_tile_size(cb_input_idx);
-    const DataFormat data_format = get_dataformat(cb_input_idx);
-
-    const InterleavedAddrGenFast</* is_dram */ true> input_address_generator = {
-        .bank_base_address = input_address, .page_size = tile_bytes, .data_format = data_format};
-
-    const InterleavedAddrGen</* is_dram */ true> target_indexes_address_generator = {
-        .bank_base_address = target_address, .page_size = target_indexes_page_size};
+    constexpr auto input_args = TensorAccessorArgs<6>();
+    constexpr auto target_args = TensorAccessorArgs<input_args.next_compile_time_args_offset()>();
+    const auto input_address_generator = TensorAccessor(input_args, input_address);
+    const auto target_indexes_address_generator = TensorAccessor(target_args, target_address);
 
     for (uint32_t i = 0; i < num_rows_to_process; ++i) {
         // calculate the address of the first tile in the row
@@ -96,17 +92,14 @@ void kernel_main() {
 
         auto [page, offset] = get_page_and_offset(start_row + i, tiled_H);
 
-        auto noc_async_target_indexes_page_addr = get_noc_addr(page, target_indexes_address_generator, offset);
+        auto noc_async_target_indexes_page_addr = target_indexes_address_generator.get_noc_addr(page, offset);
         noc_async_read(
             noc_async_target_indexes_page_addr,
             l1_target_indexes_write_addr,
             target_indexes_read_page_size);  // read the page from the target buffer
         noc_async_read_barrier();            // wait until all tiles are read
 
-        cb_reserve_back(cb_input_tile, onetile);
         cb_reserve_back(cb_target_logits, onetile);
-
-        uint32_t l1_input_tile_write_addr = get_write_ptr(cb_input_tile);
         uint32_t l1_target_logits_write_addr = get_write_ptr(cb_target_logits);
 
         auto target_indexes_l1_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_target_idx));
@@ -115,8 +108,14 @@ void kernel_main() {
 
             uint32_t target_value = target_indexes_l1_ptr[target_value_idx];
 
-            noc_async_read_tile(idx + (target_value / TILE_WIDTH), input_address_generator, l1_input_tile_write_addr);
-            noc_async_read_barrier();
+            // Read the tile containing the target value using read_tiles_by_row
+            read_tiles_by_row(
+                cb_input_tile,
+                input_address_generator,
+                idx + (target_value / TILE_WIDTH),
+                onetile,
+                tile_bytes,
+                onetile);
 
             auto read_input_tile_l1_ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_read_ptr(cb_input_tile));
 
@@ -126,47 +125,23 @@ void kernel_main() {
             auto idx_inside_tile = get_tilized_idx(h, target_value);  // only first row of the tile is used
             uint32_t inplace_idx = get_tilized_idx(h, 0);
             target_logits_write_l1_ptr[inplace_idx] = read_input_tile_l1_ptr[idx_inside_tile];
+
+            // Pop the tile after extracting the value - cb_input_tile is used as scratch space
+            cb_pop_front(cb_input_tile, onetile);
         }
 
         cb_push_back(cb_target_logits, onetile);
 
 #ifdef EVERYTHING_FITS_IN_L1
-        // read input buffer
-        cb_reserve_back(cb_input_idx, Wt);  // reserve Wt tiles in input buffer ==  wait until cb will has Wt tiles
-        uint32_t l1_write_addr = get_write_ptr(cb_input_idx);  // get the address of the first tile in the input buffer
-
-        for (uint32_t j = 0; j < Wt; ++j) {
-            noc_async_read_tile(
-                idx + j, input_address_generator, l1_write_addr);  // read the tile from the input buffer
-            l1_write_addr += tile_bytes;                           // move to the next tile
-        }
-        noc_async_read_barrier();        // wait until all tiles are read
-        cb_push_back(cb_input_idx, Wt);  // push the tile to the back of the input buffer
+        // read entire input row at once
+        read_tiles_by_row(cb_input_idx, input_address_generator, idx, Wt, tile_bytes, Wt);
 
 #else
         // read input buffer by blocks to calculate max value in row
-        for (uint32_t j = 0; j < Wt; j += block_size) {
-            cb_reserve_back(cb_input_idx, block_size);
-            uint32_t l1_write_addr = get_write_ptr(cb_input_idx);
-            for (uint32_t block_idx = 0; block_idx < block_size; ++block_idx) {
-                noc_async_read_tile(idx + j + block_idx, input_address_generator, l1_write_addr);
-                l1_write_addr += tile_bytes;
-            }
-            noc_async_read_barrier();
-            cb_push_back(cb_input_idx, block_size);
-        }
+        read_full_row_tiles(cb_input_idx, input_address_generator, Wt, block_size, tile_bytes, idx);
 
         // read input buffer by blocks to calculate sum(exp(x - max(x))) in row
-        for (uint32_t j = 0; j < Wt; j += block_size) {
-            cb_reserve_back(cb_input_idx, block_size);
-            uint32_t l1_write_addr = get_write_ptr(cb_input_idx);
-            for (uint32_t block_idx = 0; block_idx < block_size; ++block_idx) {
-                noc_async_read_tile(idx + j + block_idx, input_address_generator, l1_write_addr);
-                l1_write_addr += tile_bytes;
-            }
-            noc_async_read_barrier();
-            cb_push_back(cb_input_idx, block_size);
-        }
+        read_full_row_tiles(cb_input_idx, input_address_generator, Wt, block_size, tile_bytes, idx);
 
 #endif
     }

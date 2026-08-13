@@ -1,23 +1,21 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "compute_kernel_api.h"
-#include "compute_kernel_api/bcast.h"
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/eltwise_binary_sfpu.h"
-#include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
-#include "compute_kernel_api/eltwise_unary/recip.h"
-#include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
-#include "compute_kernel_api/eltwise_unary/sqrt.h"
-#include "compute_kernel_api/mask.h"
-#include "compute_kernel_api/reduce.h"
-#include "compute_kernel_api/tile_move_copy.h"
-
-namespace NAMESPACE {
+#include "api/compute/compute_kernel_api.h"
+#include "api/compute/bcast.h"
+#include "api/compute/common.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_binary_sfpu.h"
+#include "api/compute/eltwise_unary/eltwise_unary.h"
+#include "api/compute/eltwise_unary/recip.h"
+#include "api/compute/eltwise_unary/sfpu_split_includes.h"
+#include "api/compute/eltwise_unary/sqrt.h"
+#include "api/compute/mask.h"
+#include "api/compute/reduce.h"
+#include "api/compute/tile_move_copy.h"
 
 constexpr uint32_t num_rows_per_core = get_compile_time_arg_val(0);
 constexpr uint32_t block_size = get_compile_time_arg_val(1);
@@ -77,11 +75,11 @@ void calculate_sum_x_squared() {
             }
         }
         mul_binary_tile_init();
-        mul_binary_tile(working_register, working_register);
+        mul_binary_tile(working_register, working_register, working_register);
 
         if (col > 0) {
             add_binary_tile_init();
-            add_binary_tile(accum_register, working_register);
+            add_binary_tile(accum_register, working_register, accum_register);
         }
     }
     tile_regs_commit();
@@ -125,10 +123,10 @@ void calculate_sum_x_squared() {
             }
 
             mul_binary_tile_init();
-            mul_binary_tile(working_register, working_register);
+            mul_binary_tile(working_register, working_register, working_register);
             if (col > 0) {
                 add_binary_tile_init();
-                add_binary_tile(accum_register, working_register);
+                add_binary_tile(accum_register, working_register, accum_register);
             }
         }
 
@@ -160,7 +158,7 @@ void calculate_input_multiplied_by_gamma_and_divided_by_rms() {
 
         tile_regs_acquire();
         reconfig_data_format(cb_input, cb_gamma);
-        mul_bcast_rows_init_short(cb_input, cb_gamma);
+        mul_bcast_rows_init(cb_input, cb_gamma);
         for (uint32_t block_idx = 0; block_idx < block_size; ++block_idx) {
             mul_tiles_bcast_rows(cb_input, cb_gamma, col + block_idx, col + block_idx, block_idx);
         }
@@ -177,7 +175,7 @@ void calculate_input_multiplied_by_gamma_and_divided_by_rms() {
         cb_wait_front(cb_output_intermediate, block_size);
         tile_regs_acquire();
         reconfig_data_format(cb_output_intermediate, cb_inverse_rms_after_reduction_intermediate);
-        mul_bcast_cols_init_short(cb_output_intermediate, cb_inverse_rms_after_reduction_intermediate);
+        mul_bcast_cols_init(cb_output_intermediate, cb_inverse_rms_after_reduction_intermediate);
         for (uint32_t block_idx = 0; block_idx < block_size; ++block_idx) {
             mul_tiles_bcast_cols(
                 cb_output_intermediate,
@@ -220,7 +218,7 @@ void calculate_input_multiplied_by_gamma_and_divided_by_rms() {
 
         tile_regs_acquire();
         reconfig_data_format(cb_input, cb_gamma);
-        mul_bcast_rows_init_short(cb_input, cb_gamma);
+        mul_bcast_rows_init(cb_input, cb_gamma);
         for (uint32_t block_idx = 0; block_idx < block_size; ++block_idx) {
 #ifndef EVERYTHING_EXCEPT_GAMMA_FITS_IN_L1
             mul_tiles_bcast_rows(cb_input, cb_gamma, block_idx, block_idx, block_idx);
@@ -245,7 +243,7 @@ void calculate_input_multiplied_by_gamma_and_divided_by_rms() {
         cb_wait_front(cb_output_intermediate, block_size);
         tile_regs_acquire();
         reconfig_data_format(cb_output_intermediate, cb_inverse_rms_after_reduction_intermediate);
-        mul_bcast_cols_init_short(cb_output_intermediate, cb_inverse_rms_after_reduction_intermediate);
+        mul_bcast_cols_init(cb_output_intermediate, cb_inverse_rms_after_reduction_intermediate);
         for (uint32_t block_idx = 0; block_idx < block_size; ++block_idx) {
             mul_tiles_bcast_cols(
                 cb_output_intermediate,
@@ -276,7 +274,7 @@ void calculate_input_multiplied_by_gamma_and_divided_by_rms() {
 
 #endif
 
-void MAIN {
+void kernel_main() {
     cb_wait_front(cb_scaler, onetile);
     cb_wait_front(cb_eps, onetile);
 
@@ -285,7 +283,8 @@ void MAIN {
     }
 
     init_sfpu(cb_input, cb_output);
-    binary_op_init_common(cb_input, cb_gamma, cb_output);
+    // TODO(#52395): compute_kernel_hw_startup is a call-once API and should be the kernel's first Tensix-engine call, but here it follows another engine op (init_sfpu / a prior startup); see the issue.
+    compute_kernel_hw_startup(cb_input, cb_gamma, cb_output);
     for (uint32_t row = 0; row < num_rows_per_core; ++row) {
         calculate_sum_x_squared();
 
@@ -296,7 +295,7 @@ void MAIN {
             tile_regs_acquire();
 
             const uint32_t reduction_register = 0;
-            reconfig_data_format(cb_rms_before_reduction_intermediate, cb_scaler);
+            reconfig_data_format(cb_scaler, cb_rms_before_reduction_intermediate);
             reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(
                 cb_rms_before_reduction_intermediate, cb_scaler, cb_rms_after_reduction_intermediate);
             reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(
@@ -314,7 +313,7 @@ void MAIN {
 
             reconfig_data_format(cb_rms_before_reduction_intermediate, cb_eps);
             add_binary_tile_init();
-            add_binary_tile(reduction_register, eps_register);
+            add_binary_tile(reduction_register, eps_register, reduction_register);
 
             sqrt_tile_init();
             sqrt_tile(reduction_register);
@@ -384,5 +383,3 @@ void MAIN {
         cb_pop_front(cb_mask, onetile);
     }
 }
-
-}  // namespace NAMESPACE

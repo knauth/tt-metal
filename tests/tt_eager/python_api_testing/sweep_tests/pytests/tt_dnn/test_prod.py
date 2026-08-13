@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023-24 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023-24 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -16,7 +16,7 @@ from tests.tt_eager.python_api_testing.sweep_tests import (
 from tests.tt_eager.python_api_testing.sweep_tests.run_pytorch_ci_tests import (
     run_single_pytorch_test,
 )
-from models.utility_functions import skip_for_blackhole
+from models.common.utility_functions import skip_for_blackhole
 
 
 mem_configs = [

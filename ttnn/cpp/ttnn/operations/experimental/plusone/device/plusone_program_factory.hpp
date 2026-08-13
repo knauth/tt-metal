@@ -1,13 +1,18 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
-#include "ttnn/run_operation.hpp"
 
-namespace ttnn::operations::experimental::detail {
+#pragma once
 
-using namespace tt::constants;
+#include "plusone_device_operation_types.hpp"
+#include "ttnn/device_operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
 
-tt::tt_metal::operation::ProgramWithCallbacks plusone_single_core(
-    const Tensor& input, const std::optional<CoreRangeSet>& sub_core_grids);
+namespace ttnn::experimental::prim {
 
-}  // namespace ttnn::operations::experimental::detail
+struct PlusOneProgramFactory {
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const PlusoneParams& operation_attributes, const Tensor& input, Tensor& tensor_return_value);
+};
+
+}  // namespace ttnn::experimental::prim

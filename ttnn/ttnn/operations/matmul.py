@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,7 +6,8 @@ import math
 from typing import Optional, Tuple
 
 import ttnn
-
+from ttnn.decorators import get_golden_function
+from ttnn.operations.activations import get_golden_function_for_activation
 
 MatmulProgramConfig = ttnn._ttnn.operations.matmul.MatmulProgramConfig
 MatmulMultiCoreReuseProgramConfig = ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseProgramConfig
@@ -15,10 +16,27 @@ MatmulMultiCoreReuseMultiCast1DProgramConfig = ttnn._ttnn.operations.matmul.Matm
 MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig = (
     ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig
 )
+MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig = (
+    ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig
+)
+MatmulParams = ttnn._ttnn.operations.matmul.MatmulParams
+MatmulInputs = ttnn._ttnn.operations.matmul.MatmulInputs
+MatmulDeviceOperation = ttnn._ttnn.operations.matmul.MatmulDeviceOperation
+MatmulMultiCoreReuseOptimizedProgramFactory = ttnn._ttnn.operations.matmul.MatmulMultiCoreReuseOptimizedProgramFactory
+create_matmul_attributes = ttnn._ttnn.operations.matmul.create_matmul_attributes
+matmul_select_program_factory = ttnn._ttnn.operations.matmul.matmul_select_program_factory
 
 
 def _golden_function(
-    input_tensor_a, input_tensor_b, transpose_a=False, transpose_b=False, *, bias=None, activation=None, **kwargs
+    input_tensor_a,
+    input_tensor_b,
+    transpose_a=False,
+    transpose_b=False,
+    *,
+    bias=None,
+    activation=None,
+    program_config=None,
+    **kwargs,
 ):
     import torch
 
@@ -28,12 +46,14 @@ def _golden_function(
         input_tensor_b = input_tensor_b.transpose(-1, -2)
     output_tensor = input_tensor_a @ input_tensor_b.to(input_tensor_a.dtype)
 
-    if activation == "gelu":
-        output_tensor = torch.nn.functional.gelu(output_tensor)
-    elif activation == "relu":
-        output_tensor = torch.nn.functional.relu(output_tensor)
+    # First check if there is a fused activation in the program config
+    if program_config is not None and hasattr(program_config, "fused_activation") and program_config.fused_activation:
+        program_config_activation = program_config.fused_activation.op_type
+        output_tensor = get_golden_function_for_activation(program_config_activation)(output_tensor)
+
+    # Do the composite op activation function if it is requested
     elif activation is not None:
-        raise RuntimeError(f"{activation} is not supported as activation function")
+        output_tensor = get_golden_function_for_activation(activation)(output_tensor)
 
     while len(output_tensor.shape) > len(input_tensor_a.shape):
         output_tensor = output_tensor.squeeze(0)
@@ -47,7 +67,15 @@ ttnn.attach_golden_function(
 
 
 def _golden_function(
-    input_tensor_a, input_tensor_b, transpose_a=False, transpose_b=False, *, bias=None, activation=None, **kwargs
+    input_tensor_a,
+    input_tensor_b,
+    transpose_a=False,
+    transpose_b=False,
+    *,
+    bias=None,
+    program_config=None,
+    activation=None,
+    **kwargs,
 ):
     import torch
 
@@ -64,14 +92,14 @@ def _golden_function(
             bias = bias[0]
         output_tensor += bias
 
-    if activation == "gelu":
-        output_tensor = torch.nn.functional.gelu(output_tensor)
-    elif activation == "relu":
-        output_tensor = torch.nn.functional.relu(output_tensor)
-    elif activation == "silu":
-        output_tensor = torch.nn.functional.silu(output_tensor)
+    # First check if there is a fused activation in the program config
+    if program_config is not None and hasattr(program_config, "fused_activation") and program_config.fused_activation:
+        program_config_activation = program_config.fused_activation.op_type
+        output_tensor = get_golden_function_for_activation(program_config_activation)(output_tensor)
+
+    # Do the composite op activation function if it is requested
     elif activation is not None:
-        raise RuntimeError(f"{activation} is not supported as activation function")
+        output_tensor = get_golden_function_for_activation(activation)(output_tensor)
 
     while len(output_tensor.shape) > len(input_tensor_a.shape):
         output_tensor = output_tensor.squeeze(0)

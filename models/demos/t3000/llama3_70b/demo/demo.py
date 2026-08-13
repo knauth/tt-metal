@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,6 +7,8 @@ from loguru import logger
 
 from models.demos.t3000.llama2_70b.demo.demo import construct_arg, main
 from models.demos.t3000.llama2_70b.tt.llama_common import check_mesh_device, setup_llama_env
+from models.demos.utils.trace_region_sizes import TRACE_MODEL_KEY_PARAM
+from tests.tests_common.skip_reasons import LEGACY_CCL_SKIP
 
 
 @pytest.mark.timeout(240000)
@@ -61,7 +63,7 @@ from models.demos.t3000.llama2_70b.tt.llama_common import check_mesh_device, set
     ((32, 2048), (16, 8192), (1, 128 * 1024)),
     ids=("short_context", "long_context", "128k_context"),
 )
-@pytest.mark.parametrize("device_params", [{"trace_region_size": 14227456}], indirect=True)
+@pytest.mark.parametrize("device_params", [{TRACE_MODEL_KEY_PARAM: "llama3.1-70b-legacy"}], indirect=True)
 def test_LlamaModel_demo(
     # model args
     implementation,
@@ -76,7 +78,7 @@ def test_LlamaModel_demo(
     temperature,
     chat,
     # TT args
-    t3k_mesh_device,
+    mesh_device,
     n_devices,
     decode_only,
     trace_mode,
@@ -85,6 +87,9 @@ def test_LlamaModel_demo(
     max_batch_size,
     max_context_len,
 ):
+    if implementation == "tt" and n_devices > 1 and decode_only is True:
+        pytest.skip(LEGACY_CCL_SKIP)
+
     logger.info("Running LlamaModel demo")
     ## Get model config
 
@@ -92,7 +97,7 @@ def test_LlamaModel_demo(
         llama_version=llama_version,
     )
 
-    check_mesh_device(t3k_mesh_device, model_config)
+    check_mesh_device(mesh_device, model_config)
 
     args = construct_arg(
         implementation=implementation,
@@ -109,7 +114,7 @@ def test_LlamaModel_demo(
         top_k=top_k,
         temperature=temperature,
         chat=chat,
-        mesh_device=t3k_mesh_device,
+        mesh_device=mesh_device,
         n_devices=n_devices,
         cache_path=cache_path,
         decode_only=decode_only,

@@ -1,21 +1,19 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include <limits>
+#include <cstdint>
 
 #include "ckernel.h"
 #include "ckernel_defs.h"
-#include "sfpu/ckernel_sfpu_converter.h"
-#include "noc_nonblocking_api.h"
 #include "sfpi.h"
+#include "ckernel_sfpu_conversions.h"
+#include "sfpu/ckernel_sfpu_converter.h"
 
-using namespace sfpi;
-
-namespace ckernel {
-namespace sfpu {
+namespace ckernel::sfpu {
 
 enum {
     ADD = 0,
@@ -26,12 +24,13 @@ enum {
 };  // BINOP_MODE
 
 template <bool APPROXIMATION_MODE, int BINOP_MODE, int ITERATIONS = 8>
-void calculate_binop_with_scalar(uint32_t param) {
-    const vFloat parameter = Converter::as_float(param);
+void calculate_binop_with_scalar(std::uint32_t param) {
+    const sfpi::vFloat parameter = Converter::as_float(param);
 
+#pragma GCC unroll 8
     for (int d = 0; d < ITERATIONS; d++) {
-        vFloat val = dst_reg[0];
-        vFloat result = 0.0f;
+        sfpi::vFloat val = sfpi::dst_reg[0];
+        sfpi::vFloat result = 0.0f;
 
         if constexpr (BINOP_MODE == ADD) {
             result = val + parameter;
@@ -44,38 +43,63 @@ void calculate_binop_with_scalar(uint32_t param) {
             result = val * parameter;
         } else if constexpr (BINOP_MODE == RSUB) {
             result = parameter - val;
+
+            // This correction is added for logit(x) = log(x/(1-x)) since bf16 dest stores
+            // truncate fp32->bf16 by default, but torch computes rsub result in bf16 with IEEE
+            // round-to-nearest-even. The resulting small error is amplified by the log operation.
+            if constexpr (!DST_ACCUM_MODE) {
+                result = float32_to_bf16_rne(result);
+            }
         }
 
-        dst_reg[0] = result;
-        dst_reg++;
+        sfpi::dst_reg[0] = result;
+        sfpi::dst_reg++;
     }
 }
 
 template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
-void calculate_add(uint32_t param) {
+void calculate_add(std::uint32_t param) {
     calculate_binop_with_scalar<APPROXIMATION_MODE, ADD, ITERATIONS>(param);
-    return;
 }
 template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
-void calculate_sub(uint32_t param) {
+void calculate_sub(std::uint32_t param) {
     calculate_binop_with_scalar<APPROXIMATION_MODE, SUB, ITERATIONS>(param);
-    return;
 }
 template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
-void calculate_mul(uint32_t param) {
+void calculate_mul(std::uint32_t param) {
     calculate_binop_with_scalar<APPROXIMATION_MODE, MUL, ITERATIONS>(param);
-    return;
 }
 template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
-void calculate_div(uint32_t param) {
+void calculate_div(std::uint32_t param) {
     calculate_binop_with_scalar<APPROXIMATION_MODE, DIV, ITERATIONS>(param);
-    return;
 }
 template <bool APPROXIMATION_MODE, int ITERATIONS = 8>
-void calculate_rsub(uint32_t param) {
+void calculate_rsub(std::uint32_t param) {
     calculate_binop_with_scalar<APPROXIMATION_MODE, RSUB, ITERATIONS>(param);
-    return;
 }
 
-}  // namespace sfpu
-}  // namespace ckernel
+template <bool APPROXIMATION_MODE, int ITERATIONS>
+void calculate_add_int32(std::uint32_t scalar) {
+    // dst (int32, 2's complement) + scalar
+    const sfpi::vInt s = static_cast<int>(scalar);
+#pragma GCC unroll 8
+    for (int d = 0; d < ITERATIONS; d++) {
+        sfpi::vInt a = sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>();
+        sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = a + s;
+        sfpi::dst_reg++;
+    }
+}
+
+template <bool APPROXIMATION_MODE, int ITERATIONS>
+void calculate_sub_int32(std::uint32_t scalar) {
+    // dst (int32, 2's complement) - scalar
+    const sfpi::vInt s = static_cast<int>(scalar);
+#pragma GCC unroll 8
+    for (int d = 0; d < ITERATIONS; d++) {
+        sfpi::vInt a = sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>();
+        sfpi::dst_reg[0].mode<sfpi::DataLayout::I32>() = a - s;
+        sfpi::dst_reg++;
+    }
+}
+
+}  // namespace ckernel::sfpu

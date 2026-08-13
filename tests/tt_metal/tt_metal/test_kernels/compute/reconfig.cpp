@@ -1,17 +1,17 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/eltwise_unary/sfpu_split_includes.h"
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/pack.h"
-#include "compute_kernel_api/reconfig_data_format.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/eltwise_unary/sfpu_split_includes.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/pack.h"
+#include "api/compute/reconfig_data_format.h"
+#include "api/dataflow/circular_buffer.h"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t num_tiles = get_arg_val<uint32_t>(0);
     uint32_t ublock_size_tiles = get_arg_val<uint32_t>(1);
 
@@ -21,15 +21,21 @@ void MAIN {
     constexpr auto cb_out0 = tt::CBIndex::c_16;  // Fp32
     constexpr auto cb_out1 = tt::CBIndex::c_17;  // Bfp8_b
 
-    binary_op_init_common(cb_in0, cb_in1, cb_out0);
-    binary_tiles_init<false, ELWADD>(cb_in0, cb_in1);
-    for (uint32_t block = 0; block < num_tiles; ++block) {
-        cb_wait_front(cb_in0, ublock_size_tiles);
-        cb_wait_front(cb_in1, ublock_size_tiles);
-        cb_reserve_back(cb_out0, ublock_size_tiles);
-        cb_reserve_back(cb_out1, ublock_size_tiles);
+    CircularBuffer cbin0(tt::CBIndex::c_0);
+    CircularBuffer cbin1(tt::CBIndex::c_1);
+    CircularBuffer cbin2(tt::CBIndex::c_2);
+    CircularBuffer cbout0(tt::CBIndex::c_16);
+    CircularBuffer cbout1(tt::CBIndex::c_17);
 
-        acquire_dst();
+    compute_kernel_hw_startup(cb_in0, cb_in1, cb_out0);
+    binary_tiles_init<false, EltwiseBinaryType::ELWADD>(cb_in0, cb_in1);
+    for (uint32_t block = 0; block < num_tiles; ++block) {
+        cbin0.wait_front(ublock_size_tiles);
+        cbin1.wait_front(ublock_size_tiles);
+        cbout0.reserve_back(ublock_size_tiles);
+        cbout1.reserve_back(ublock_size_tiles);
+
+        tile_regs_acquire();
 
         // ------------------------- Copy to DEST -----------------------------
 
@@ -40,20 +46,17 @@ void MAIN {
         // This call will test copy_tile_to_dst_init_short as well
         copy_tile_to_dst_init_short_with_dt(cb_in0, cb_in2);
 
-        cb_wait_front(cb_in2, ublock_size_tiles);
+        cbin2.wait_front(ublock_size_tiles);
 #if (BLOCK_COPY == 1)
         for (uint32_t u_cnt = 0; u_cnt < ublock_size_tiles; u_cnt++) {
             copy_tile(cb_in2, 0, 0);
         }
 #elif (BLOCK_COPY == 0)
-        copy_block_matmul_partials(cb_in2, 0, 0, ublock_size_tiles);
+        copy_block(cb_in2, 0, 0, ublock_size_tiles);
 #endif
-        cb_pop_front(cb_in2, ublock_size_tiles);
+        cbin2.pop_front(ublock_size_tiles);
 
         // -------------------- Addition with acc -----------------------------
-
-        // Init like CB_0 is in A and CB_1 is in B
-        add_tiles_init(cb_in0, cb_in1, true);
 
         // Reconfigure UNPACK for correct source formats, tests reconfig calls
 #if (EXPLICIT_RECONFIG == 1)
@@ -76,9 +79,15 @@ void MAIN {
 #endif  // SPLIT_SRC_RECONFIG
 #endif  // EXPLICIT_RECONFIG
 
+        // Init like CB_0 is in A and CB_1 is in B
+        add_init(cb_in1, cb_in0, true);
+
         for (uint32_t i = 0; i < ublock_size_tiles; ++i) {
             add_tiles(cb_in1, cb_in0, i, i, i);
         }
+
+        tile_regs_commit();
+        tile_regs_wait();
 
         // ----------------------- Pack to 2 outs -----------------------------
 
@@ -87,7 +96,7 @@ void MAIN {
         pack_reconfig_l1_acc(true);
 #endif
         // Configured already for CB_16, Bfp16_b
-        pack_tile_block(0, cb_out0, ublock_size_tiles);
+        pack_block(0, cb_out0, ublock_size_tiles);
         // Reconfig for CB_17, Bfp8_b, then pack to CB_17
 #if (EXPLICIT_RECONFIG == 1)
         // Indices for old_output, new_output
@@ -99,13 +108,12 @@ void MAIN {
         // Not testing for L1 accumulation
         pack_reconfig_l1_acc(false);
 
-        pack_tile_block(0, cb_out1, ublock_size_tiles);
-        release_dst();
+        pack_block(0, cb_out1, ublock_size_tiles);
+        tile_regs_release();
 
-        cb_pop_front(cb_in0, ublock_size_tiles);
-        cb_pop_front(cb_in1, ublock_size_tiles);
-        cb_push_back(cb_out0, ublock_size_tiles);
-        cb_push_back(cb_out1, ublock_size_tiles);
+        cbin0.pop_front(ublock_size_tiles);
+        cbin1.pop_front(ublock_size_tiles);
+        cbout0.push_back(ublock_size_tiles);
+        cbout1.push_back(ublock_size_tiles);
     }
 }
-}  // namespace NAMESPACE

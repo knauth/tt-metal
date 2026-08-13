@@ -1,16 +1,23 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
+#include <utility>
+#include <limits>
 
+#include "api/debug/assert.h"
 #include "tt_metal/fabric/hw/inc/edm_fabric/named_types.hpp"
 
-#include "tt_metal/hw/inc/utils/utils.h"
-#include "risc_attribs.h"
+#include "api/alignment.h"
+#include "internal/risc_attribs.h"
+
+#include "api/debug/assert.h"
 
 namespace tt::tt_fabric {
 
@@ -182,6 +189,104 @@ struct ChannelCounter {
 
     FORCE_INLINE uint32_t distance_behind(const ChannelCounter& leading_counter) const {
         return leading_counter.counter - this->counter;
+    }
+};
+
+/*
+ * Tracks receiver channel pointers (from sender side)
+ */
+template <uint8_t RECEIVER_NUM_BUFFERS>
+struct OutboundReceiverChannelPointers {
+    uint32_t slot_size_bytes;
+    uint32_t remote_receiver_channel_address_base;
+    uint32_t remote_receiver_channel_address_ptr;
+    uint32_t remote_receiver_channel_address_last;
+    uint32_t num_free_slots;
+
+    FORCE_INLINE void init() {
+        this->slot_size_bytes = 0U;
+        this->remote_receiver_channel_address_base = 0U;
+        this->remote_receiver_channel_address_ptr = 0U;
+        this->remote_receiver_channel_address_last = 0U;
+        this->num_free_slots = RECEIVER_NUM_BUFFERS;
+    }
+
+    FORCE_INLINE void init(uint32_t const remote_receiver_buffer_address, uint32_t const slot_size_bytes) {
+        this->slot_size_bytes = slot_size_bytes;
+        this->remote_receiver_channel_address_base = remote_receiver_buffer_address;
+        this->remote_receiver_channel_address_ptr = remote_receiver_buffer_address;
+        this->remote_receiver_channel_address_last = remote_receiver_buffer_address + ((RECEIVER_NUM_BUFFERS - 1U) * slot_size_bytes);
+        this->num_free_slots = RECEIVER_NUM_BUFFERS;
+    }
+
+    FORCE_INLINE bool has_space_for_packet() const { return num_free_slots; }
+
+    FORCE_INLINE void advance_remote_receiver_buffer_pointer() {
+        bool const is_last_buffer = remote_receiver_channel_address_ptr == remote_receiver_channel_address_last;
+        remote_receiver_channel_address_ptr += slot_size_bytes;
+        if(is_last_buffer) {
+            remote_receiver_channel_address_ptr = remote_receiver_channel_address_base;
+        }
+    }
+};
+
+/*
+ * Tracks receiver channel pointers (from receiver side). Must call reset() before using.
+ */
+template <uint8_t RECEIVER_NUM_BUFFERS>
+struct ReceiverChannelPointers {
+    ChannelCounter<RECEIVER_NUM_BUFFERS> wr_sent_counter;
+    ChannelCounter<RECEIVER_NUM_BUFFERS> wr_flush_counter;
+    ChannelCounter<RECEIVER_NUM_BUFFERS> ack_counter;
+    ChannelCounter<RECEIVER_NUM_BUFFERS> completion_counter;
+    std::array<uint8_t, RECEIVER_NUM_BUFFERS> src_chan_ids;
+
+    FORCE_INLINE void set_src_chan_id(BufferIndex buffer_index, uint8_t src_chan_id) {
+        src_chan_ids[buffer_index.get()] = src_chan_id;
+    }
+
+    FORCE_INLINE uint8_t get_src_chan_id(BufferIndex buffer_index) const { return src_chan_ids[buffer_index.get()]; }
+
+    FORCE_INLINE uint8_t get_src_chan_id() const { return src_chan_ids[0]; }
+
+    FORCE_INLINE void init() { reset(); }
+
+    FORCE_INLINE void reset() {
+        wr_sent_counter.reset();
+        wr_flush_counter.reset();
+        ack_counter.reset();
+        completion_counter.reset();
+    }
+};
+
+// Forward‐declare the Impl primary template:
+template <template <uint8_t> class ChannelType, auto& BufferSizes, typename Seq>
+struct ChannelPointersTupleImpl;
+
+// Provide the specialization that actually holds the tuple and `get<>`:
+template <template <uint8_t> class ChannelType, auto& BufferSizes, size_t... Is>
+struct ChannelPointersTupleImpl<ChannelType, BufferSizes, std::index_sequence<Is...>> {
+    static constexpr size_t N = sizeof...(Is);
+    std::tuple<ChannelType<BufferSizes[Is]>...> channel_ptrs;
+
+    template <size_t I>
+    constexpr auto& get() {
+        return std::get<I>(channel_ptrs);
+    }
+};
+
+// Simplify the "builder" so that make() returns the Impl<…> directly:
+template <template <uint8_t> class ChannelType, auto& BufferSizes>
+struct ChannelPointersTuple {
+    static constexpr size_t N = std::size(BufferSizes);
+
+    static constexpr auto make() {
+        // call init() on each element and return it
+        auto channel_ptrs = ChannelPointersTupleImpl<ChannelType, BufferSizes, std::make_index_sequence<N>>{};
+        std::apply(
+            [&](auto&... chans) { ((chans.init()), ...); },
+            channel_ptrs.channel_ptrs);  // Apply to the actual tuple member
+        return channel_ptrs;
     }
 };
 

@@ -1,12 +1,17 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dataflow_api.h"
-#include "ttnn/deprecated/tt_dnn/kernels/dataflow/moreh_common.hpp"
+#include "api/dataflow/dataflow_api.h"
+#include "ttnn/kernel/dataflow/moreh_common.hpp"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/core_local_mem.h"
+#include "api/tensor/noc_traits.h"
 
 template <typename T>
 void write_mean_rstd(
+    const Noc& noc,
     uint32_t cb_id,
     uint32_t tile_offset,
     uint32_t num_inner,
@@ -17,15 +22,17 @@ void write_mean_rstd(
     uint32_t Ht,
     uint32_t Wt,
     T addrg) {
+    using namespace tt::constants;
     constexpr uint32_t onetile = 1;
 
+    DataflowBuffer dfb(cb_id);
     const uint32_t cb_tile_bytes = get_tile_size(cb_id);
     const auto cb_dtype_bytes = cb_tile_bytes / (TILE_HEIGHT * TILE_WIDTH);
 
-    cb_wait_front(cb_id, onetile);
+    dfb.wait_front(onetile);
 
-    uint32_t output_l1_write_addr = get_read_ptr(cb_id);
-    auto l1_ptr = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(output_l1_write_addr);
+    uint32_t output_l1_write_addr = dfb.get_read_ptr();
+    CoreLocalMem<volatile uint16_t> l1_ptr(output_l1_write_addr);
 
     uint32_t output_tile_offset = tile_offset / num_inner;
 
@@ -47,12 +54,13 @@ void write_mean_rstd(
 
             auto src_idx = get_tilized_idx(0, src_h * FACE_WIDTH);
 
-            auto dst_noc_addr = get_noc_addr(noc_id, addrg);
-            noc_async_write(
-                output_l1_write_addr + src_idx * cb_dtype_bytes,
-                dst_noc_addr + tilized_idx * cb_dtype_bytes,
-                cb_dtype_bytes * FACE_HEIGHT);
-            noc_async_write_barrier();
+            noc.async_write(
+                dfb,
+                addrg,
+                cb_dtype_bytes * FACE_HEIGHT,
+                {.offset_bytes = src_idx * cb_dtype_bytes},
+                {.page_id = noc_id, .offset_bytes = tilized_idx * cb_dtype_bytes});
+            noc.async_write_barrier();
         }
     } else {
         auto output_idx = output_tile_offset + outer_idx;
@@ -73,18 +81,20 @@ void write_mean_rstd(
             l1_ptr[tilized_idx] = l1_ptr[0];
         }
 
-        auto dst_noc_addr = get_noc_addr(noc_id, addrg);
-        noc_async_write(
-            output_l1_write_addr + tilized_idx * cb_dtype_bytes,
-            dst_noc_addr + tilized_idx * cb_dtype_bytes,
-            cb_dtype_bytes);
-        noc_async_write_barrier();
+        noc.async_write(
+            dfb,
+            addrg,
+            cb_dtype_bytes,
+            {.offset_bytes = tilized_idx * cb_dtype_bytes},
+            {.page_id = noc_id, .offset_bytes = tilized_idx * cb_dtype_bytes});
+        noc.async_write_barrier();
     }
 
-    cb_pop_front(cb_id, onetile);
+    dfb.pop_front(onetile);
 }
 
 void kernel_main() {
+    using namespace tt::constants;
     const auto output_addr = get_arg_val<uint32_t>(0);
     const auto mean_addr = get_arg_val<uint32_t>(1);
     const auto rstd_addr = get_arg_val<uint32_t>(2);
@@ -95,12 +105,12 @@ void kernel_main() {
     const auto mean_rstd_width = get_arg_val<uint32_t>(7);
     const auto normalized_dims = get_arg_val<uint32_t>(8);
 
-    constexpr bool output_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr bool mean_is_dram = get_compile_time_arg_val(1) == 1;
-    constexpr bool rstd_is_dram = get_compile_time_arg_val(2) == 1;
-    constexpr bool mean_has_value = get_compile_time_arg_val(3) == 1;
-    constexpr bool rstd_has_value = get_compile_time_arg_val(4) == 1;
-    constexpr uint32_t block_size = get_compile_time_arg_val(5);
+    constexpr bool mean_has_value = get_compile_time_arg_val(0) == 1;
+    constexpr bool rstd_has_value = get_compile_time_arg_val(1) == 1;
+    constexpr uint32_t block_size = get_compile_time_arg_val(2);
+    constexpr auto output_args = TensorAccessorArgs<3>();
+    constexpr auto mean_args = TensorAccessorArgs<output_args.next_compile_time_args_offset()>();
+    constexpr auto rstd_args = TensorAccessorArgs<mean_args.next_compile_time_args_offset()>();
 
     constexpr uint32_t cb_id_output = tt::CBIndex::c_16;
     constexpr uint32_t cb_id_mean = tt::CBIndex::c_17;
@@ -108,24 +118,13 @@ void kernel_main() {
 
     // output
     const uint32_t output_tile_bytes = get_tile_size(cb_id_output);
-    const auto output_data_format = get_dataformat(cb_id_output);
-
-    const InterleavedAddrGenFast<output_is_dram> output_addrg = {
-        .bank_base_address = output_addr, .page_size = output_tile_bytes, .data_format = output_data_format};
+    const auto output_addrg = TensorAccessor(output_args, output_addr);
 
     // mean
-    const uint32_t mean_tile_bytes = get_tile_size(cb_id_mean);
-    const auto mean_data_format = get_dataformat(cb_id_mean);
-
-    const InterleavedAddrGenFast<mean_is_dram> mean_addrg = {
-        .bank_base_address = mean_addr, .page_size = mean_tile_bytes, .data_format = mean_data_format};
+    const auto mean_addrg = TensorAccessor(mean_args, mean_addr);
 
     // rstd
-    const uint32_t rstd_tile_bytes = get_tile_size(cb_id_rstd);
-    const auto rstd_data_format = get_dataformat(cb_id_rstd);
-
-    const InterleavedAddrGenFast<rstd_is_dram> rstd_addrg = {
-        .bank_base_address = rstd_addr, .page_size = rstd_tile_bytes, .data_format = rstd_data_format};
+    const auto rstd_addrg = TensorAccessor(rstd_args, rstd_addr);
 
     uint32_t offs = 0;
     constexpr uint32_t onetile = 1;
@@ -133,9 +132,13 @@ void kernel_main() {
     uint32_t Wt = (mean_rstd_width + TILE_WIDTH - 1) / TILE_WIDTH;
     uint32_t Ht = (mean_rstd_height + TILE_HEIGHT - 1) / TILE_HEIGHT;
 
+    Noc noc;
+    DataflowBuffer dfb_output(cb_id_output);
+
     for (uint32_t outer_idx = 0; outer_idx < num_rows_per_core; outer_idx++) {
         if (mean_has_value) {
             write_mean_rstd(
+                noc,
                 cb_id_mean,
                 tile_offset,
                 num_inner,
@@ -150,6 +153,7 @@ void kernel_main() {
 
         if (rstd_has_value) {
             write_mean_rstd(
+                noc,
                 cb_id_rstd,
                 tile_offset,
                 num_inner,
@@ -164,14 +168,17 @@ void kernel_main() {
 
         // output
         for (uint32_t inner_idx = 0; inner_idx < num_inner; inner_idx += block_size) {
-            cb_wait_front(cb_id_output, block_size);
-            auto output_l1_read_addr = get_read_ptr(cb_id_output);
+            dfb_output.wait_front(block_size);
             for (uint32_t r = 0; r < block_size; r++) {
-                noc_async_write_tile(offs + inner_idx + r + tile_offset, output_addrg, output_l1_read_addr);
-                output_l1_read_addr += output_tile_bytes;
+                noc.async_write(
+                    dfb_output,
+                    output_addrg,
+                    output_tile_bytes,
+                    {.offset_bytes = r * output_tile_bytes},
+                    {.page_id = offs + inner_idx + r + tile_offset});
             }
-            noc_async_write_barrier();
-            cb_pop_front(cb_id_output, block_size);
+            noc.async_write_barrier();
+            dfb_output.pop_front(block_size);
         }  // num_inner loop
 
         offs += num_inner;

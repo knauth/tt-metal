@@ -1,14 +1,14 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "compute_kernel_api/tile_move_copy.h"
-#include "compute_kernel_api/matmul.h"
+#include "api/compute/tile_move_copy.h"
+#include "api/compute/matmul.h"
+#include "api/compute/compute_kernel_hw_startup.h"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t in0_block_w = get_compile_time_arg_val(0);              // inner block size in tiles
     uint32_t in0_num_subblocks = get_compile_time_arg_val(1);        // outer row block size (in inner row blocks)
     uint32_t in0_block_num_tiles = get_compile_time_arg_val(2);      // out_subblock_h*in0_block_w*in0_num_subblocks;
@@ -27,7 +27,8 @@ void MAIN {
     uint32_t out_cb_id = tt::CBIndex::c_16;
     uint32_t mm_partials_cb_id = tt::CBIndex::c_24;
 
-    mm_init(in0_cb_id, in1_cb_id, out_cb_id);
+    compute_kernel_hw_startup<SrcOrder::Reverse>(in0_cb_id, in1_cb_id, out_cb_id);
+    matmul_init(in0_cb_id, in1_cb_id);
 
     for (uint32_t b = 0; b < batch; b++) {
         bool spill = num_blocks > 1;
@@ -43,7 +44,7 @@ void MAIN {
             for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; in0_subblock++) {
                 int in1_index_subblock_offset = 0;
                 for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; in1_subblock++) {
-                    acquire_dst();
+                    tile_regs_acquire();
 
                     if (enable_reload) {
                         // Reconfigure input
@@ -54,7 +55,8 @@ void MAIN {
                         }
                         cb_pop_front(mm_partials_cb_id, out_subblock_num_tiles);
                         // Reconfigure srcA back
-                        mm_init_short_with_dt(in0_cb_id, in1_cb_id, mm_partials_cb_id);
+                        reconfig_data_format_srca(mm_partials_cb_id, in1_cb_id);
+                        matmul_init(in0_cb_id, in1_cb_id);
                     }
 
                     // Compute output sub-block from in0_subblock x in1_subblock
@@ -66,14 +68,16 @@ void MAIN {
                             for (uint32_t inner_dim = 0; inner_dim < in0_block_w; inner_dim++) {
                                 int in0_index = in0_index_subblock_offset + in0_index_h_offset + inner_dim;
                                 int in1_index = in1_index_subblock_offset + in1_index_inner_dim_offset + w;
-                                matmul_tiles(
-                                    in0_cb_id, in1_cb_id, in0_index, in1_index, dst_index, false /* transpose */);
+                                matmul_tiles(in0_cb_id, in1_cb_id, in0_index, in1_index, dst_index);
                                 in1_index_inner_dim_offset += in1_per_core_w;
                             }
                             dst_index++;
                         }
                         in0_index_h_offset += in0_block_w;
                     }
+
+                    tile_regs_commit();
+                    tile_regs_wait();
 
                     if (last_out) {
                         // Pack out to output buffer
@@ -96,7 +100,7 @@ void MAIN {
                         cb_push_back(mm_partials_cb_id, out_subblock_num_tiles);
                     }
 
-                    release_dst();
+                    tile_regs_release();
                     in1_index_subblock_offset += out_subblock_w;
                 }
                 in0_index_subblock_offset += in0_subblock_num_tiles;
@@ -111,4 +115,3 @@ void MAIN {
         }
     }
 }
-}  // namespace NAMESPACE

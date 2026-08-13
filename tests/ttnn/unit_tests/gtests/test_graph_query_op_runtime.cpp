@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -14,25 +14,22 @@
 #include <tt-metalium/shape.hpp>
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include "tt_metal/test_utils/env_vars.hpp"
-#include "ttnn/decorators.hpp"
 #include "ttnn/device.hpp"
 #include "ttnn/graph/graph_query_op_runtime.hpp"
 #include "ttnn/graph/graph_trace_utils.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
-#include "ttnn/tensor/enum_types.hpp"
 #include "ttnn/tensor/layout/page_config.hpp"
 #include "ttnn/tensor/layout/tensor_layout.hpp"
 #include "ttnn/tensor/shape/shape.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/types.hpp"
-#include "umd/device/types/arch.h"
+#include <umd/device/types/arch.hpp>
+#include "common/tt_backend_api_types.hpp"
 
-namespace tt {
-namespace tt_metal {
+namespace tt::tt_metal {
 class IDevice;
-}  // namespace tt_metal
-}  // namespace tt
+}  // namespace tt::tt_metal
 
 namespace ttnn::operations::binary::test {
 
@@ -58,29 +55,35 @@ protected:
     void TearDown() override { ttnn::close_device(*device_); }
 
 public:
-    static const ttnn::TensorSpec m_interleaved_1_3_1024_1024_tiled;
+    static const tt::tt_metal::TensorSpec m_interleaved_1_3_1024_1024_tiled;
 };
 
-const ttnn::TensorSpec TTNNFixtureWithTraceEnabledDevice::m_interleaved_1_3_1024_1024_tiled = ttnn::TensorSpec(
-    ttnn::Shape({1, 3, 1024, 1024}),
-    tt::tt_metal::TensorLayout(
-        tt::tt_metal::DataType::BFLOAT16,
-        tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE),
-        ttnn::L1_MEMORY_CONFIG));
+const tt::tt_metal::TensorSpec TTNNFixtureWithTraceEnabledDevice::m_interleaved_1_3_1024_1024_tiled =
+    tt::tt_metal::TensorSpec(
+        ttnn::Shape({1, 3, 1024, 1024}),
+        tt::tt_metal::TensorLayout(
+            tt::tt_metal::DataType::BFLOAT16,
+            tt::tt_metal::PageConfig(tt::tt_metal::Layout::TILE),
+            ttnn::L1_MEMORY_CONFIG));
 
 // ============================================================================
 // Binary Eltwise Op tests
 // ============================================================================
 
-class BinaryOpTraceRuntime : public TTNNFixtureWithTraceEnabledDevice,
-                             public testing::WithParamInterface<std::tuple<ttnn::TensorSpec, ttnn::TensorSpec>> {};
+class BinaryOpTraceRuntime
+    : public TTNNFixtureWithTraceEnabledDevice,
+      public testing::WithParamInterface<std::tuple<tt::tt_metal::TensorSpec, tt::tt_metal::TensorSpec>> {};
 
 TEST_P(BinaryOpTraceRuntime, Add) {
     const auto& [input_spec_a, input_spec_b] = GetParam();
 
     {
-        auto device = device_;
-        auto query = ttnn::graph::query_op_runtime(ttnn::add, device, input_spec_a, input_spec_b);
+        auto* device = device_;
+        auto query = ttnn::graph::query_op_runtime(
+            [](auto&&... args) { return ttnn::add(std::forward<decltype(args)>(args)...); },
+            device,
+            input_spec_a,
+            input_spec_b);
 
         EXPECT_EQ(query.status, ttnn::graph::ExecutionStatus::Success);
         log_info(tt::LogTest, "Trace runtime: {} ns", query.runtime);
@@ -92,7 +95,7 @@ TEST_P(BinaryOpTraceRuntime, AddChain) {
 
     {
         auto add_chain = [](const auto& i0, const auto& i1) { return ttnn::add(i0, ttnn::add(i0, i1)); };
-        auto device = device_;
+        auto* device = device_;
         auto query = ttnn::graph::query_op_runtime(add_chain, device, input_spec_a, input_spec_b);
 
         EXPECT_EQ(query.status, ttnn::graph::ExecutionStatus::Success);

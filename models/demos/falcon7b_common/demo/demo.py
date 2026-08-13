@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,6 +6,7 @@ import json
 import os
 import time
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -14,18 +15,16 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 import ttnn
+from models.common.utility_functions import nearest_32, tt_tensors_to_torch_tensors
 from models.common.utils import top_k_top_p_filtering
 from models.demos.falcon7b_common.tests.test_utils import get_num_devices, initialize_kv_cache, load_hf_model
 from models.demos.falcon7b_common.tt.falcon_causallm import TtFalconCausalLM
 from models.demos.falcon7b_common.tt.model_config import get_model_config
+from models.demos.utils.device_sku import get_current_device_sku_name
 from models.demos.utils.llm_demo_utils import check_tokens_match, create_benchmark_data, verify_perf
 from models.perf.benchmarking_utils import BenchmarkProfiler
-from models.utility_functions import (
-    disable_persistent_kernel_cache,
-    enable_persistent_kernel_cache,
-    nearest_32,
-    tt_tensors_to_torch_tensors,
-)
+from models.tt_transformers.tt.common import get_hf_tt_cache_path
+from models.tt_transformers.tt.model_config import determine_device_name
 
 END_OF_TEXT = 11
 SPACE = 204
@@ -41,6 +40,14 @@ def load_inputs(user_input, batch):
     for i in range(batch):
         in_prompt.append(user_input[i]["question"])
     return in_prompt
+
+
+def post_process_on_device(logits, index):
+    next_token_logits = logits[:, index, :]
+    # argmax support only ROW_MAJOR layout
+    next_token_logits = ttnn.to_layout(next_token_logits, layout=ttnn.ROW_MAJOR_LAYOUT)
+    next_tokens = ttnn.argmax(next_token_logits, dim=-1)
+    return next_tokens
 
 
 def post_process(logits, index):
@@ -118,19 +125,20 @@ def run_falcon_demo_kv(
     batch_size,
     max_seq_len,
     model_config_strs_prefill_decode,
-    model_location_generator,
-    get_tt_cache_path,
     mesh_device,  # can be ttnn.Device or ttnn.MeshDevice
     model_version="tiiuae/falcon-7b-instruct",
     num_layers=32,
     perf_mode=False,  # Option to measure perf using max seq length (with invalid outputs)
     greedy_sampling=False,  # Option to use greedy decoding instead of top-k/p
     expected_perf_metrics=None,  # Expected perf (t/s) for prefill and decode in perf mode
+    model_name=None,
+    sku=None,
+    target_batch_size=None,
+    target_seq_len=None,
     expected_greedy_output_path=None,  # Path for expected outputs for greedy decoding
     save_generated_text_path=None,  # If provided, save generated text to this path (e.g. set to expected_greedy_output_path to update expected output)
     json_perf_targets={},  # Optional perf targets for CSV output
     is_ci_env=False,  # Whether is running in CI environment
-    galaxy_type=None,  # "4U" or "6U" when running on WH-Galaxy
 ):
     profiler = BenchmarkProfiler()
     profiler.start("run")
@@ -141,7 +149,7 @@ def run_falcon_demo_kv(
         assert (
             not perf_mode and greedy_sampling
         ), "Output verification only supported for greedy sampling in default mode!"
-    elif expected_perf_metrics is not None:
+    elif expected_perf_metrics is not None or (model_name and sku):
         assert perf_mode, "Performance verification is only supported for perf mode!"
 
     # Set up warmup iterations and targets dicts for saving benchmark data
@@ -149,8 +157,6 @@ def run_falcon_demo_kv(
         N_warmup_iter = {"inference_prefill": 5, "inference_decode": 10}  # Number of warmup iterations for perf mode
     else:
         N_warmup_iter = {}
-
-    disable_persistent_kernel_cache()
 
     num_devices = get_num_devices(mesh_device)
     global_batch = batch_size * num_devices
@@ -173,21 +179,19 @@ def run_falcon_demo_kv(
     logger.info("Tokenizing inputs...")
     profiler.start(f"tokenizing_inputs")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_version)
+    tokenizer = AutoTokenizer.from_pretrained(model_version, local_files_only=os.getenv("CI") == "true")
     prefill_ids, num_users, num_input_tokens = preprocess_and_validate_inputs(
         input_prompts, tokenizer, max_seq_len, perf_mode
     )
     profiler.end(f"tokenizing_inputs")
 
     model_config = get_model_config(model_config_strs_prefill_decode[0], nearest_32(num_input_tokens), batch_size)
-    tt_cache_path = get_tt_cache_path(
-        model_version, model_subdir="Falcon", default_dir=model_config["DEFAULT_CACHE_PATH"]
-    )
+    tt_cache_path = Path(get_hf_tt_cache_path(model_version))
 
     # State dict is needed for embeddings
     logger.info("Loading huggingface weights...")
     profiler.start(f"loading_weights")
-    hugging_face_reference_model, state_dict = load_hf_model(model_location_generator, model_version)
+    hugging_face_reference_model, state_dict = load_hf_model(model_version)
     configuration = hugging_face_reference_model.config
     logger.info("Loading weights finished!")
     profiler.end(f"loading_weights")
@@ -328,7 +332,6 @@ def run_falcon_demo_kv(
     profiler.end(f"moving_to_device")
 
     ### Second prefill run without compile ###
-    enable_persistent_kernel_cache()
 
     post_processor = partial(post_process)
     output_ids = torch.zeros(num_users, 1, dtype=torch.int64)
@@ -373,12 +376,14 @@ def run_falcon_demo_kv(
             else:
                 raise ValueError("Invalid type for tt_attention_mask")
 
-        logits = tt_tensors_to_torch_tensors(tt_logits, mesh_device, concat_dim=0).squeeze(1)
+        tt_logits = ttnn.squeeze(tt_logits, 1)
+        tt_user_output_ids = post_process_on_device(tt_logits, num_input_tokens - 1)
+        user_output_ids = tt_tensors_to_torch_tensors(tt_user_output_ids, mesh_device)
+        user_output_ids = user_output_ids[:, None]
 
         tt_prefill_input_ids.deallocate()
         tt_logits.deallocate()
 
-        user_output_ids = post_processor(logits=logits, index=num_input_tokens - 1)
         output_ids[user_id::batch_size] = user_output_ids
 
         if i >= N_warmup_prefill:
@@ -538,17 +543,17 @@ def run_falcon_demo_kv(
 
     # Save benchmark data (will only save if running in CI environment)
     benchmark_data = create_benchmark_data(profiler, measurements, N_warmup_iter, json_perf_targets)
-    run_type = f"demo_perf_{num_devices}chip" if perf_mode else f"demo_generate_{num_devices}chip"
-    if galaxy_type:
-        run_type += f"_{galaxy_type}"
+    run_type = "demo_perf" if perf_mode else "demo_generate"
+
     benchmark_data.save_partial_run_json(
         profiler,
         run_type=run_type,
-        ml_model_name=model_version,
+        ml_model_name=model_version.removeprefix("tiiuae/"),
         ml_model_type="llm",
+        device_name=determine_device_name(mesh_device),
         num_layers=num_layers,
         batch_size=batch_size,
-        config_params=configuration.to_dict(),
+        config_params={"data_parallel": num_devices, "tensor_parallel": 1},
         precision=f"prefill[{model_config_strs_prefill_decode[0]}]_decode[{model_config_strs_prefill_decode[1]}]",
         input_sequence_length=num_input_tokens,
         output_sequence_length=1 if perf_mode else output_token_index + 1,
@@ -556,11 +561,23 @@ def run_falcon_demo_kv(
 
     # Verify output or perf if expected values are provided
     assert expected_perf_metrics is None or expected_greedy_output_path is None
-    if expected_perf_metrics is not None:
-        if num_devices == 32:  # set higher margin to 20% for Galaxy due to larger variance on CI
-            verify_perf(measurements, expected_perf_metrics, high_tol_percentage=1.20)
-        else:
-            verify_perf(measurements, expected_perf_metrics)
+    if sku is None:
+        sku = get_current_device_sku_name()
+    if expected_perf_metrics is not None or (model_name and sku):
+        expected_measurements = {
+            "prefill_t/s": True,
+            "decode_t/s": True,
+            "decode_t/s/u": True,
+        }
+        verify_perf(
+            measurements,
+            expected_perf_metrics=expected_perf_metrics,
+            expected_measurements=expected_measurements,
+            model_name=model_name,
+            sku=sku,
+            batch_size=target_batch_size,
+            seq_len=target_seq_len,
+        )
     elif expected_greedy_output_path is not None:
         if token_check_does_pass:
             logger.info("Output Check Passed!")

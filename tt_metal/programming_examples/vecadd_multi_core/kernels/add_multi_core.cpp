@@ -1,21 +1,22 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "compute_kernel_api.h"
-#include "compute_kernel_api/common.h"
-#include "compute_kernel_api/eltwise_binary.h"
-#include "compute_kernel_api/tile_move_copy.h"
+#include "api/compute/compute_kernel_api.h"
+#include "api/compute/common.h"
+#include "api/compute/eltwise_binary.h"
+#include "api/compute/tile_move_copy.h"
 #include <cstdint>
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     uint32_t n_tiles = get_arg_val<uint32_t>(0);
     uint32_t start_tile_id = get_arg_val<uint32_t>(1);
 
     // We are going to read from these two circular buffers
+    // These buffers can be accessed using either the index or the name, since
+    // the mapping was defined in the CreateKernel call.
     constexpr auto cb_in0 = get_compile_time_arg_val(0);
-    constexpr auto cb_in1 = get_compile_time_arg_val(1);
+    constexpr auto cb_in1 = get_named_compile_time_arg_val("c_1");
     // and write to the output circular buffer
     constexpr auto cb_out0 = get_compile_time_arg_val(2);
     // The destination register.
@@ -24,16 +25,16 @@ void MAIN {
     // from computer architecture. Think it like that. Later on we will ensure
     // that registers are free and then we will submit compute to the FPU/SFPU
     // that writes to the register. see:
-    // https://tenstorrent-metal.github.io/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/compute/acquire_dst.html
+    // https://docs.tenstorrent.com/tt-metal/latest/tt-metalium/tt_metal/apis/kernel_apis/compute/acquire_dst.html#acquire-dst
     constexpr uint32_t dst_reg = 0;
 
     // Tell the SFPU that we will be using circular buffers c_in0, c_in1 and
     // c_out0 to perform the computation.
-    binary_op_init_common(cb_in0, cb_in1, cb_out0);
+    compute_kernel_hw_startup(cb_in0, cb_in1, cb_out0);
     // And we are going to add tiles. This function is only called if we ever
     // need to switch operation to something else. Since we are only adding
     // tiles, this function is only called once before the loop.
-    add_tiles_init(cb_in0, cb_in1);
+    add_init(cb_in0, cb_in1);
 
     // Calculate the range of tiles this core should process
     const uint32_t end_tile_id = start_tile_id + n_tiles;
@@ -61,8 +62,5 @@ void MAIN {
         cb_push_back(cb_out0, 1);
         cb_pop_front(cb_in0, 1);
         cb_pop_front(cb_in1, 1);
-        // Release the held register
-        release_dst();
     }
 }
-}  // namespace NAMESPACE

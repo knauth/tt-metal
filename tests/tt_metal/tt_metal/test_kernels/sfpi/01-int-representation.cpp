@@ -1,14 +1,13 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ckernel.h"
-#include "compute_kernel_api.h"
+#include "api/compute/compute_kernel_api.h"
 #include <sfpi.h>
 
 using namespace sfpi;
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
 #if COMPILE_FOR_TRISC == 1  // compute
 #include "pre.inc"
 
@@ -28,7 +27,7 @@ void MAIN {
     {  // test loading 0x80000001 loads as expected
         vUInt value = vUInt(1) | vUInt(0x8000) << 16;
 
-        vUInt signOne = setsgn(vUInt(1), 1);
+        vUInt signOne = as<vUInt>(setsgn(vUInt(1), 1));
 
         vUInt notCorrect = value ^ signOne;
         FAIL_IF(notCorrect != 0);
@@ -131,4 +130,3 @@ void MAIN {
 #include "post.inc"
 #endif
 }
-}  // namespace NAMESPACE

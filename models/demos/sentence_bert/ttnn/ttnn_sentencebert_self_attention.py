@@ -1,13 +1,22 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import ttnn
-from models.demos.sentence_bert.ttnn.common import (
-    pre_softmax_config,
-    query_key_value_matmul_program_config,
-    softmax_config,
-)
+from models.common.utility_functions import is_blackhole
+
+if is_blackhole():
+    from models.demos.blackhole.sentence_bert.ttnn.common import (
+        pre_softmax_config,
+        query_key_value_matmul_program_config,
+        softmax_config,
+    )
+else:
+    from models.demos.wormhole.sentence_bert.ttnn.common import (
+        pre_softmax_config,
+        query_key_value_matmul_program_config,
+        softmax_config,
+    )
 
 
 class TtnnSentenceBertSelfAttention:

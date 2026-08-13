@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -37,10 +37,26 @@ golden_benchmarks = {}
 def add_benchmark_iterations(input):
     out = {}
     for benchmark in input["benchmarks"]:
+        name = benchmark["name"]
+        # A benchmark that aborted (e.g. a TT_FATAL) has no timing fields. Preserve the error entry so
+        # the comparison below reports it explicitly instead of crashing with a KeyError on IterationTime.
+        if benchmark.get("error_occurred") or "IterationTime" not in benchmark:
+            if "error_occurred" not in out.get(name, {}):
+                out[name] = benchmark
+            continue
         if benchmark["repetitions"] == 1:
-            out[benchmark["name"]] = benchmark
-        elif benchmark["run_type"] == "aggregate" and benchmark["aggregate_name"] == "mean":
-            out[benchmark["name"].replace("_mean", "")] = benchmark
+            out[name] = benchmark
+        elif benchmark["repetitions"] == 2:
+            if benchmark["run_type"] == "iteration":
+                if name in out and "IterationTime" in out[name]:
+                    # Use the minimum time to reduce the impact of flakes. Flakes are unlikely to improve performance,
+                    # but may hurt performance due to some other process using CPU. Avoid using the median in the 2
+                    # repetition case, because it reverts to the mean and is more sensitive to flakes.
+                    out[name]["IterationTime"] = min(out[name]["IterationTime"], benchmark["IterationTime"])
+                else:
+                    out[name] = benchmark
+        elif benchmark["run_type"] == "aggregate" and benchmark["aggregate_name"] == "median":
+            out[benchmark["name"].replace("_median", "")] = benchmark
     return out
 
 

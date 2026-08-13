@@ -1,33 +1,35 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/circular_buffer.h"
+#include "api/core_local_mem.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
+    Noc noc;
+
     // READER RUNTIME ARGS
     uint32_t in0_tensor_addr = get_arg_val<uint32_t>(0);
     uint32_t in0_tensor_tile_id = get_arg_val<uint32_t>(1);
 
     // COMPILE TIME ARGS
-    // interleaved accessor args
-    constexpr uint32_t in0_is_dram = get_compile_time_arg_val(0);
     // READER COMPILE TIME ARGS
-    constexpr uint32_t block_size = get_compile_time_arg_val(1);
-    constexpr uint32_t out_num_blocks_per_tensor = get_compile_time_arg_val(2);
+    constexpr uint32_t block_size = get_compile_time_arg_val(0);
+    constexpr uint32_t out_num_blocks_per_tensor = get_compile_time_arg_val(1);
+    constexpr auto in0_args = TensorAccessorArgs<2>();
 
     constexpr uint32_t cb_id_in0 = 0;
     constexpr uint32_t cb_id_in1 = 1;
     const uint32_t single_tile_size_bytes = get_tile_size(cb_id_in0);
     const DataFormat data_format = get_dataformat(cb_id_in0);
+    const auto s0 = TensorAccessor(in0_args, in0_tensor_addr);
 
-    constexpr bool in0_is_dram_bool = in0_is_dram == 1;
-    const InterleavedAddrGenFast<in0_is_dram_bool> s0 = {
-        .bank_base_address = in0_tensor_addr,
-        .page_size = single_tile_size_bytes,
-        .data_format = data_format,
-    };
+    CircularBuffer cb_in0(cb_id_in0);
+    CircularBuffer cb_in1(cb_id_in1);
 
     uint32_t cb_id;
     uint32_t l1_write_addr;
@@ -42,16 +44,22 @@ void kernel_main() {
             cb_id = cb_id_in0;
         }
 
-        l1_write_addr = get_write_ptr(cb_id);
+        CircularBuffer cb_cur(cb_id);
+        l1_write_addr = cb_cur.get_write_ptr();
         for (uint32_t block_idx = 0; block_idx < out_num_blocks_per_tensor; block_idx++) {
-            cb_reserve_back(cb_id, block_size);
+            cb_cur.reserve_back(block_size);
             for (uint32_t i = 0; i < block_size; i++) {
-                noc_async_read_tile(in0_tensor_tile_id, s0, l1_write_addr);
+                noc.async_read(
+                    s0,
+                    CoreLocalMem<uint32_t>(l1_write_addr),
+                    single_tile_size_bytes,
+                    {.page_id = in0_tensor_tile_id},
+                    {});
                 l1_write_addr += single_tile_size_bytes;
                 in0_tensor_tile_id++;
             }
-            noc_async_read_barrier();
-            cb_push_back(cb_id, block_size);
+            noc.async_read_barrier();
+            cb_cur.push_back(block_size);
         }
     }
 }

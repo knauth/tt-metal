@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -28,7 +28,6 @@ class TtMobileNetV3InvertedSqueeze(nn.Module):
         bias: bool = False,
         dilation: int = 1,
         use_activation: Union[bool, str] = False,
-        activation="",
         state_dict=None,
         base_address="",
         device=None,

@@ -1,40 +1,52 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/tensor/tensor.hpp"
-#include "ttnn/run_operation.hpp"
+#include "interleaved_to_sharded_partial_op_types.hpp"
+#include "interleaved_to_sharded_partial_program_factory.hpp"
+#include "ttnn/types.hpp"
+#include <tt-metalium/experimental/program_descriptor_patching.hpp>
 
-#include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/buffer.hpp>
-namespace ttnn::operations::data_movement {
+namespace ttnn::prim {
 
 struct InterleavedToShardedPartialDeviceOperation {
-    const CoreCoord grid_size;
-    const tt::tt_metal::ShardSpec shard_spec;
-    const uint32_t num_slices;
-    const uint32_t slice_index;
-    const tt::tt_metal::MemoryConfig output_mem_config;
-    const tt::tt_metal::DataType output_dtype;
+    using operation_attributes_t = InterleavedToShardedPartialParams;
+    using tensor_args_t = Tensor;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
+    using tensor_return_value_t = Tensor;
+    using program_factory_t = std::variant<InterleavedToShardedPartialProgramFactory>;
+    static void validate_on_program_cache_miss(
+        const operation_attributes_t& operation_attributes, const Tensor& input_tensor);
 
-    void validate(const std::vector<Tensor>& input_tensors) const;
-    std::vector<ttnn::TensorSpec> compute_output_specs(const std::vector<Tensor>& input_tensors) const;
-    tt::tt_metal::operation::ProgramWithCallbacks create_program(
-        const std::vector<Tensor>& input_tensors, std::vector<Tensor>& output_tensors) const;
-    tt::tt_metal::operation::OpPerformanceModelGeneral<std::vector<Tensor>> create_op_performance_model(
-        const std::vector<Tensor>& input_tensors,
-        const std::vector<std::optional<const Tensor>>& optional_input_tensors,
-        std::vector<Tensor>& output_tensors) const;
-    static constexpr auto attribute_names =
-        std::make_tuple("grid_size", "shard_spec", "output_mem_config", "output_dtype");
-    auto attribute_values() const {
-        return std::make_tuple(
-            std::cref(this->grid_size),
-            std::cref(this->shard_spec),
-            std::cref(this->output_mem_config),
-            std::cref(this->output_dtype));
-    }
+    static spec_return_value_t compute_output_specs(
+        const operation_attributes_t& operation_attributes, const Tensor& input_tensor);
+
+    static tensor_return_value_t create_output_tensors(
+        const operation_attributes_t& operation_attributes, const Tensor& input_tensor);
+
+    static ttsl::hash::hash_t compute_program_hash(
+        const operation_attributes_t& operation_attributes, const Tensor& input_tensor);
+
+    // slice_index feeds only the runtime read-offset starting_idx_h and is excluded from the program
+    // hash, so cache hits for a different slice must re-derive the per-dispatch args (otherwise the
+    // reader/writer args baked at first miss stay frozen at the first slice). Re-run create_descriptor
+    // (single source of truth) and re-apply its per-core args + tensor-backed CB addresses.
+    static void override_runtime_arguments(
+        tt::tt_metal::Program& program,
+        const operation_attributes_t& operation_attributes,
+        const Tensor& input_tensor,
+        tensor_return_value_t& output,
+        const std::optional<ttnn::MeshCoordinate>& mesh_dispatch_coordinate = std::nullopt);
 };
-}  // namespace ttnn::operations::data_movement
+
+Tensor interleaved_to_sharded_partial(
+    const Tensor& input_tensor,
+    const CoreCoord& grid_size,
+    const tt::tt_metal::ShardSpec& shard_spec,
+    uint32_t num_slices,
+    uint32_t slice_index,
+    const tt::tt_metal::MemoryConfig& output_mem_config,
+    const tt::tt_metal::DataType& output_dtype);
+}  // namespace ttnn::prim

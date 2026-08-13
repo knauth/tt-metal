@@ -1,8 +1,10 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "moreh_softmax_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+#include "ttnn/device_operation.hpp"
 
 using namespace tt::tt_metal;
 
@@ -21,8 +23,8 @@ bool is_moreh_softmax_w_small_available(const Tensor& tensor, const DeviceComput
     auto data_format = tt::tt_metal::datatype_to_dataformat_converter(tensor.dtype());
     auto intermed_data_format = fp32_dest_acc_en ? tt::DataFormat::Float32 : data_format;
 
-    auto tile_size = tt::tt_metal::detail::TileSize(data_format);
-    auto intermed_tile_size = tt::tt_metal::detail::TileSize(intermed_data_format);
+    auto tile_size = tt::tile_size(data_format);
+    auto intermed_tile_size = tt::tile_size(intermed_data_format);
 
     int32_t cb_usage = 0;        // bytes
     cb_usage += Wt * tile_size;  // input;
@@ -51,8 +53,8 @@ bool is_moreh_softmax_h_small_available(const Tensor& tensor, const DeviceComput
     auto data_format = tt::tt_metal::datatype_to_dataformat_converter(tensor.dtype());
     auto intermed_data_format = fp32_dest_acc_en ? tt::DataFormat::Float32 : data_format;
 
-    auto tile_size = tt::tt_metal::detail::TileSize(data_format);
-    auto intermed_tile_size = tt::tt_metal::detail::TileSize(intermed_data_format);
+    auto tile_size = tt::tile_size(data_format);
+    auto intermed_tile_size = tt::tile_size(intermed_data_format);
 
     int32_t cb_usage = 0;        // bytes
     cb_usage += Ht * tile_size;  // input;
@@ -90,9 +92,10 @@ void MorehSoftmaxOperation::validate_inputs(
     TT_FATAL(input.buffer() != nullptr, "Operands to softmax need to be allocated in buffers on device!");
     TT_FATAL((input.layout() == Layout::TILE), "Inputs to softmax must be tilized");
     TT_FATAL(
-        input.dtype() == DataType::BFLOAT16 || input.dtype() == DataType::BFLOAT8_B,
-        "Inputs must be of bfloat16 or bfloat8_b type");
-
+        input.dtype() == DataType::BFLOAT16 || input.dtype() == DataType::BFLOAT8_B ||
+            input.dtype() == DataType::FLOAT32,
+        "Inputs must be of bfloat16, bfloat8_b or float32 type. Received: {}",
+        input.dtype());
     const auto rank = input.logical_shape().rank();
     const auto dim = operation_attributes.dim;
     TT_FATAL(dim >= 0 && dim < rank, "dim {} should be less than output tensor rank {}", dim, rank);
@@ -103,18 +106,13 @@ void MorehSoftmaxOperation::validate_on_program_cache_miss(
     validate_inputs(operation_attributes, tensor_args);
 }
 
-void MorehSoftmaxOperation::validate_on_program_cache_hit(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    validate_inputs(operation_attributes, tensor_args);
-}
-
 MorehSoftmaxOperation::spec_return_value_t MorehSoftmaxOperation::compute_output_specs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     if (tensor_args.output.has_value()) {
         return tensor_args.output->tensor_spec();
     }
 
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         tensor_args.input.logical_shape(),
         TensorLayout(
             tensor_args.input.dtype(), PageConfig(tensor_args.input.layout()), operation_attributes.memory_config));
@@ -128,25 +126,6 @@ MorehSoftmaxOperation::tensor_return_value_t MorehSoftmaxOperation::create_outpu
     }
 
     return create_device_tensor(compute_output_specs(operation_attributes, tensor_args), tensor_args.input.device());
-}
-
-std::tuple<MorehSoftmaxOperation::operation_attributes_t, MorehSoftmaxOperation::tensor_args_t>
-MorehSoftmaxOperation::invoke(
-    const Tensor& input,
-    uint32_t dim,
-    const std::optional<Tensor>& output,
-    const MorehSoftmaxOp op,
-    const MorehSoftmaxOpParallelizationStrategy strategy,
-    const std::optional<MemoryConfig>& memory_config,
-    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
-    return {
-        operation_attributes_t{
-            dim,
-            op,
-            strategy,
-            memory_config.value_or(input.memory_config()),
-            init_device_compute_kernel_config(input.device()->arch(), compute_kernel_config, MathFidelity::HiFi4)},
-        tensor_args_t{input, output}};
 }
 
 MorehSoftmaxOpParallelizationStrategy MorehSoftmaxOperation::get_parallelization_strategy(
@@ -209,3 +188,26 @@ MorehSoftmaxOpParallelizationStrategy MorehSoftmaxOperation::get_parallelization
 }
 
 }  // namespace ttnn::operations::moreh::moreh_softmax
+
+namespace ttnn::prim {
+ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOperation::tensor_return_value_t moreh_softmax(
+    const Tensor& input,
+    uint32_t dim,
+    const std::optional<Tensor>& output,
+    const ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOp op,
+    const ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOpParallelizationStrategy strategy,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
+    using OperationType = ttnn::operations::moreh::moreh_softmax::MorehSoftmaxOperation;
+    const bool is_fp32 = input.dtype() == DataType::FLOAT32;
+    auto operation_attributes = OperationType::operation_attributes_t{
+        dim,
+        op,
+        strategy,
+        memory_config.value_or(input.memory_config()),
+        init_device_compute_kernel_config(
+            input.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi4, true, is_fp32)};
+    auto tensor_args = OperationType::tensor_args_t{input, output};
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
+}
+}  // namespace ttnn::prim

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,6 +9,7 @@ import ttnn
 
 DataType = ttnn._ttnn.tensor.DataType
 uint8 = DataType.UINT8
+int8 = DataType.INT8
 uint16 = DataType.UINT16
 int32 = DataType.INT32
 uint32 = DataType.UINT32
@@ -16,6 +17,8 @@ float32 = DataType.FLOAT32
 bfloat16 = DataType.BFLOAT16
 bfloat8_b = DataType.BFLOAT8_B
 bfloat4_b = DataType.BFLOAT4_B
+fp8_e4m3 = DataType.FP8_E4M3
+DumpTensorMode = ttnn._ttnn.tensor.DumpTensorMode
 
 BufferType = ttnn._ttnn.tensor.BufferType
 TensorMemoryLayout = ttnn._ttnn.tensor.TensorMemoryLayout
@@ -40,6 +43,7 @@ DEVICE_STORAGE_TYPE = StorageType.DEVICE
 TILE_SIZE = 32
 
 Tile = ttnn._ttnn.tensor.Tile
+OverlappedTensor = ttnn._ttnn.tensor.OverlappedTensor
 
 Shape = ttnn._ttnn.types.Shape
 TensorSpec = ttnn._ttnn.tensor.TensorSpec
@@ -55,7 +59,6 @@ ThrottleLevel = ttnn._ttnn.operations.core.ThrottleLevel
 DeviceComputeKernelConfig = ttnn._ttnn.operations.core.DeviceComputeKernelConfig
 WormholeComputeKernelConfig = ttnn._ttnn.operations.core.WormholeComputeKernelConfig
 BlackholeComputeKernelConfig = WormholeComputeKernelConfig
-GrayskullComputeKernelConfig = ttnn._ttnn.operations.core.GrayskullComputeKernelConfig
 
 
 @dataclasses.dataclass
@@ -75,12 +78,13 @@ MeshCoordinate = ttnn._ttnn.multi_device.MeshCoordinate
 MeshCoordinateRange = ttnn._ttnn.multi_device.MeshCoordinateRange
 MeshCoordinateRangeSet = ttnn._ttnn.multi_device.MeshCoordinateRangeSet
 ShardOrientation = ttnn._ttnn.tensor.ShardOrientation
-ShardMode = ttnn._ttnn.tensor.ShardMode
 ShardSpec = ttnn._ttnn.tensor.ShardSpec
 NdShardSpec = ttnn._ttnn.tensor.NdShardSpec
 CoreRangeSet = ttnn._ttnn.tensor.CoreRangeSet
 CoreRange = ttnn._ttnn.tensor.CoreRange
 CoreCoord = ttnn._ttnn.tensor.CoreCoord
+corerange_to_cores = ttnn._ttnn.tensor.corerange_to_cores
+get_optimal_worker_cores_for_sharded_tensor = ttnn._ttnn.tensor.get_optimal_worker_cores_for_sharded_tensor
 
 QueueId = ttnn._ttnn.types.QueueId
 
@@ -91,13 +95,28 @@ BinaryOpType = ttnn._ttnn.operations.binary.BinaryOpType
 BcastOpMath = ttnn._ttnn.types.BcastOpMath
 BcastOpDim = ttnn._ttnn.types.BcastOpDim
 
+DataMovementProcessor = ttnn._ttnn.types.DataMovementProcessor
+NOC = ttnn._ttnn.types.NOC
+NOC_MODE = ttnn._ttnn.types.NOC_MODE
+
+TileDescriptor = ttnn._ttnn.program_descriptor.TileDescriptor
 CBFormatDescriptor = ttnn._ttnn.program_descriptor.CBFormatDescriptor
 CBDescriptor = ttnn._ttnn.program_descriptor.CBDescriptor
 ReaderConfigDescriptor = ttnn._ttnn.program_descriptor.ReaderConfigDescriptor
 WriterConfigDescriptor = ttnn._ttnn.program_descriptor.WriterConfigDescriptor
+DataMovementConfigDescriptor = ttnn._ttnn.program_descriptor.DataMovementConfigDescriptor
 ComputeConfigDescriptor = ttnn._ttnn.program_descriptor.ComputeConfigDescriptor
 KernelDescriptor = ttnn._ttnn.program_descriptor.KernelDescriptor
+RuntimeArgs = ttnn._ttnn.program_descriptor.RuntimeArgs
+RuntimeArgsColProxy = ttnn._ttnn.program_descriptor.RuntimeArgsColProxy
 SemaphoreDescriptor = ttnn._ttnn.program_descriptor.SemaphoreDescriptor
 ProgramDescriptor = ttnn._ttnn.program_descriptor.ProgramDescriptor
+MeshProgramDescriptor = ttnn._ttnn.program_descriptor.MeshProgramDescriptor
+merge_program_descriptors = ttnn._ttnn.program_descriptor.merge_program_descriptors
+cb_descriptor_from_sharded_tensor = ttnn._ttnn.program_descriptor.cb_descriptor_from_sharded_tensor
+get_cb_address = ttnn._ttnn.program_descriptor.get_cb_address
+UnpackToDestMode = ttnn._ttnn.program_descriptor.UnpackToDestMode
+FaceGeometry = ttnn._ttnn.program_descriptor.FaceGeometry
+compute_program_descriptor_hash = ttnn._ttnn.operations.generic.compute_program_descriptor_hash
 
 TensorAccessorArgs = ttnn._ttnn.tensor_accessor_args.TensorAccessorArgs

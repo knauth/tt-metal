@@ -1,27 +1,25 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
-import torch
-import random
+import contextlib
+import json
 import os
-import numpy as np
+import random
+import subprocess
+from datetime import datetime
 from functools import partial
 from operator import contains, eq, getitem
 from pathlib import Path
-import json
-import multiprocess
-import signal
-import time
-import psutil
-import subprocess
-from datetime import datetime
 
+import numpy as np
+import pytest
+import torch
 from loguru import logger
 
-from tests.scripts.common import run_process_and_get_result
-from tests.scripts.common import get_updated_device_params
+from models.demos.utils.trace_region_sizes import TRACE_MODEL_KEY_PARAM, resolve_trace_region_size
+from models.tt_transformers.demo.trace_region_config import get_logical_sku, get_supported_trace_region_size
+from tests.scripts.common import get_updated_device_params, run_process_and_get_result
 
 # Constants for device configurations
 SIX_U_NUM_PCIE_DEVICES = 32
@@ -70,10 +68,11 @@ def galaxy_type():
 def is_galaxy():
     import ttnn
 
-    return (
-        ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.GALAXY
-        or ttnn.cluster.get_cluster_type() == ttnn.cluster.ClusterType.TG
-    )
+    return ttnn.cluster.get_cluster_type() in [
+        ttnn.cluster.ClusterType.GALAXY,
+        ttnn.cluster.ClusterType.TG,
+        ttnn.cluster.ClusterType.BLACKHOLE_GALAXY,
+    ]
 
 
 # TODO: Remove this when TG clusters are deprecated.
@@ -136,6 +135,16 @@ class CIv2ModelDownloadUtils_:
             subprocess.run(
                 [
                     "wget",
+                    # LFC is an internal cluster service and must be reached directly. The CIv2
+                    # no_proxy entry for it is scheme-prefixed ("http://...") so it never matches
+                    # the target hostname; without --no-proxy, wget sends the request through the
+                    # restricted egress proxy, which returns 503 for internal hosts.
+                    "--no-proxy",
+                    # LFC occasionally refuses direct connections; wget does not retry connection
+                    # refusals by default, so opt in and back off a few times before giving up.
+                    "--tries=5",
+                    "--retry-connrefused",
+                    "--waitretry=10",
                     "-r",
                     "-nH",
                     "-x",
@@ -236,7 +245,14 @@ def model_location_generator(is_ci_v2_env):
     directory structure
     """
 
-    def model_location_generator_(model_version, model_subdir="", download_if_ci_v2=False, ci_v2_timeout_in_s=300):
+    def model_location_generator_(
+        model_version,
+        model_subdir="",
+        download_if_ci_v2=False,
+        ci_v2_timeout_in_s=300,
+        endpoint_prefix="http://large-file-cache.large-file-cache.svc.cluster.local//mldata/model_checkpoints/pytorch/huggingface",
+        download_dir_suffix="model_weights",
+    ):
         model_folder = Path("tt_dnn-models") / model_subdir
         internal_weka_path = Path("/mnt/MLPerf") / model_folder / model_version
         has_internal_weka = internal_weka_path.exists()
@@ -251,7 +267,10 @@ def model_location_generator(is_ci_v2_env):
                 not model_subdir
             ), f"model_subdir is set to {model_subdir}, but we don't support further levels of directories in the large file cache in CIv2"
             civ2_download_path = CIv2ModelDownloadUtils_.download_from_ci_v2_cache(
-                model_version, download_dir_suffix="model_weights", timeout_in_s=ci_v2_timeout_in_s
+                model_version,
+                download_dir_suffix=download_dir_suffix,
+                timeout_in_s=ci_v2_timeout_in_s,
+                endpoint_prefix=endpoint_prefix,
             )
             logger.info(f"For model location, using CIv2 large file cache: {civ2_download_path}")
             return civ2_download_path
@@ -287,12 +306,147 @@ def get_tt_cache_path():
 
 @pytest.fixture(scope="function")
 def device_params(request):
-    return getattr(request, "param", {})
+    # Return a copy so the mesh_device fixture can resolve/pop TRACE_MODEL_KEY_PARAM
+    # (using the logical submesh SKU) without mutating the shared parametrize dict.
+    return dict(getattr(request, "param", {}))
+
+
+@pytest.fixture(scope="module")
+def _device_module_impl(request):
+    """
+    Internal module-scoped device fixture.
+
+    Do not request this fixture directly in test function signatures. Instead, use the
+    `device` fixture with @pytest.mark.use_module_device marker. When the marker is
+    present, the `device` fixture automatically delegates to this fixture via
+    request.getfixturevalue(), providing a module-scoped device while keeping test
+    signatures unchanged.
+
+    This optimization is intended for test modules where all tests share the same
+    device configuration. The device is created once per module and reused across
+    all tests, reducing setup/teardown overhead.
+
+    Usage in test files:
+        # Module scope, no special params:
+        pytestmark = pytest.mark.use_module_device
+
+        # Module scope WITH a single device configuration:
+        pytestmark = pytest.mark.use_module_device({"l1_small_size": 16384})
+
+        def test_something(device):  # Just use 'device' as normal
+            ...
+
+    IMPORTANT: Do NOT use this marker in test files that use parametrized device_params:
+        @pytest.mark.parametrize("device_params", [...], indirect=True)
+
+    Tests with multiple device configurations via parametrized device_params require
+    a fresh device for each parameter set and should continue using the default
+    function-scoped `device` fixture.
+
+    STATE SHARING CONSIDERATIONS:
+
+    Since the device is shared across all tests in a module, tests can affect each
+    other through accumulated device state:
+
+    - Program cache: Cached programs from earlier tests may be reused by later tests.
+      If tests require different program configurations (e.g., broadcast vs non-broadcast),
+      this can cause incorrect results. Call device.disable_and_clear_program_cache()
+      at the start of tests that are sensitive to cache state.
+
+    - Memory allocations: Tensors allocated on device persist until explicitly
+      deallocated or garbage collected. For highly parameterized tests, this can
+      exhaust device resources (TLBs, L1 memory). Tests should avoid holding
+      references to device tensors beyond what's needed.
+
+    - Device configuration: Any device configuration changes persist across tests.
+
+    WHEN TO USE MODULE SCOPE:
+
+    Module-scoped devices work best for:
+    - Tests that are stateless or don't depend on program cache state
+    - Tests that properly clean up device state when needed
+    - Test modules with many parameterized test cases (biggest time savings)
+
+    Avoid module scope for:
+    - Tests that assert on program cache entry counts
+    - Tests that require specific device initialization state
+    - Tests that use mesh_device or other multi-device fixtures
+
+    FAILURE HANDLING:
+
+    If a test fails or crashes, subsequent tests in the module will still run with
+    the same device. The device generally remains usable, but may have stale state.
+    For test isolation after failures, prefer function-scoped devices.
+    """
+    import ttnn
+
+    device_id = request.config.getoption("device_id")
+
+    # Get device_params from marker - supports both patterns:
+    #   @pytest.mark.use_module_device({"param": value})  # positional
+    #   @pytest.mark.use_module_device(device_params={"param": value})  # keyword
+    marker = request.node.get_closest_marker("use_module_device")
+    if marker and marker.args:
+        device_params = marker.args[0]
+    elif marker and marker.kwargs:
+        # Validate kwargs - only 'device_params' is allowed
+        unexpected_kwargs = set(marker.kwargs.keys()) - {"device_params"}
+        if unexpected_kwargs:
+            raise ValueError(
+                f"@pytest.mark.use_module_device received unexpected keyword argument(s): "
+                f"{unexpected_kwargs}. Only 'device_params' is supported. "
+                f"Usage: @pytest.mark.use_module_device({{'l1_small_size': 16384}}) or "
+                f"@pytest.mark.use_module_device(device_params={{'l1_small_size': 16384}})"
+            )
+        device_params = marker.kwargs.get("device_params", {})
+    else:
+        device_params = {}
+
+    # When initializing a single device on a TG system, we want to
+    # target the first user exposed device, not device 0 (one of the
+    # 4 gateway devices)
+    if is_tg_cluster() and not device_id:
+        device_id = first_available_tg_device()
+
+    # Preserve original default device to restore on teardown
+    original_default_device = ttnn.GetDefaultDevice()
+
+    updated_device_params = get_updated_device_params(device_params)
+    device = ttnn.CreateDevice(device_id=device_id, **updated_device_params)
+    request.node.pci_ids = [ttnn.GetPCIeDeviceID(device_id)]
+    ttnn.SetDefaultDevice(device)
+
+    yield device
+
+    # Restore the original default device BEFORE closing the test-specific one
+    ttnn.SetDefaultDevice(original_default_device)
+    ttnn.close_device(device)
 
 
 @pytest.fixture(scope="function")
 def device(request, device_params):
+    """
+    Primary device fixture - delegates to module-scoped or function-scoped implementation.
+
+    The device_params parameter is required even for the module-scoped path to detect
+    conflicting usage with @pytest.mark.parametrize("device_params", ...).
+    """
     import ttnn
+
+    # Check if file/test wants module-scoped device
+    if request.node.get_closest_marker("use_module_device"):
+        # device_params will be non-empty if test uses parametrized device_params,
+        # which conflicts with module-scoped device (can't vary device config per test)
+        if device_params:
+            raise ValueError(
+                "Cannot use @pytest.mark.use_module_device with "
+                "@pytest.mark.parametrize('device_params', ...). "
+                "Module-scoped devices are created once per module and cannot "
+                "vary per test. Either remove the marker to use function-scoped "
+                "device, or split tests with different device_params into separate files."
+            )
+        yield request.getfixturevalue("_device_module_impl")
+        return
 
     device_id = request.config.getoption("device_id")
     request.node.pci_ids = [ttnn.GetPCIeDeviceID(device_id)]
@@ -303,47 +457,21 @@ def device(request, device_params):
     if is_tg_cluster() and not device_id:
         device_id = first_available_tg_device()
 
+    original_default_device = ttnn.GetDefaultDevice()
+
     updated_device_params = get_updated_device_params(device_params)
     device = ttnn.CreateDevice(device_id=device_id, **updated_device_params)
     ttnn.SetDefaultDevice(device)
 
+    from tests.tests_common.cache_entries_counter import CacheEntriesCounter
+
+    device.cache_entries_counter = CacheEntriesCounter(device)
+
     yield device
 
+    # Restore the original default device BEFORE closing the test-specific one
+    ttnn.SetDefaultDevice(original_default_device)
     ttnn.close_device(device)
-
-
-@pytest.fixture(scope="function")
-def pcie_devices(request, device_params):
-    import ttnn
-
-    num_devices = ttnn.GetNumPCIeDevices()
-    device_ids = [i for i in range(num_devices)]
-    request.node.pci_ids = device_ids
-
-    # Get only physical devices
-    updated_device_params = get_updated_device_params(device_params)
-    devices = ttnn.CreateDevices(device_ids, **updated_device_params)
-
-    yield [devices[i] for i in range(num_devices)]
-
-    ttnn.CloseDevices(devices)
-
-
-@pytest.fixture(scope="function")
-def all_devices(request, device_params):
-    import ttnn
-
-    num_devices = ttnn.GetNumAvailableDevices()
-    device_ids = [i for i in range(num_devices)]
-    request.node.pci_ids = [ttnn.GetPCIeDeviceID(i) for i in device_ids]
-
-    # Get only physical devices
-    updated_device_params = get_updated_device_params(device_params)
-    devices = ttnn.CreateDevices(device_ids, **updated_device_params)
-
-    yield [devices[i] for i in range(num_devices)]
-
-    ttnn.CloseDevices(devices)
 
 
 # Reset fabric config to DISABLED if not None, and do nothing otherwise
@@ -359,12 +487,53 @@ def reset_fabric(fabric_config):
 # Set fabric config to passed in value
 # Do nothing if not set
 # Must be called before creating the mesh device
-def set_fabric(fabric_config):
+def set_fabric(
+    fabric_config, reliability_mode=None, fabric_tensix_config=None, fabric_manager=None, fabric_router_config=None
+):
     import ttnn
 
     # If fabric_config is not None, set it to fabric_config
     if fabric_config:
-        ttnn.set_fabric_config(fabric_config)
+        if reliability_mode is None:
+            reliability_mode = ttnn.FabricReliabilityMode.STRICT_INIT
+
+        # Apply default logic for fabric_tensix_config,
+        # fabric_tensix_config is used for enabling tensix extensions for the fabric router,
+        # some sender channels in the fabric router are moved to the fabric tensix extension
+        # (currently the extension is mux kernel, can have other kernels in future as well).
+        if fabric_tensix_config is None:
+            fabric_tensix_config = get_default_fabric_tensix_config()
+
+        if fabric_manager is None:
+            fabric_manager = ttnn.FabricManagerMode.DEFAULT
+
+        # Build kwargs for set_fabric_config, only include fabric_router_config if provided
+        if fabric_router_config is not None:
+            ttnn.set_fabric_config(
+                fabric_config,
+                reliability_mode,
+                None,
+                fabric_tensix_config,
+                ttnn.FabricUDMMode.DISABLED,
+                fabric_manager,
+                fabric_router_config,
+            )
+        else:
+            ttnn.set_fabric_config(
+                fabric_config,
+                reliability_mode,
+                None,
+                fabric_tensix_config,
+                ttnn.FabricUDMMode.DISABLED,
+                fabric_manager,
+            )
+
+
+def get_default_fabric_tensix_config():
+    import ttnn
+
+    # Default to DISABLED for all architectures
+    return ttnn.FabricTensixConfig.DISABLED
 
 
 @pytest.fixture(scope="function")
@@ -386,32 +555,77 @@ def mesh_device(request, silicon_arch_name, device_params):
     """
     import ttnn
 
-    device_ids = ttnn.get_device_ids()
+    request.node.pci_ids = ttnn.get_pcie_device_ids()
 
     try:
         param = request.param
     except (ValueError, AttributeError):
-        param = len(device_ids)  # Default to using all available devices
+        # Get number of devices from the system mesh descriptor.
+        param = ttnn._ttnn.multi_device.SystemMeshDescriptor().shape().mesh_size()
 
     if isinstance(param, tuple):
         grid_dims = param
         assert len(grid_dims) == 2, "Device mesh grid shape should have exactly two elements."
         num_devices_requested = grid_dims[0] * grid_dims[1]
-        if num_devices_requested > len(device_ids):
-            pytest.skip("Requested more devices than available. Test not applicable for machine")
-        mesh_shape = ttnn.MeshShape(*grid_dims)
-        assert num_devices_requested <= len(device_ids), "Requested more devices than available."
-    else:
-        num_devices_requested = min(param, len(device_ids))
-        mesh_shape = ttnn.MeshShape(1, num_devices_requested)
+        available_num_devices = (
+            ttnn._ttnn.multi_device.SystemMeshDescriptor().shape().mesh_size()
+            if ttnn.using_distributed_env()
+            else ttnn.get_num_devices()
+        )
+        if (
+            device_params.get("require_exact_physical_num_devices", False)
+            and num_devices_requested != available_num_devices
+        ):
+            pytest.skip(
+                f"Test requires exact match of requested num devices ({num_devices_requested}) to available physical num devices ({available_num_devices})."
+            )
 
-    request.node.pci_ids = [ttnn.GetPCIeDeviceID(i) for i in device_ids[:num_devices_requested]]
+        if num_devices_requested > available_num_devices:
+            pytest.skip(
+                f"Requested more devices ({num_devices_requested}) than available ({available_num_devices}). Test not applicable for machine"
+            )
+        mesh_shape = ttnn.MeshShape(*grid_dims)
+    else:
+        if not ttnn.using_distributed_env() and param > ttnn.get_num_devices():
+            pytest.skip(
+                f"Requested more devices ({param}) than available ({ttnn.get_num_devices()}). Test not applicable for machine"
+            )
+        mesh_shape = ttnn.MeshShape(1, param)
+
+    # Resolve trace_region_size against the SKU of the submesh actually opened.
+    # TRACE_MODEL_KEY_PARAM is resolved here (not at device_params/collection time) so the
+    # logical SKU reflects request.param/data_parallel/MESH_DEVICE, not the physical cluster.
+    trace_model_key = device_params.pop(TRACE_MODEL_KEY_PARAM, None)
+    if "trace_region_size" in device_params:
+        logger.info(
+            f"Keeping trace_region_size={device_params['trace_region_size']!r} from device_params (already set)"
+        )
+    elif trace_model_key is not None:
+        sku = get_logical_sku(request, param)
+        if sku is None:
+            logger.info(f"No SKU for {param!r}; not setting trace_region_size for model {trace_model_key!r}")
+        else:
+            device_params["trace_region_size"] = resolve_trace_region_size(trace_model_key, sku)
+    else:
+        override_trace_region_size = get_supported_trace_region_size(request, param)
+        if override_trace_region_size is None:
+            logger.info(f"No trace region size for {param!r}")
+        else:
+            device_params["trace_region_size"] = override_trace_region_size
 
     updated_device_params = get_updated_device_params(device_params)
+    updated_device_params.pop("require_exact_physical_num_devices", False)
     fabric_config = updated_device_params.pop("fabric_config", None)
+    fabric_tensix_config = updated_device_params.pop("fabric_tensix_config", None)
     reliability_mode = updated_device_params.pop("reliability_mode", None)
-    set_fabric(fabric_config)
+    fabric_manager = updated_device_params.pop("fabric_manager", None)
+    fabric_router_config = updated_device_params.pop("fabric_router_config", None)
+    set_fabric(fabric_config, reliability_mode, fabric_tensix_config, fabric_manager, fabric_router_config)
     mesh_device = ttnn.open_mesh_device(mesh_shape=mesh_shape, **updated_device_params)
+
+    from tests.tests_common.cache_entries_counter import CacheEntriesCounter
+
+    mesh_device.cache_entries_counter = CacheEntriesCounter(mesh_device)
 
     logger.debug(f"multidevice with {mesh_device.get_num_devices()} devices is created")
     yield mesh_device
@@ -469,8 +683,9 @@ def pcie_mesh_device(request, silicon_arch_name, silicon_arch_wormhole_b0, devic
 
     updated_device_params = get_updated_device_params(device_params)
     fabric_config = updated_device_params.pop("fabric_config", None)
+    fabric_tensix_config = updated_device_params.pop("fabric_tensix_config", None)
     reliability_mode = updated_device_params.pop("reliability_mode", None)
-    set_fabric(fabric_config)
+    set_fabric(fabric_config, reliability_mode, fabric_tensix_config)
     mesh_device = ttnn.open_mesh_device(
         mesh_shape=ttnn.MeshShape(2, 2),
         **updated_device_params,
@@ -490,21 +705,28 @@ def pcie_mesh_device(request, silicon_arch_name, silicon_arch_wormhole_b0, devic
 
 
 @pytest.fixture(scope="function")
-def n300_mesh_device(request, silicon_arch_name, silicon_arch_wormhole_b0, device_params):
+def bh_1d_mesh_device(request, silicon_arch_name, silicon_arch_blackhole, device_params):
+    # Generic blackhole configuration
+    # This configures an [m,n] blackhole mesh device to appear as a [1,m*n] line or ring
+    # Implements wraparound in rackboxes
     import ttnn
 
-    if ttnn.get_num_devices() < 2:
+    if ttnn.get_num_devices() not in [1, 2, 4, 8, 32]:
         pytest.skip()
 
+    request.node.pci_ids = ttnn.get_pcie_device_ids()
     updated_device_params = get_updated_device_params(device_params)
     fabric_config = updated_device_params.pop("fabric_config", None)
+    fabric_tensix_config = updated_device_params.pop("fabric_tensix_config", None)
     reliability_mode = updated_device_params.pop("reliability_mode", None)
-    set_fabric(fabric_config)
+    fabric_manager = updated_device_params.pop("fabric_manager", None)
+    fabric_router_config = updated_device_params.pop("fabric_router_config", None)
+    set_fabric(fabric_config, reliability_mode, fabric_tensix_config, fabric_manager, fabric_router_config)
+
     mesh_device = ttnn.open_mesh_device(
-        mesh_shape=ttnn.MeshShape(1, 2),
+        mesh_shape=ttnn.MeshShape(ttnn.get_num_devices(), 1),
         **updated_device_params,
     )
-
     logger.debug(f"multidevice with {mesh_device.get_num_devices()} devices is created")
     yield mesh_device
 
@@ -516,49 +738,35 @@ def n300_mesh_device(request, silicon_arch_name, silicon_arch_wormhole_b0, devic
     del mesh_device
 
 
-@pytest.fixture(scope="function")
-def t3k_mesh_device(request, silicon_arch_name, silicon_arch_wormhole_b0, device_params):
+@contextlib.contextmanager
+def bh_2d_mesh_device_context(device_params):
     import ttnn
 
-    if ttnn.get_num_devices() < 8:
-        pytest.skip()
-
-    request.node.pci_ids = ttnn.get_pcie_device_ids()
+    if ttnn.get_num_devices() not in [1, 2, 4, 8, 32]:
+        raise RuntimeError("bh_2d_mesh_device requires 1, 2, 4, 8, or 32 devices (got %s)" % ttnn.get_num_devices())
     updated_device_params = get_updated_device_params(device_params)
     fabric_config = updated_device_params.pop("fabric_config", None)
+    fabric_tensix_config = updated_device_params.pop("fabric_tensix_config", None)
     reliability_mode = updated_device_params.pop("reliability_mode", None)
-    set_fabric(fabric_config)
-    mesh_device = ttnn.open_mesh_device(
-        mesh_shape=ttnn.MeshShape(1, 8),
-        **updated_device_params,
-    )
+    fabric_manager = updated_device_params.pop("fabric_manager", None)
+    fabric_router_config = updated_device_params.pop("fabric_router_config", None)
+    set_fabric(fabric_config, reliability_mode, fabric_tensix_config, fabric_manager, fabric_router_config)
 
-    logger.debug(f"multidevice with {mesh_device.get_num_devices()} devices is created")
-    yield mesh_device
-
-    for submesh in mesh_device.get_submeshes():
-        ttnn.close_mesh_device(submesh)
-
-    ttnn.close_mesh_device(mesh_device)
-    reset_fabric(fabric_config)
-    del mesh_device
-
-
-@pytest.fixture(scope="function")
-def p150_mesh_device(request, silicon_arch_name, silicon_arch_blackhole, device_params):
-    import ttnn
-
-    if ttnn.get_num_devices() not in [1, 2, 4, 8]:
-        pytest.skip()
-
-    request.node.pci_ids = ttnn.get_pcie_device_ids()
-    updated_device_params = get_updated_device_params(device_params)
-    fabric_config = updated_device_params.pop("fabric_config", None)
-    reliability_mode = updated_device_params.pop("reliability_mode", None)
-    set_fabric(fabric_config)
-    if ttnn.get_num_devices() == 8:
+    # TODO #50463: Revisit MGD path handling
+    if os.environ.get("TT_MESH_GRAPH_DESC_PATH"):
+        mesh_shape = ttnn._ttnn.multi_device.SystemMeshDescriptor().shape()
+        mesh_device = ttnn.open_mesh_device(
+            mesh_shape=mesh_shape,
+            **updated_device_params,
+        )
+    elif ttnn.get_num_devices() == 8:
         mesh_device = ttnn.open_mesh_device(
             mesh_shape=ttnn.MeshShape(4, 2),
+            **updated_device_params,
+        )
+    elif ttnn.get_num_devices() == 32:
+        mesh_device = ttnn.open_mesh_device(
+            mesh_shape=ttnn.MeshShape(4, 8),
             **updated_device_params,
         )
     else:
@@ -567,14 +775,78 @@ def p150_mesh_device(request, silicon_arch_name, silicon_arch_blackhole, device_
             **updated_device_params,
         )
     logger.debug(f"multidevice with {mesh_device.get_num_devices()} devices is created")
-    yield mesh_device
+    try:
+        yield mesh_device
+    finally:
+        for submesh in mesh_device.get_submeshes():
+            ttnn.close_mesh_device(submesh)
+        ttnn.close_mesh_device(mesh_device)
+        reset_fabric(fabric_config)
+        del mesh_device
 
-    for submesh in mesh_device.get_submeshes():
-        ttnn.close_mesh_device(submesh)
 
-    ttnn.close_mesh_device(mesh_device)
-    reset_fabric(fabric_config)
-    del mesh_device
+@pytest.fixture(scope="function")
+def bh_2d_mesh_device(request, silicon_arch_name, silicon_arch_blackhole, device_params):
+    import ttnn
+
+    if ttnn.get_num_devices() not in [1, 2, 4, 8, 32]:
+        pytest.skip()
+
+    request.node.pci_ids = ttnn.get_pcie_device_ids()
+    with bh_2d_mesh_device_context(device_params) as mesh_device:
+        yield mesh_device
+
+
+def _check_requires_grid_size(device_or_mesh, marker):
+    """Skip the test if device worker grid (compute_with_storage_grid_size) is smaller than required by the mark."""
+    if marker is None or len(marker.args) == 0:
+        return
+    required = marker.args[0]
+    grid = device_or_mesh.compute_with_storage_grid_size()
+    if isinstance(required, tuple):
+        min_x, min_y = required
+        if grid.x < min_x or grid.y < min_y:
+            pytest.skip(
+                f"Test requires device worker grid at least {min_x}x{min_y} but "
+                f"got {grid.x}x{grid.y} ({grid.x * grid.y} cores)"
+            )
+    else:
+        min_cores = int(required)
+        total = grid.x * grid.y
+        if total < min_cores:
+            pytest.skip(f"Test requires at least {min_cores} worker cores but got {total} ({grid.x}x{grid.y})")
+
+
+@pytest.fixture(autouse=True)
+def check_requires_grid_size(request):
+    """Autouse fixture: skips the test when it has requires_grid_size mark and device worker grid is too small. Supports device, bh_2d_mesh_device, and mesh_device. Tests only need @pytest.mark.requires_grid_size((x,y)) or @pytest.mark.requires_grid_size(n_cores).
+
+    Enforces *every* requires_grid_size marker on the item, not just the closest
+    one. A parametrized case commonly carries both a function-level default
+    requirement and a stricter per-param requirement (via pytest.param(marks=...));
+    get_closest_marker() would return only one of them and silently drop the other,
+    letting an under-provisioned grid (e.g. a harvested board) run a case that needs
+    more cores. Applying all markers makes the strictest requirement win.
+    """
+    markers = list(request.node.iter_markers("requires_grid_size"))
+    if not markers:
+        return
+    for name in ("bh_2d_mesh_device", "mesh_device", "device"):
+        if name in request.fixturenames:
+            device_or_mesh = request.getfixturevalue(name)
+            for marker in markers:
+                _check_requires_grid_size(device_or_mesh, marker)
+            return
+    pytest.skip(
+        "requires_grid_size mark requires one of: device, bh_2d_mesh_device, mesh_device (none requested by test)"
+    )
+
+
+requires_hybrid_allocator = pytest.mark.skipif(
+    os.environ.get("TT_METAL_ALLOCATOR_MODE_HYBRID") != "1",
+    reason="Test requires TT_METAL_ALLOCATOR_MODE_HYBRID=1 for per-core L1 allocation; "
+    "the env var must be exported before pytest starts so ttnn.open_device() sees it.",
+)
 
 
 @pytest.fixture()
@@ -585,36 +857,35 @@ def ensure_devices_tg():
     assert len(device_ids) == 32, f"Expected 32 devices, got {len(device_ids)}"
 
 
-@pytest.fixture()
-def clear_compile_cache():
-    yield
-    import ttnn
-
-    ttnn.device.DisablePersistentKernelCache()
-
-
 @pytest.fixture(autouse=True)
-def reset_default_device():
+def reset_default_device(request):
     import ttnn
 
-    device = ttnn.GetDefaultDevice()
+    # Skip applying the fixture logic for this test
+    if "no_reset_default_device" in request.keywords:
+        yield
+        return
+
+    try:
+        device = ttnn.GetDefaultDevice()
+    except Exception:
+        logger.warning("Device handle is stale/crashed - setting saved device to None")
+        device = None
+
     yield
-    ttnn.SetDefaultDevice(device)
+
+    if device is not None:
+        ttnn.SetDefaultDevice(device)
+    elif "device" in request.fixturenames:
+        # if the test used a device, but there was no default device, we need to clear the default device
+        ttnn.SetDefaultDevice(None)
 
 
 def get_devices(request):
     if "device" in request.fixturenames:
         devices = [request.getfixturevalue("device")]
-    elif "all_devices" in request.fixturenames:
-        devices = request.getfixturevalue("all_devices")
-    elif "pcie_devices" in request.fixturenames:
-        devices = request.getfixturevalue("pcie_devices")
     elif "mesh_device" in request.fixturenames:
         devices = [request.getfixturevalue("mesh_device")]
-    elif "n300_mesh_device" in request.fixturenames:
-        devices = [request.getfixturevalue("n300_mesh_device")]
-    elif "t3k_mesh_device" in request.fixturenames:
-        devices = [request.getfixturevalue("t3k_mesh_device")]
     elif "pcie_mesh_device" in request.fixturenames:
         devices = [request.getfixturevalue("pcie_mesh_device")]
     elif "t3k_single_board_mesh_device" in request.fixturenames:
@@ -635,6 +906,29 @@ def tracy_profile():
     profiler.disable()
 
 
+@pytest.fixture
+def expect_error():
+    """Use instead of pytest.raises. Adds info to the logs that these errors are expected,
+    which helps automated CI log triaging. message must appear in the real device error
+    text (the TT_FATAL line), since that's what the triager matches.
+
+        with expect_error(RuntimeError, "Out of Memory"):
+            ...
+    """
+
+    @contextlib.contextmanager
+    def expect_error_(error, message):
+        names = ", ".join(e.__name__ for e in (error if isinstance(error, tuple) else (error,)))
+        logger.info(f'[EXPECTED_ERROR BEGIN] {names} message="{message}"')
+        try:
+            with pytest.raises(error, match=message) as exc_info:
+                yield exc_info
+        finally:
+            logger.info(f'[EXPECTED_ERROR END] {names} message="{message}"')
+
+    return expect_error_
+
+
 ###############################
 # Modifying pytest hooks
 ###############################
@@ -643,6 +937,7 @@ ALL_ARCHS = set(
         "grayskull",
         "wormhole_b0",
         "blackhole",
+        "quasar",
     ]
 )
 
@@ -682,12 +977,6 @@ def pytest_addoption(parser):
     )
     parser.addoption("--cli-input", action="store", default=None, help="Enter prompt if --input-method=cli")
     parser.addoption(
-        "--metal-timeout",
-        action="store",
-        default=None,
-        help="Enable process timeout",
-    )
-    parser.addoption(
         "--didt-workload-iterations",
         action="store",
         default=None,
@@ -703,7 +992,7 @@ def pytest_addoption(parser):
         "--grid-size",
         action="store",
         default=None,
-        help="Size of chip grid for the test to run on. Grid size is defined by nubmer of cores in row x number of cores in column, e.g., 8x8",
+        help="Size of chip grid for the test to run on. Grid size is defined by number of cores in row x number of cores in column, e.g., 8x8",
     )
 
 
@@ -887,95 +1176,71 @@ def pytest_runtest_makereport(item, call):
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_teardown(item, nextitem):
     yield
-    metal_timeout_enabled = item.config.getoption("--metal-timeout")
-    using_xdist = int(os.getenv("PYTEST_XDIST_WORKER_COUNT", "0"))
-
-    if metal_timeout_enabled is not None or using_xdist:
-        report = item.stash[phase_report_key]
-        test_failed = report.get("call", None) and report["call"].failed
-        if test_failed:
-            logger.info(f"In custom teardown, open device ids: {set(item.pci_ids)}")
-            reset_tensix(set(item.pci_ids))
-
-
-# This is overriding the timer setup hook from pytest-timeout
-# If --metal-timeout is passed, we define a new timeout method that spawns a timer process
-# At timeout, the process kills it's parent (the test process) and then itself
-@pytest.hookimpl(tryfirst=True)
-def pytest_timeout_set_timer(item, settings):
-    metal_timeout_enabled = item.config.getoption("--metal-timeout")
-    using_xdist = int(os.getenv("PYTEST_XDIST_WORKER_COUNT", "0"))
-
-    if metal_timeout_enabled is not None or using_xdist:
-        parent_pid = os.getpid()
-        logger.info(f"Metal timeout {settings.timeout} seconds {parent_pid} for {item.nodeid}")
-
-        def get_parent_status():
-            try:
-                parent = psutil.Process(parent_pid)
-            except:
-                return "already dead"
-            return parent.status()
-
-        def run_timer(settings):
-            logger.info(f"Timer started for {item.nodeid}")
-            dead_status = ["zombie", "dead", "already dead"]
-            timeout = settings.timeout
-            parent_status = "running"
-            while parent_status not in dead_status and timeout > 0:
-                time.sleep(5)
-                timeout -= 5
-                parent_status = get_parent_status()
-            if parent_status != "already dead":
-                logger.warning(f"This test seems to have hung... Timing out test case")
-                os.kill(parent_pid, signal.SIGKILL)
-            logger.info(f"Killing timer")
-            os._exit(1)
-
-        def cancel():
-            logger.info(f"Cancelling timer")
-            metal_timer.terminate()
-
-        metal_timer = multiprocess.Process(target=run_timer, args=(settings,), daemon=True)
-        item.cancel_timeout = cancel
-        metal_timer.start()
-    return True
-
-
-# This is a hook used in pytest-xdist to handle when a worker crashes out
-# In our case, combined with pytest-timeout thread method, the worker will crash out for a hang and
-# then it should get cleaned up by the controller through this fixture
-@pytest.hookimpl(tryfirst=True)
-def pytest_handlecrashitem(crashitem, report, sched):
-    reset_tensix()
+    # Reset devices on test failure
+    report = item.stash[phase_report_key]
+    test_failed = report.get("call", None) and report["call"].failed
+    if test_failed:
+        # pci_ids may be on the test item (function-scoped device) or on the
+        # parent module node (module-scoped device via use_module_device marker)
+        pci_ids = getattr(item, "pci_ids", None)
+        if pci_ids is None and item.parent is not None:
+            pci_ids = getattr(item.parent, "pci_ids", None)
+        if pci_ids is not None:
+            logger.info(f"In custom teardown, open device ids: {set(pci_ids)}")
+            # reset_tensix(set(pci_ids))
 
 
 def reset_tensix(tt_open_devices=None):
-    import shutil
-
     if is_galaxy():
         logger.info("Skipping reset for Galaxy systems, need a new reset.json scheme")
         return
 
-    # Check if tt-smi exists
-    if not shutil.which("tt-smi"):
-        logger.error("tt-smi command not found. Cannot reset devices. Please install tt-smi.")
+    try:
+        import tt_umd
+    except ImportError:
+        logger.error("tt_umd not found. Cannot reset devices. Please install tt-umd.")
         return
 
     if tt_open_devices is None:
-        logger.info(f"Running reset for all pci devices")
-        smi_reset_result = run_process_and_get_result(f"tt-smi -r")
+        logger.info("Running reset for all pci devices")
+        success = tt_umd.WarmReset.warm_reset()
     else:
-        tt_open_devices_str = ",".join([str(i) for i in tt_open_devices])
-        logger.info(f"Running reset for pci devices: {tt_open_devices_str}")
-        smi_reset_result = run_process_and_get_result(f"tt-smi -r {tt_open_devices_str}")
+        device_ids = list(tt_open_devices)
+        logger.info(f"Running reset for pci devices: {device_ids}")
+        success = tt_umd.WarmReset.warm_reset(pci_device_ids=device_ids)
 
-    logger.info(f"tt-smi reset status: {smi_reset_result.returncode}")
+    if not success:
+        logger.warning(
+            "UMD warm reset failed. "
+            "The device may be in an inconsistent state. This can happen if device handles "
+            "are still open (e.g., UMD connection held by the process). Subsequent tests may fail."
+        )
+    else:
+        logger.info("UMD warm reset completed successfully")
 
 
-@pytest.hookimpl(tryfirst=True)
-def pytest_xdist_auto_num_workers(config):
-    return 1
+@pytest.fixture(autouse=True)
+def ttnn_graph_report(request):
+    """
+    Automatically generate graph reports when config enables it.
+
+    Gates on enable_logging and either enable_graph_report or enable_comparison_mode,
+    then delegates to ``ttnn.graph_report.run_pytest_graph_report_fixture`` for
+    report_path validation, capture lifecycle, and import.
+    """
+    import ttnn
+
+    if not getattr(ttnn.CONFIG, "enable_logging", False):
+        yield
+        return
+
+    enable_graph_report = getattr(ttnn.CONFIG, "enable_graph_report", False)
+    enable_comparison_mode = getattr(ttnn.CONFIG, "enable_comparison_mode", False)
+    if not enable_graph_report and not enable_comparison_mode:
+        yield
+        return
+
+    yield from ttnn.graph_report.run_pytest_graph_report_fixture(request)
 
 
 @pytest.fixture(scope="function", autouse=True)

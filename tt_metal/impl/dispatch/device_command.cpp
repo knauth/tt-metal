@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,8 +6,12 @@
 
 #include <cstring>
 
+#include <random>
+
 #include <tt_stl/aligned_allocator.hpp>
-#include "assert.hpp"
+#include <tt_stl/assert.hpp>
+#include "dispatch/dispatch_core_manager.hpp"
+#include "dispatch/dispatch_mem_map.hpp"
 #include "dispatch/kernels/cq_commands.hpp"
 #include "dispatch/memcpy.hpp"
 #include "dispatch_settings.hpp"
@@ -17,7 +21,7 @@ namespace tt::tt_metal {
 
 template <bool hugepage_write>
 DeviceCommand<hugepage_write>::DeviceCommand(void* cmd_region, uint32_t cmd_sequence_sizeB) :
-    cmd_sequence_sizeB(cmd_sequence_sizeB), cmd_region(cmd_region), cmd_write_offsetB(0) {
+    cmd_sequence_sizeB(cmd_sequence_sizeB), cmd_region(cmd_region) {
     TT_FATAL(
         cmd_sequence_sizeB % sizeof(uint32_t) == 0,
         "Command sequence size B={} is not {}-byte aligned",
@@ -27,8 +31,7 @@ DeviceCommand<hugepage_write>::DeviceCommand(void* cmd_region, uint32_t cmd_sequ
 
 template <bool hugepage_write>
 template <bool hp_w, typename std::enable_if_t<!hp_w, int>>
-DeviceCommand<hugepage_write>::DeviceCommand(uint32_t cmd_sequence_sizeB) :
-    cmd_sequence_sizeB(cmd_sequence_sizeB), cmd_write_offsetB(0) {
+DeviceCommand<hugepage_write>::DeviceCommand(uint32_t cmd_sequence_sizeB) : cmd_sequence_sizeB(cmd_sequence_sizeB) {
     TT_FATAL(
         cmd_sequence_sizeB % sizeof(uint32_t) == 0,
         "Command sequence size B={} is not {}-byte aligned",
@@ -40,6 +43,9 @@ DeviceCommand<hugepage_write>::DeviceCommand(uint32_t cmd_sequence_sizeB) :
 
 template <bool hugepage_write>
 DeviceCommand<hugepage_write>& DeviceCommand<hugepage_write>::operator=(const DeviceCommand& other) {
+    if (this == &other) {
+        return *this;
+    }
     this->cmd_sequence_sizeB = other.cmd_sequence_sizeB;
     this->cmd_write_offsetB = other.cmd_write_offsetB;
     this->cmd_region_vector = other.cmd_region_vector;
@@ -103,7 +109,25 @@ vector_aligned<uint32_t> DeviceCommand<hugepage_write>::cmd_vector() const {
 
 template <bool hugepage_write>
 void DeviceCommand<hugepage_write>::add_dispatch_wait(
-    uint32_t flags, uint32_t address, uint32_t stream, uint32_t count, uint8_t dispatcher_type) {
+    uint32_t flags, uint32_t address, uint32_t stream, uint32_t count, uint8_t cq_id, uint8_t dispatcher_type) {
+    // If there are no stream registers (Quasar), translate stream flags to memory flags and calculate the L1 worker
+    // completion counter address from the stream index.
+    if (!MetalContext::instance().hal().has_stream_registers() &&
+        (flags & (CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM))) {
+        const auto& mem_map = MetalContext::instance().dispatch_mem_map();
+        const uint32_t first_stream = mem_map.get_dispatch_stream_index(0);
+        const uint32_t completion_counter_offset = mem_map.get_completion_counter_offset(cq_id);
+        address = mem_map.get_dispatch_message_addr_start() +
+                  completion_counter_offset * MetalContext::instance().hal().get_alignment(HalMemType::L1) +
+                  mem_map.get_sync_offset(stream - first_stream);
+        uint32_t new_flags = flags & ~(CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM);
+        new_flags |= CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_MEMORY;
+        if (flags & CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM) {
+            new_flags |= CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_MEMORY;
+        }
+        flags = new_flags;
+        stream = 0;
+    }
     auto initialize_wait_cmds = [&](CQPrefetchCmd* relay_wait, CQDispatchCmd* wait_cmd) {
         relay_wait->base.cmd_id = CQ_PREFETCH_CMD_RELAY_INLINE;
         relay_wait->relay_inline.dispatcher_type = dispatcher_type;
@@ -121,8 +145,8 @@ void DeviceCommand<hugepage_write>::add_dispatch_wait(
     CQDispatchCmd* wait_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_wait;
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd wait_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_wait{};
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd wait_cmd{};
         initialize_wait_cmds(&relay_wait, &wait_cmd);
         this->memcpy(relay_wait_dst, &relay_wait, sizeof(CQPrefetchCmd));
         this->memcpy(wait_cmd_dst, &wait_cmd, sizeof(CQDispatchCmd));
@@ -134,8 +158,8 @@ void DeviceCommand<hugepage_write>::add_dispatch_wait(
 
 template <bool hugepage_write>
 void DeviceCommand<hugepage_write>::add_dispatch_wait_with_prefetch_stall(
-    uint32_t flags, uint32_t address, uint32_t stream, uint32_t count) {
-    this->add_dispatch_wait(flags | CQ_DISPATCH_CMD_WAIT_FLAG_NOTIFY_PREFETCH, address, stream, count);
+    uint32_t flags, uint32_t address, uint32_t stream, uint32_t count, uint8_t cq_id) {
+    this->add_dispatch_wait(flags | CQ_DISPATCH_CMD_WAIT_FLAG_NOTIFY_PREFETCH, address, stream, count, cq_id);
     uint32_t increment_sizeB = tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment);
     auto initialize_stall_cmd = [&](CQPrefetchCmd* stall_cmd) {
         *stall_cmd = {};
@@ -144,7 +168,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_wait_with_prefetch_stall(
     CQPrefetchCmd* stall_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd stall_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd stall_cmd{};
         initialize_stall_cmd(&stall_cmd);
         this->memcpy(stall_cmd_dst, &stall_cmd, sizeof(CQPrefetchCmd));
     } else {
@@ -153,22 +177,44 @@ void DeviceCommand<hugepage_write>::add_dispatch_wait_with_prefetch_stall(
 }
 
 template <bool hugepage_write>
-void DeviceCommand<hugepage_write>::add_prefetch_relay_linear(uint32_t noc_xy_addr, uint32_t lengthB, uint32_t addr) {
-    uint32_t increment_sizeB = tt::align(sizeof(CQPrefetchCmd), this->pcie_alignment);
-    auto initialize_relay_linear_cmd = [&](CQPrefetchCmd* relay_linear_cmd) {
+void DeviceCommand<hugepage_write>::add_prefetch_relay_linear(
+    uint32_t noc_xy_addr, DeviceAddr lengthB, DeviceAddr addr) {
+    uint32_t increment_sizeB = tt::align(sizeof(CQPrefetchCmdLarge), this->pcie_alignment);
+    auto initialize_relay_linear_cmd = [&](CQPrefetchCmdLarge* relay_linear_cmd) {
         relay_linear_cmd->base.cmd_id = CQ_PREFETCH_CMD_RELAY_LINEAR;
         relay_linear_cmd->relay_linear.noc_xy_addr = noc_xy_addr;
         relay_linear_cmd->relay_linear.length = lengthB;
         relay_linear_cmd->relay_linear.addr = addr;
     };
-    CQPrefetchCmd* relay_linear_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
+    CQPrefetchCmdLarge* relay_linear_cmd_dst = this->reserve_space<CQPrefetchCmdLarge*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_linear_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmdLarge relay_linear_cmd{};
         initialize_relay_linear_cmd(&relay_linear_cmd);
-        this->memcpy(relay_linear_cmd_dst, &relay_linear_cmd, sizeof(CQPrefetchCmd));
+        this->memcpy(relay_linear_cmd_dst, &relay_linear_cmd, sizeof(CQPrefetchCmdLarge));
     } else {
         initialize_relay_linear_cmd(relay_linear_cmd_dst);
+    }
+}
+
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_prefetch_relay_linear_h(
+    uint32_t noc_xy_addr, DeviceAddr lengthB, DeviceAddr addr) {
+    uint32_t increment_sizeB = tt::align(sizeof(CQPrefetchCmdLarge), this->pcie_alignment);
+    auto initialize_relay_linear_h_cmd = [&](CQPrefetchCmdLarge* relay_linear_h_cmd) {
+        relay_linear_h_cmd->base.cmd_id = CQ_PREFETCH_CMD_RELAY_LINEAR_H;
+        relay_linear_h_cmd->relay_linear_h.noc_xy_addr = noc_xy_addr;
+        relay_linear_h_cmd->relay_linear_h.length = lengthB;
+        relay_linear_h_cmd->relay_linear_h.addr = addr;
+    };
+    CQPrefetchCmdLarge* relay_linear_h_cmd_dst = this->reserve_space<CQPrefetchCmdLarge*>(increment_sizeB);
+
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmdLarge relay_linear_h_cmd{};
+        initialize_relay_linear_h_cmd(&relay_linear_h_cmd);
+        this->memcpy(relay_linear_h_cmd_dst, &relay_linear_h_cmd, sizeof(CQPrefetchCmdLarge));
+    } else {
+        initialize_relay_linear_h_cmd(relay_linear_h_cmd_dst);
     }
 }
 
@@ -195,7 +241,7 @@ void DeviceCommand<hugepage_write>::add_prefetch_relay_paged(
     CQPrefetchCmd* relay_paged_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_paged_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_paged_cmd{};
         initialize_relay_paged_cmd(&relay_paged_cmd);
         this->memcpy(relay_paged_cmd_dst, &relay_paged_cmd, sizeof(CQPrefetchCmd));
     } else {
@@ -222,14 +268,85 @@ void DeviceCommand<hugepage_write>::add_prefetch_relay_paged_packed(
     CQPrefetchCmd* relay_paged_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_paged_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_paged_cmd{};
         initialize_relay_paged_cmd(&relay_paged_cmd);
         this->memcpy(relay_paged_cmd_dst, &relay_paged_cmd, sizeof(CQPrefetchCmd));
     } else {
         initialize_relay_paged_cmd(relay_paged_cmd_dst);
     }
 
-    this->memcpy((char*)relay_paged_cmd_dst + sizeof(CQPrefetchCmd), &sub_cmds[offset_idx], sub_cmds_sizeB);
+    this->memcpy(
+        reinterpret_cast<char*>(relay_paged_cmd_dst) + sizeof(CQPrefetchCmd), &sub_cmds[offset_idx], sub_cmds_sizeB);
+}
+
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_prefetch_relay_linear_packed(
+    uint32_t noc_xy_addr,
+    uint32_t total_length,
+    const std::vector<CQPrefetchRelayLinearPackedSubCmd>& sub_cmds,
+    uint16_t num_sub_cmds,
+    uint32_t offset_idx) {
+    static_assert(sizeof(CQPrefetchRelayLinearPackedSubCmd) % sizeof(uint32_t) == 0);
+
+    uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQPrefetchRelayLinearPackedSubCmd);
+    uint32_t increment_sizeB = tt::align(sub_cmds_sizeB + sizeof(CQPrefetchCmd), this->pcie_alignment);
+    auto initialize_relay_linear_packed_cmd = [&](CQPrefetchCmd* relay_linear_packed_cmd) {
+        relay_linear_packed_cmd->base.cmd_id = CQ_PREFETCH_CMD_RELAY_LINEAR_PACKED;
+        relay_linear_packed_cmd->relay_linear_packed.noc_xy_addr = noc_xy_addr;
+        relay_linear_packed_cmd->relay_linear_packed.total_length = total_length;
+        relay_linear_packed_cmd->relay_linear_packed.stride = increment_sizeB;
+        relay_linear_packed_cmd->relay_linear_packed.count = num_sub_cmds;
+        relay_linear_packed_cmd->relay_linear_packed.pad = 0;
+    };
+    CQPrefetchCmd* relay_linear_packed_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
+
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_linear_packed_cmd{};
+        initialize_relay_linear_packed_cmd(&relay_linear_packed_cmd);
+        this->memcpy(relay_linear_packed_cmd_dst, &relay_linear_packed_cmd, sizeof(CQPrefetchCmd));
+    } else {
+        initialize_relay_linear_packed_cmd(relay_linear_packed_cmd_dst);
+    }
+
+    this->memcpy(
+        reinterpret_cast<char*>(relay_linear_packed_cmd_dst) + sizeof(CQPrefetchCmd),
+        &sub_cmds[offset_idx],
+        sub_cmds_sizeB);
+}
+
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_prefetch_relay_linear_packed_h(
+    uint32_t noc_xy_addr,
+    uint32_t total_length,
+    const std::vector<CQPrefetchRelayLinearPackedSubCmd>& sub_cmds,
+    uint16_t num_sub_cmds,
+    uint32_t offset_idx) {
+    static_assert(sizeof(CQPrefetchRelayLinearPackedSubCmd) % sizeof(uint32_t) == 0);
+
+    uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQPrefetchRelayLinearPackedSubCmd);
+    uint32_t increment_sizeB = tt::align(sub_cmds_sizeB + sizeof(CQPrefetchCmd), this->pcie_alignment);
+    auto initialize_relay_linear_packed_h_cmd = [&](CQPrefetchCmd* relay_linear_packed_h_cmd) {
+        relay_linear_packed_h_cmd->base.cmd_id = CQ_PREFETCH_CMD_RELAY_LINEAR_PACKED_H;
+        relay_linear_packed_h_cmd->relay_linear_packed.noc_xy_addr = noc_xy_addr;
+        relay_linear_packed_h_cmd->relay_linear_packed.total_length = total_length;
+        relay_linear_packed_h_cmd->relay_linear_packed.stride = increment_sizeB;
+        relay_linear_packed_h_cmd->relay_linear_packed.count = num_sub_cmds;
+        relay_linear_packed_h_cmd->relay_linear_packed.pad = 0;
+    };
+    CQPrefetchCmd* relay_linear_packed_h_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
+
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_linear_packed_h_cmd{};
+        initialize_relay_linear_packed_h_cmd(&relay_linear_packed_h_cmd);
+        this->memcpy(relay_linear_packed_h_cmd_dst, &relay_linear_packed_h_cmd, sizeof(CQPrefetchCmd));
+    } else {
+        initialize_relay_linear_packed_h_cmd(relay_linear_packed_h_cmd_dst);
+    }
+
+    this->memcpy(
+        reinterpret_cast<char*>(relay_linear_packed_h_cmd_dst) + sizeof(CQPrefetchCmd),
+        &sub_cmds[offset_idx],
+        sub_cmds_sizeB);
 }
 
 template <bool hugepage_write>
@@ -243,7 +360,7 @@ void DeviceCommand<hugepage_write>::add_prefetch_paged_to_ringbuffer(
     CQPrefetchCmd* paged_to_ringbuffer_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd paged_to_ringbuffer_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd paged_to_ringbuffer_cmd{};
         initialize_paged_to_ringbuffer_cmd(&paged_to_ringbuffer_cmd);
         this->memcpy(paged_to_ringbuffer_cmd_dst, &paged_to_ringbuffer_cmd, sizeof(CQPrefetchCmd));
     } else {
@@ -262,7 +379,7 @@ void DeviceCommand<hugepage_write>::add_prefetch_set_ringbuffer_offset(uint32_t 
     CQPrefetchCmd* set_ringbuffer_offset_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd set_ringbuffer_offset_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd set_ringbuffer_offset_cmd{};
         initialize_set_ringbuffer_offset_cmd(&set_ringbuffer_offset_cmd);
         this->memcpy(set_ringbuffer_offset_cmd_dst, &set_ringbuffer_offset_cmd, sizeof(CQPrefetchCmd));
     } else {
@@ -286,7 +403,7 @@ void DeviceCommand<hugepage_write>::add_prefetch_relay_ringbuffer(
     CQPrefetchCmd* relay_ringbuffer_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_ringbuffer_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_ringbuffer_cmd{};
         initialize_relay_ringbuffer_cmd(&relay_ringbuffer_cmd);
         this->memcpy(relay_ringbuffer_cmd_dst, &relay_ringbuffer_cmd, sizeof(CQPrefetchCmd));
     } else {
@@ -301,14 +418,16 @@ template <bool flush_prefetch, bool inline_data>
 void DeviceCommand<hugepage_write>::add_dispatch_write_linear(
     uint8_t num_mcast_dests,
     uint32_t noc_xy_addr,
-    uint32_t addr,
-    uint32_t data_sizeB,
+    DeviceAddr addr,
+    DeviceAddr data_sizeB,
     const void* data,
     uint32_t write_offset_index) {
-    uint32_t payload_sizeB = sizeof(CQDispatchCmd) + (flush_prefetch ? data_sizeB : 0);
+    // payload to prefetch relay inline will always be limited to the length of the cmddat queue, i.e. < 64 bits
+    // Conversely if data_sizeB > 32-bits, then the data won't be inline
+    uint32_t payload_sizeB = static_cast<uint32_t>(sizeof(CQDispatchCmdLarge) + (flush_prefetch ? data_sizeB : 0));
     this->add_prefetch_relay_inline(flush_prefetch, payload_sizeB);
 
-    auto initialize_write_cmd = [&](CQDispatchCmd* write_cmd) {
+    auto initialize_write_cmd = [&](CQDispatchCmdLarge* write_cmd) {
         write_cmd->base.cmd_id = CQ_DISPATCH_CMD_WRITE_LINEAR;
         write_cmd->write_linear.num_mcast_dests = num_mcast_dests;
         write_cmd->write_linear.write_offset_index = write_offset_index;
@@ -316,12 +435,12 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_linear(
         write_cmd->write_linear.addr = addr;
         write_cmd->write_linear.length = data_sizeB;
     };
-    CQDispatchCmd* write_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
+    CQDispatchCmdLarge* write_cmd_dst = this->reserve_space<CQDispatchCmdLarge*>(sizeof(CQDispatchCmdLarge));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmdLarge write_cmd{};
         initialize_write_cmd(&write_cmd);
-        this->memcpy(write_cmd_dst, &write_cmd, sizeof(CQDispatchCmd));
+        this->memcpy(write_cmd_dst, &write_cmd, sizeof(CQDispatchCmdLarge));
     } else {
         initialize_write_cmd(write_cmd_dst);
     }
@@ -329,19 +448,19 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_linear(
     // Case 1: flush_prefetch
     //  a) there is inline_data: data is provided here and follows prefetch relay inline and cq dispatch write
     //  linear so total increment size is:
-    //          tt::align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd) + data_sizeB, pcie_alignment)
+    //          tt::align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmdLarge) + data_sizeB, pcie_alignment)
     //  b) don't have inline_data: next command should be to add_data (don't do aligned increment) so total
     //  increment size is:
-    //          sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd)
+    //          sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmdLarge)
     // Case 2: !flush_prefetch: no data, increment size is:
-    //          tt::align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd), pcie_alignment)
+    //          tt::align(sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmdLarge), pcie_alignment)
     // Note that adding prefetch_relay_inline and writing the dispatch command already increment cmd_write_offsetB
     // via calls to reserve_space
     if constexpr (flush_prefetch) {
         if constexpr (inline_data) {
             TT_ASSERT(data != nullptr);  // compiled out?
             this->add_data(data, data_sizeB, data_sizeB);
-            // this->cmd_write_offsetB has been incremented by sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmd) +
+            // this->cmd_write_offsetB has been incremented by sizeof(CQPrefetchCmd) + sizeof(CQDispatchCmdLarge) +
             // data_sizeB need to ensure this is aligned for next cmds to be written at the correct location
             this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
         }
@@ -350,6 +469,53 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_linear(
         this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
 }
+
+template <bool hugepage_write>
+template <bool flush_prefetch, bool inline_data>
+void DeviceCommand<hugepage_write>::add_dispatch_write_linear_h(
+    uint8_t num_mcast_dests,
+    uint32_t noc_xy_addr,
+    DeviceAddr addr,
+    DeviceAddr data_sizeB,
+    const void* data,
+    uint32_t write_offset_index) {
+    uint32_t payload_sizeB = sizeof(CQDispatchCmdLarge) + (flush_prefetch ? data_sizeB : 0);
+    this->add_prefetch_relay_inline(flush_prefetch, payload_sizeB);
+
+    auto initialize_write_cmd = [&](CQDispatchCmdLarge* write_cmd) {
+        write_cmd->base.cmd_id = CQ_DISPATCH_CMD_WRITE_LINEAR_H;
+        write_cmd->write_linear.num_mcast_dests = num_mcast_dests;
+        write_cmd->write_linear.write_offset_index = write_offset_index;
+        write_cmd->write_linear.noc_xy_addr = noc_xy_addr;
+        write_cmd->write_linear.addr = addr;
+        write_cmd->write_linear.length = data_sizeB;
+    };
+    CQDispatchCmdLarge* write_cmd_dst = this->reserve_space<CQDispatchCmdLarge*>(sizeof(CQDispatchCmdLarge));
+
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmdLarge write_cmd{};
+        initialize_write_cmd(&write_cmd);
+        this->memcpy(write_cmd_dst, &write_cmd, sizeof(CQDispatchCmdLarge));
+    } else {
+        initialize_write_cmd(write_cmd_dst);
+    }
+
+    if constexpr (flush_prefetch) {
+        if constexpr (inline_data) {
+            TT_ASSERT(data != nullptr);
+            this->add_data(data, data_sizeB, data_sizeB);
+            // Align so the next command is written to a correctly aligned location. Mirrors
+            // DeviceCommandCalculator::add_dispatch_write_linear_h and add_dispatch_write_linear.
+            this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+        }
+    } else {
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+    }
+}
+
+// Explicit template instantiations for add_dispatch_write_linear_h
+template void DeviceCommand<true>::add_dispatch_write_linear_h<false, false>(
+    uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
 
 template <bool hugepage_write>
 void DeviceCommand<hugepage_write>::add_dispatch_go_signal_mcast(
@@ -383,11 +549,31 @@ void DeviceCommand<hugepage_write>::add_dispatch_go_signal_mcast(
     CQDispatchCmd* mcast_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd mcast_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd mcast_cmd{};
         initialize_mcast_cmd(&mcast_cmd);
         this->memcpy(mcast_cmd_dst, &mcast_cmd, sizeof(CQDispatchCmd));
     } else {
         initialize_mcast_cmd(mcast_cmd_dst);
+    }
+    this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+}
+
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_dispatch_rt_profiler_flush(uint32_t wait_count, uint32_t wait_stream) {
+    this->add_prefetch_relay_inline(true, sizeof(CQDispatchCmd), DispatcherSelect::DISPATCH_SUBORDINATE);
+    auto initialize_flush_cmd = [&](CQDispatchCmd* flush_cmd) {
+        *flush_cmd = {};
+        flush_cmd->base.cmd_id = CQ_DISPATCH_CMD_RT_PROFILER_FLUSH;
+        flush_cmd->rt_profiler_flush.wait_count = wait_count;
+        flush_cmd->rt_profiler_flush.wait_stream = wait_stream;
+    };
+    CQDispatchCmd* flush_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd flush_cmd{};
+        initialize_flush_cmd(&flush_cmd);
+        this->memcpy(flush_cmd_dst, &flush_cmd, sizeof(CQDispatchCmd));
+    } else {
+        initialize_flush_cmd(flush_cmd_dst);
     }
     this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
 }
@@ -404,7 +590,7 @@ void DeviceCommand<hugepage_write>::add_notify_dispatch_s_go_signal_cmd(uint8_t 
     };
     CQDispatchCmd* dispatch_s_sem_update_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd dispatch_s_sem_update_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd dispatch_s_sem_update_cmd{};
         initialize_sem_update_cmd(&dispatch_s_sem_update_cmd);
         this->memcpy(dispatch_s_sem_update_dst, &dispatch_s_sem_update_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -438,7 +624,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_paged(
     CQDispatchCmd* write_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_cmd{};
         initialize_write_cmd(&write_cmd);
         this->memcpy(write_cmd_dst, &write_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -447,21 +633,65 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_paged(
 
     if (inline_data) {
         TT_ASSERT(data != nullptr);  // compiled out?
-        uint32_t increment_sizeB = tt::align(data_sizeB, this->pcie_alignment);
-        this->add_data(data, data_sizeB, increment_sizeB);
+        this->add_data(data, data_sizeB, data_sizeB);
+        // Increment wr offset to aligned address only if data is inline. Out-of-line data will
+        // follow right after the command, so defer alignment to after it.
+        this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
     }
+}
+
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_dispatch_write_paged_with_custom_inline_size(
+    bool flush_prefetch,
+    uint8_t is_dram,
+    uint16_t start_page,
+    uint32_t base_addr,
+    uint32_t page_size,
+    uint32_t pages,
+    uint32_t inline_data_sizeB,
+    const void* data) {
+    // When using custom inline size, always account for inline data in payload (e.g., alignment prefix bytes)
+    uint32_t payload_sizeB = sizeof(CQDispatchCmd) + inline_data_sizeB;
+    this->add_prefetch_relay_inline(flush_prefetch, payload_sizeB);
+
+    auto initialize_write_cmd = [&](CQDispatchCmd* write_cmd) {
+        write_cmd->base.cmd_id = CQ_DISPATCH_CMD_WRITE_PAGED;
+        write_cmd->write_paged.is_dram = is_dram;
+        write_cmd->write_paged.start_page = start_page;
+        write_cmd->write_paged.base_addr = base_addr;
+        write_cmd->write_paged.page_size = page_size;
+        write_cmd->write_paged.pages = pages;
+    };
+    CQDispatchCmd* write_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
+
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_cmd{};
+        initialize_write_cmd(&write_cmd);
+        this->memcpy(write_cmd_dst, &write_cmd, sizeof(CQDispatchCmd));
+    } else {
+        initialize_write_cmd(write_cmd_dst);
+    }
+
+    TT_ASSERT(data != nullptr);
+    this->add_data(data, inline_data_sizeB, inline_data_sizeB);
+    // Increment wr offset to aligned address only if data is inline. Out-of-line data will
+    // follow right after the command, so defer alignment to after it.
+    this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
 }
 
 template <bool hugepage_write>
 template <bool inline_data>
 void DeviceCommand<hugepage_write>::add_dispatch_write_host(
-    bool flush_prefetch, uint32_t data_sizeB, bool is_event, const void* data) {
+    bool flush_prefetch, uint64_t data_sizeB, bool is_event, uint16_t pad1, const void* data) {
     uint32_t payload_sizeB = sizeof(CQDispatchCmd) + (flush_prefetch ? data_sizeB : 0);
     this->add_prefetch_relay_inline(flush_prefetch, payload_sizeB);
 
     auto initialize_write_cmd = [&](CQDispatchCmd* write_cmd) {
         write_cmd->base.cmd_id = CQ_DISPATCH_CMD_WRITE_LINEAR_H_HOST;
         write_cmd->write_linear_host.is_event = is_event;
+        // This padding value is checked on the host side for event commands.
+        write_cmd->write_linear_host.pad1 = pad1;
+        write_cmd->write_linear_host.pad2 = DeviceCommand::random_padding_value();
         write_cmd->write_linear_host.length =
             sizeof(CQDispatchCmd) +
             data_sizeB;  // CQ_DISPATCH_CMD_WRITE_LINEAR_HOST writes dispatch cmd back to completion queue
@@ -469,7 +699,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_host(
     CQDispatchCmd* write_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_cmd{};
         initialize_write_cmd(&write_cmd);
         this->memcpy(write_cmd_dst, &write_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -495,7 +725,7 @@ void DeviceCommand<hugepage_write>::add_prefetch_exec_buf(uint32_t base_addr, ui
     CQPrefetchCmd* exec_buf_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd exec_buf_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd exec_buf_cmd{};
         initialize_exec_buf_cmd(&exec_buf_cmd);
         this->memcpy(exec_buf_cmd_dst, &exec_buf_cmd, sizeof(CQPrefetchCmd));
     } else {
@@ -513,11 +743,45 @@ void DeviceCommand<hugepage_write>::add_dispatch_set_num_worker_sems(
     };
     CQDispatchCmd* set_num_worker_sems_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd set_num_worker_sems_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd set_num_worker_sems_cmd{};
         initialize_set_num_worker_sems_cmd(&set_num_worker_sems_cmd);
         this->memcpy(set_num_worker_sems_cmd_dst, &set_num_worker_sems_cmd, sizeof(CQDispatchCmd));
     } else {
         initialize_set_num_worker_sems_cmd(set_num_worker_sems_cmd_dst);
+    }
+    this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+}
+
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_dispatch_set_sub_device_worker_counts(
+    ttsl::Span<const uint32_t> workers_per_sub_device, DispatcherSelect dispatcher_type) {
+    TT_ASSERT(workers_per_sub_device.size() <= DispatchSettings::DISPATCH_MESSAGE_ENTRIES);
+    auto data_sizeB = workers_per_sub_device.size() * sizeof(uint32_t);
+    uint32_t lengthB = sizeof(CQDispatchCmd) + data_sizeB;
+    if (dispatcher_type == DispatcherSelect::DISPATCH_SUBORDINATE) {
+        constexpr uint32_t dispatch_page_size = 1 << DispatchSettings::DISPATCH_S_BUFFER_LOG_PAGE_SIZE;
+        TT_FATAL(
+            lengthB <= dispatch_page_size,
+            "Data to set dispatch_s worker counts {} must fit within one dispatch page {}",
+            lengthB,
+            dispatch_page_size);
+    }
+    this->add_prefetch_relay_inline(true, lengthB, dispatcher_type);
+    auto initialize_set_sub_device_worker_counts_cmd = [&](CQDispatchCmd* cmd) {
+        cmd->base.cmd_id = CQ_DISPATCH_SET_SUB_DEVICE_WORKER_COUNTS;
+        cmd->set_sub_device_worker_counts.num_sub_devices = static_cast<uint32_t>(workers_per_sub_device.size());
+    };
+    CQDispatchCmd* set_sub_device_worker_counts_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd set_sub_device_worker_counts_cmd{};
+        initialize_set_sub_device_worker_counts_cmd(&set_sub_device_worker_counts_cmd);
+        this->memcpy(set_sub_device_worker_counts_cmd_dst, &set_sub_device_worker_counts_cmd, sizeof(CQDispatchCmd));
+    } else {
+        initialize_set_sub_device_worker_counts_cmd(set_sub_device_worker_counts_cmd_dst);
+    }
+    uint32_t* workers_per_sub_device_dst = this->reserve_space<uint32_t*>(data_sizeB);
+    if (data_sizeB > 0) {
+        this->memcpy(workers_per_sub_device_dst, workers_per_sub_device.data(), data_sizeB);
     }
     this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
 }
@@ -547,7 +811,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_set_go_signal_noc_data(
     };
     CQDispatchCmd* set_go_signal_noc_data_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd set_go_signal_noc_data_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd set_go_signal_noc_data_cmd{};
         initialize_set_go_signal_noc_data_cmd(&set_go_signal_noc_data_cmd);
         this->memcpy(set_go_signal_noc_data_cmd_dst, &set_go_signal_noc_data_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -561,7 +825,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_set_go_signal_noc_data(
 }
 
 template <bool hugepage_write>
-void DeviceCommand<hugepage_write>::add_dispatch_set_write_offsets(tt::stl::Span<const uint32_t> write_offsets) {
+void DeviceCommand<hugepage_write>::add_dispatch_set_write_offsets(ttsl::Span<const uint32_t> write_offsets) {
     TT_ASSERT(write_offsets.size() <= CQ_DISPATCH_MAX_WRITE_OFFSETS);
     size_t data_sizeB = write_offsets.size() * sizeof(uint32_t);
     size_t cmd_size = sizeof(CQDispatchCmd) + data_sizeB;
@@ -574,7 +838,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_set_write_offsets(tt::stl::Span
     CQDispatchCmd* write_offset_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_offset_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_offset_cmd{};
         initialize_write_offset_cmd(&write_offset_cmd);
         this->memcpy(write_offset_cmd_dst, &write_offset_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -595,7 +859,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_terminate(DispatcherSelect disp
     CQDispatchCmd* terminate_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd terminate_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd terminate_cmd{};
         initialize_terminate_cmd(&terminate_cmd);
         this->memcpy(terminate_cmd_dst, &terminate_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -614,7 +878,7 @@ void DeviceCommand<hugepage_write>::add_prefetch_terminate() {
     CQPrefetchCmd* terminate_cmd_dst = this->reserve_space<CQPrefetchCmd*>(increment_sizeB);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd terminate_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd terminate_cmd{};
         initialize_terminate_cmd(&terminate_cmd);
         this->memcpy(terminate_cmd_dst, &terminate_cmd, sizeof(CQPrefetchCmd));
     } else {
@@ -639,8 +903,8 @@ void DeviceCommand<hugepage_write>::add_prefetch_exec_buf_end() {
     CQDispatchCmd* dispatch_exec_buf_end_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd prefetch_exec_buf_end_cmd;
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd dispatch_exec_buf_end_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd prefetch_exec_buf_end_cmd{};
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd dispatch_exec_buf_end_cmd{};
         initialize_prefetch_exec_buf_end_cmd(&prefetch_exec_buf_end_cmd);
         initialize_dispatch_exec_buf_end_cmd(&dispatch_exec_buf_end_cmd);
         this->memcpy(prefetch_exec_buf_end_cmd_dst, &prefetch_exec_buf_end_cmd, sizeof(CQPrefetchCmd));
@@ -667,6 +931,11 @@ void DeviceCommand<hugepage_write>::add_data(
 }
 
 template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::align_write_offset() {
+    this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+}
+
+template <bool hugepage_write>
 template <typename PackedSubCmd>
 void DeviceCommand<hugepage_write>::add_dispatch_write_packed(
     uint8_t type,
@@ -681,13 +950,13 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed(
     const bool no_stride,
     uint32_t write_offset_index) {
     static_assert(
-        std::is_same<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>::value or
-        std::is_same<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>::value);
-    bool multicast = std::is_same<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>::value;
+        std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd> or
+        std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>);
+    bool multicast = std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>;
 
     uint32_t packed_write_max_multicast_sub_cmds =
         get_packed_write_max_multicast_sub_cmds(packed_write_max_unicast_sub_cmds);
-    uint32_t max_num_packed_sub_cmds = std::is_same<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>::value
+    uint32_t max_num_packed_sub_cmds = std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>
                                            ? packed_write_max_unicast_sub_cmds
                                            : packed_write_max_multicast_sub_cmds;
     TT_FATAL(
@@ -714,7 +983,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed(
     CQDispatchCmd* write_packed_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_packed_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_packed_cmd{};
         initialize_write_packed_cmd(&write_packed_cmd);
         this->memcpy(write_packed_cmd_dst, &write_packed_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -733,8 +1002,11 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed(
     increment_sizeB = tt::align(packed_data_sizeB, this->l1_alignment);
     uint32_t num_data_copies = no_stride ? 1 : num_sub_cmds;
     for (uint32_t i = offset_idx; i < offset_idx + num_data_copies; ++i) {
-        this->memcpy(
-            (char*)this->cmd_region + this->cmd_write_offsetB, data_collection[i].first, data_collection[i].second);
+        if (data_collection[i].first) {
+            this->memcpy(
+                (char*)this->cmd_region + this->cmd_write_offsetB, data_collection[i].first, data_collection[i].second);
+        }
+        // Always advanced by the packed stride, even if no data was copied
         this->cmd_write_offsetB += increment_sizeB;
     }
 
@@ -758,13 +1030,13 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed(
     const bool no_stride,
     uint32_t write_offset_index) {
     static_assert(
-        std::is_same<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>::value or
-        std::is_same<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>::value);
-    bool multicast = std::is_same<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>::value;
+        std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd> or
+        std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>);
+    bool multicast = std::is_same_v<PackedSubCmd, CQDispatchWritePackedMulticastSubCmd>;
 
     uint32_t packed_write_max_multicast_sub_cmds =
         get_packed_write_max_multicast_sub_cmds(packed_write_max_unicast_sub_cmds);
-    uint32_t max_num_packed_sub_cmds = std::is_same<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>::value
+    uint32_t max_num_packed_sub_cmds = std::is_same_v<PackedSubCmd, CQDispatchWritePackedUnicastSubCmd>
                                            ? packed_write_max_unicast_sub_cmds
                                            : packed_write_max_multicast_sub_cmds;
     TT_ASSERT(
@@ -790,7 +1062,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed(
     CQDispatchCmd* write_packed_cmd_dst = this->reserve_space<CQDispatchCmd*>(sizeof(CQDispatchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_packed_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_packed_cmd{};
         initialize_write_packed_cmd(&write_packed_cmd);
         this->memcpy(write_packed_cmd_dst, &write_packed_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -810,9 +1082,12 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed(
     uint32_t num_data_copies = no_stride ? 1 : num_sub_cmds;
     for (uint32_t i = offset_idx; i < offset_idx + num_data_copies; ++i) {
         uint32_t offset = 0;
-        for (auto& data : data_collection[i]) {
-            this->memcpy(
-                (char*)this->cmd_region + this->cmd_write_offsetB + offset, std::get<0>(data), std::get<1>(data));
+        for (const auto& data : data_collection[i]) {
+            if (std::get<0>(data)) {
+                this->memcpy(
+                    (char*)this->cmd_region + this->cmd_write_offsetB + offset, std::get<0>(data), std::get<1>(data));
+            }
+            // Always advanced by the stride, even if no data was copied
             offset += std::get<2>(data);
         }
         this->cmd_write_offsetB += increment_sizeB;
@@ -845,7 +1120,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed_large(
     uint16_t alignment,
     uint16_t num_sub_cmds,
     const std::vector<CQDispatchWritePackedLargeSubCmd>& sub_cmds,
-    const std::vector<tt::stl::Span<const uint8_t>>& data_collection,
+    const std::vector<ttsl::Span<const uint8_t>>& data_collection,
     std::vector<uint8_t*>*
         data_collection_buffer_ptr,  // optional. Stores the location each data segment was written to
     const uint32_t offset_idx,
@@ -860,6 +1135,59 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed_large(
         tt::align(sizeof(CQDispatchCmd) + sub_cmds_sizeB, this->l1_alignment) + data_collection_size,
         this->l1_alignment);
     this->add_dispatch_write_packed_large_internal(
+        type, flush_prefetch, alignment, payload_size, num_sub_cmds, sub_cmds, offset_idx, write_offset_index);
+
+    if (data_collection_buffer_ptr != nullptr) {
+        data_collection_buffer_ptr->resize(data_collection.size());
+    }
+    for (size_t i = 0; i < data_collection.size(); i++) {
+        if (data_collection_buffer_ptr) {
+            data_collection_buffer_ptr->at(i) = (uint8_t*)this->cmd_region + this->cmd_write_offsetB;
+        }
+        this->add_data(data_collection[i].data(), data_collection[i].size(), data_collection[i].size());
+    }
+    this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+}
+
+// Add write packed large unicast, with no data.
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_dispatch_write_packed_large_unicast(
+    uint8_t type,
+    uint16_t alignment,
+    uint16_t num_sub_cmds,
+    const std::vector<CQDispatchWritePackedLargeUnicastSubCmd>& sub_cmds,
+    const uint32_t offset_idx,
+    uint32_t write_offset_index) {
+    constexpr bool flush_prefetch = false;
+    uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQDispatchWritePackedLargeUnicastSubCmd);
+    uint32_t payload_size = tt::align(sizeof(CQDispatchCmd) + sub_cmds_sizeB, this->l1_alignment);
+    this->add_dispatch_write_packed_large_unicast_internal(
+        type, flush_prefetch, alignment, payload_size, num_sub_cmds, sub_cmds, offset_idx, write_offset_index);
+    this->cmd_write_offsetB = tt::align(this->cmd_write_offsetB, this->pcie_alignment);
+}
+
+// Add write packed large unicast, with data inlined.
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_dispatch_write_packed_large_unicast(
+    uint8_t type,
+    uint16_t alignment,
+    uint16_t num_sub_cmds,
+    const std::vector<CQDispatchWritePackedLargeUnicastSubCmd>& sub_cmds,
+    const std::vector<ttsl::Span<const uint8_t>>& data_collection,
+    std::vector<uint8_t*>*
+        data_collection_buffer_ptr,  // optional. Stores the location each data segment was written to
+    const uint32_t offset_idx,
+    uint32_t write_offset_index) {
+    constexpr bool flush_prefetch = true;
+    size_t data_collection_size = 0;
+    for (const auto& data : data_collection) {
+        data_collection_size += data.size();
+    }
+    uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQDispatchWritePackedLargeUnicastSubCmd);
+    uint32_t payload_size = tt::align(
+        tt::align(sizeof(CQDispatchCmd) + sub_cmds_sizeB, this->l1_alignment) + data_collection_size,
+        this->l1_alignment);
+    this->add_dispatch_write_packed_large_unicast_internal(
         type, flush_prefetch, alignment, payload_size, num_sub_cmds, sub_cmds, offset_idx, write_offset_index);
 
     if (data_collection_buffer_ptr != nullptr) {
@@ -897,7 +1225,7 @@ void DeviceCommand<hugepage_write>::add_prefetch_relay_inline(
     CQPrefetchCmd* relay_write_dst = this->reserve_space<CQPrefetchCmd*>(sizeof(CQPrefetchCmd));
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_write;
+        alignas(MEMCPY_ALIGNMENT) CQPrefetchCmd relay_write{};
         initialize_relay_write(&relay_write);
         this->memcpy(relay_write_dst, &relay_write, sizeof(CQPrefetchCmd));
     } else {
@@ -936,7 +1264,7 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed_large_internal(
     char* write_packed_large_sub_cmds_dst = (char*)write_packed_large_cmd_dst + sizeof(CQDispatchCmd);
 
     if constexpr (hugepage_write) {
-        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_packed_large_cmd;
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_packed_large_cmd{};
         initialize_write_packed_large_cmd(&write_packed_large_cmd);
         this->memcpy(write_packed_large_cmd_dst, &write_packed_large_cmd, sizeof(CQDispatchCmd));
     } else {
@@ -946,12 +1274,54 @@ void DeviceCommand<hugepage_write>::add_dispatch_write_packed_large_internal(
     this->memcpy(write_packed_large_sub_cmds_dst, &sub_cmds[offset_idx], sub_cmds_sizeB);
 }
 
+// Write packed large unicast cmd and subcmds, but not data.
+template <bool hugepage_write>
+void DeviceCommand<hugepage_write>::add_dispatch_write_packed_large_unicast_internal(
+    uint8_t type,
+    bool flush_prefetch,
+    uint16_t alignment,
+    uint32_t payload_sizeB,
+    uint16_t num_sub_cmds,
+    const std::vector<CQDispatchWritePackedLargeUnicastSubCmd>& sub_cmds,
+    const uint32_t offset_idx,
+    uint32_t write_offset_index) {
+    TT_ASSERT(
+        num_sub_cmds <= CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_UNICAST_MAX_SUB_CMDS,
+        "Cannot fit {} sub cmds in one CQDispatchWritePackedLargeUnicastCmd",
+        num_sub_cmds);
+    static_assert(sizeof(CQDispatchWritePackedLargeUnicastSubCmd) % sizeof(uint32_t) == 0);
+    uint32_t sub_cmds_sizeB = num_sub_cmds * sizeof(CQDispatchWritePackedLargeUnicastSubCmd);
+    this->add_prefetch_relay_inline(flush_prefetch, payload_sizeB);
+
+    auto initialize_write_packed_large_unicast_cmd = [&](CQDispatchCmd* write_packed_large_unicast_cmd) {
+        write_packed_large_unicast_cmd->base.cmd_id = CQ_DISPATCH_CMD_WRITE_PACKED_LARGE_UNICAST;
+        write_packed_large_unicast_cmd->write_packed_large_unicast.type = type;
+        write_packed_large_unicast_cmd->write_packed_large_unicast.count = num_sub_cmds;
+        write_packed_large_unicast_cmd->write_packed_large_unicast.alignment = alignment;
+        write_packed_large_unicast_cmd->write_packed_large_unicast.write_offset_index = write_offset_index;
+    };
+    uint32_t sub_cmd_size = tt::align(sizeof(CQDispatchCmd) + sub_cmds_sizeB, this->l1_alignment);
+    CQDispatchCmd* write_packed_large_unicast_cmd_dst = this->reserve_space<CQDispatchCmd*>(sub_cmd_size);
+    char* write_packed_large_unicast_sub_cmds_dst =
+        reinterpret_cast<char*>(write_packed_large_unicast_cmd_dst) + sizeof(CQDispatchCmd);
+
+    if constexpr (hugepage_write) {
+        alignas(MEMCPY_ALIGNMENT) CQDispatchCmd write_packed_large_unicast_cmd{};
+        initialize_write_packed_large_unicast_cmd(&write_packed_large_unicast_cmd);
+        this->memcpy(write_packed_large_unicast_cmd_dst, &write_packed_large_unicast_cmd, sizeof(CQDispatchCmd));
+    } else {
+        initialize_write_packed_large_unicast_cmd(write_packed_large_unicast_cmd_dst);
+    }
+
+    this->memcpy(write_packed_large_unicast_sub_cmds_dst, &sub_cmds[offset_idx], sub_cmds_sizeB);
+}
+
 template <bool hugepage_write>
 void DeviceCommand<hugepage_write>::validate_cmd_write(uint32_t data_sizeB) const {
     uint32_t data_endB = this->cmd_write_offsetB + data_sizeB;
     TT_ASSERT(
         data_endB <= this->cmd_sequence_sizeB,
-        "Out of bounds command sequence write: attemping to write {} B but only {} B available",
+        "Out of bounds command sequence write: attempting to write {} B but only {} B available",
         data_sizeB,
         this->cmd_sequence_sizeB - this->cmd_write_offsetB);
 }
@@ -976,6 +1346,20 @@ void DeviceCommand<hugepage_write>::memcpy(void* __restrict dst, const void* __r
     }
 }
 
+namespace {
+uint32_t random_padding_value_cached = []() {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint32_t> dist(1u, 0xFFFFFFFFu);
+    return dist(gen);
+}();
+}  // namespace
+
+template <bool hugepage_write>
+uint32_t DeviceCommand<hugepage_write>::random_padding_value() {
+    return random_padding_value_cached;
+}
+
 // clang-format off
 template class DeviceCommand<true>;
 template class DeviceCommand<false>;
@@ -992,23 +1376,23 @@ template void DeviceCommand<true>::add_dispatch_write_packed<CQDispatchWritePack
 template void DeviceCommand<false>::add_dispatch_write_packed<CQDispatchWritePackedUnicastSubCmd>(uint8_t, uint16_t, uint32_t, uint16_t, uint32_t, const std::vector<CQDispatchWritePackedUnicastSubCmd>&, const std::vector<std::vector<std::tuple<const void*, uint32_t, uint32_t>>>&, uint32_t, const uint32_t, const bool, uint32_t);
 template void DeviceCommand<false>::add_dispatch_write_packed<CQDispatchWritePackedMulticastSubCmd>(uint8_t, uint16_t, uint32_t, uint16_t, uint32_t, const std::vector<CQDispatchWritePackedMulticastSubCmd>&, const std::vector<std::vector<std::tuple<const void*, uint32_t, uint32_t>>>&, uint32_t, const uint32_t, const bool, uint32_t);
 
-template void DeviceCommand<true>::add_dispatch_write_host<false>(bool, uint32_t, bool, const void*);
-template void DeviceCommand<true>::add_dispatch_write_host<true>(bool, uint32_t, bool, const void*);
-template void DeviceCommand<false>::add_dispatch_write_host<false>(bool, uint32_t, bool, const void*);
-template void DeviceCommand<false>::add_dispatch_write_host<true>(bool, uint32_t, bool, const void*);
+template void DeviceCommand<true>::add_dispatch_write_host<false>(bool, uint64_t, bool, uint16_t, const void*);
+template void DeviceCommand<true>::add_dispatch_write_host<true>(bool, uint64_t, bool, uint16_t, const void*);
+template void DeviceCommand<false>::add_dispatch_write_host<false>(bool, uint64_t, bool, uint16_t, const void*);
+template void DeviceCommand<false>::add_dispatch_write_host<true>(bool, uint64_t, bool, uint16_t, const void*);
 
 template void DeviceCommand<true>::add_dispatch_write_paged<false>(bool, uint8_t, uint16_t, uint32_t, uint32_t, uint32_t, const void*);
 template void DeviceCommand<true>::add_dispatch_write_paged<true>(bool, uint8_t, uint16_t, uint32_t, uint32_t, uint32_t, const void*);
 template void DeviceCommand<false>::add_dispatch_write_paged<false>(bool, uint8_t, uint16_t, uint32_t, uint32_t, uint32_t, const void*);
 template void DeviceCommand<false>::add_dispatch_write_paged<true>(bool, uint8_t, uint16_t, uint32_t, uint32_t, uint32_t, const void*);
 
-template void DeviceCommand<true>::add_dispatch_write_linear<true, false>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-template void DeviceCommand<true>::add_dispatch_write_linear<true, true>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-template void DeviceCommand<true>::add_dispatch_write_linear<false, false>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-template void DeviceCommand<true>::add_dispatch_write_linear<false, true>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-template void DeviceCommand<false>::add_dispatch_write_linear<true, false>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-template void DeviceCommand<false>::add_dispatch_write_linear<true, true>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-template void DeviceCommand<false>::add_dispatch_write_linear<false, false>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
-template void DeviceCommand<false>::add_dispatch_write_linear<false, true>(uint8_t, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
+template void DeviceCommand<true>::add_dispatch_write_linear<true, false>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
+template void DeviceCommand<true>::add_dispatch_write_linear<true, true>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
+template void DeviceCommand<true>::add_dispatch_write_linear<false, false>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
+template void DeviceCommand<true>::add_dispatch_write_linear<false, true>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
+template void DeviceCommand<false>::add_dispatch_write_linear<true, false>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
+template void DeviceCommand<false>::add_dispatch_write_linear<true, true>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
+template void DeviceCommand<false>::add_dispatch_write_linear<false, false>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
+template void DeviceCommand<false>::add_dispatch_write_linear<false, true>(uint8_t, uint32_t, DeviceAddr, DeviceAddr, const void*, uint32_t);
 // clang-format on
 }  // namespace tt::tt_metal

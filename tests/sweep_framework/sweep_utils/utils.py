@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -16,7 +16,7 @@ import copy
 from functools import partial
 
 from tests.tt_eager.python_api_testing.sweep_tests.generation_funcs import gen_func_with_cast_tt
-from models.utility_functions import torch_random
+from models.common.utility_functions import torch_random
 
 
 def sanitize_shape_rm(input_shape):
@@ -276,8 +276,8 @@ def get_device_grid_size():
     device = ttnn.open_device(device_id=0)
     if ttnn.device.is_wormhole_b0(device):
         y, x = 8, 8
-    elif ttnn.device.is_grayskull(device):
-        y, x = 9, 12
+    elif ttnn.device.is_blackhole(device):
+        y, x = 8, 8
     else:
         y, x = 8, 8
     ttnn.close_device(device)

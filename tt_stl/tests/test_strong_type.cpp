@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -11,10 +11,10 @@
 #include <unordered_set>
 #include <utility>
 
-using MyIntId = tt::stl::StrongType<int, struct MyIntIdTag>;
-using MyStringId = tt::stl::StrongType<std::string, struct MyStringIdTag>;
+using MyIntId = ttsl::StrongType<int, struct MyIntIdTag>;
+using MyStringId = ttsl::StrongType<std::string, struct MyStringIdTag>;
 
-namespace tt::stl {
+namespace ttsl {
 namespace {
 
 using ::testing::ElementsAre;
@@ -32,7 +32,7 @@ TEST(StrongTypeTest, Basic) {
     EXPECT_EQ(my_int_id1, my_int_id2);
 }
 
-TEST(StrongTypeTest, GuarenteedUnique) {
+TEST(StrongTypeTest, GuaranteedUnique) {
     StrongType<int> one{1};
     StrongType<int> otherone{1};
 
@@ -80,4 +80,4 @@ TEST(StrongTypeTest, MoveOnlyType) {
 }
 
 }  // namespace
-}  // namespace tt::stl
+}  // namespace ttsl

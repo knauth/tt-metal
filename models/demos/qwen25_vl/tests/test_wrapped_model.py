@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 import os
@@ -8,9 +8,9 @@ import torch
 from loguru import logger
 
 import ttnn
+from models.common.utility_functions import comp_allclose, comp_pcc
 from models.demos.qwen25_vl.tt.model import DropInVisionTransformer
 from models.demos.qwen25_vl.tt.model_config import VisionModelArgs
-from models.utility_functions import comp_allclose, comp_pcc
 
 
 @torch.no_grad()
@@ -33,7 +33,13 @@ def test_wrapped_vision_model_inference(
     reset_seeds,
     ensure_gc,
     num_layers,
+    is_ci_env,
+    request,
 ):
+    test_id = request.node.callspec.id
+    if is_ci_env and "two_layers" not in test_id:
+        pytest.skip("CI only runs the two_layers test")
+
     dtype = ttnn.bfloat8_b
     pcc = (
         0.99 if num_layers and num_layers <= 3 else 0.91
@@ -67,6 +73,12 @@ def test_wrapped_vision_model_inference(
 
     # Run reference model
     reference_output = reference_model(pt_pixel_values, image_grid_thw)
+    # transformers 5.x returns a BaseModelOutputWithPooling instead of a bare merged tensor:
+    # last_hidden_state is the PRE-merger vision hidden (dim=hidden_size), pooler_output is the
+    # POST-merger output (dim=out_hidden_size, reverse_indices applied) — which is what the tt
+    # wrapped model produces. 4.x returned that merged tensor directly.
+    if getattr(reference_output, "pooler_output", None) is not None:
+        reference_output = reference_output.pooler_output
     tt_output_torch = torch_model(pt_pixel_values, image_grid_thw)
 
     # Compare outputs

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -77,6 +77,7 @@ class TtDetectionTransformerDecoder:
                 spatial_shapes=spatial_shapes,
             )
             output = ttnn.permute(output, (1, 0, 2))
+            ttnn.ReadDeviceProfiler(self.device)
 
             if reg_branches is not None:
                 # Select reg_branch layers for current lid
@@ -91,7 +92,6 @@ class TtDetectionTransformerDecoder:
                         tmp = ttnn.relu(tmp)
                 assert reference_points.shape[-1] == 3
 
-                new_reference_points = ttnn.zeros_like(reference_points, memory_config=ttnn.L1_MEMORY_CONFIG)
                 updated_xy = tmp[..., :2] + inverse_sigmoid(reference_points[..., :2])  # shape (..., 2)
                 updated_z = tmp[..., 4:5] + inverse_sigmoid(reference_points[..., 2:3])  # shape (..., 1)
 
@@ -196,8 +196,6 @@ class TtMapDetectionTransformerDecoder:
                         tmp = ttnn.relu(tmp)
 
                 assert reference_points.shape[-1] == 2
-
-                new_reference_points = ttnn.zeros_like(reference_points, memory_config=ttnn.L1_MEMORY_CONFIG)
 
                 updated_xy = tmp[..., :2] + inverse_sigmoid(reference_points[..., :2])
 

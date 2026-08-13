@@ -1,11 +1,13 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include "ttnn/decorators.hpp"
+#include "ttnn/device_operation.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include "ttnn/types.hpp"
+#include <tt-metalium/program_descriptors.hpp>
 
 namespace ttnn::operations::moreh::moreh_softmax_backward {
 
@@ -42,29 +44,15 @@ struct MorehSoftmaxBackwardOperation {
         const std::optional<Tensor>& input_grad_tensor;
     };
 
-    using spec_return_value_t = TensorSpec;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = Tensor;
 
-#define DEFINE_SOFTMAX_BACKWARD_FACTORY(factory_name)                                       \
-    struct factory_name {                                                                   \
-        struct shared_variables_t {                                                         \
-            tt::tt_metal::KernelHandle unary_reader_kernel_id;                              \
-            tt::tt_metal::KernelHandle unary_writer_kernel_id;                              \
-            std::size_t num_cores;                                                          \
-            std::size_t num_cores_y;                                                        \
-        };                                                                                  \
-        using cached_program_t = ttnn::device_operation::CachedProgram<shared_variables_t>; \
-                                                                                            \
-        static cached_program_t create(                                                     \
-            const operation_attributes_t& operation_attributes,                             \
-            const tensor_args_t& tensor_args,                                               \
-            tensor_return_value_t& output);                                                 \
-                                                                                            \
-        static void override_runtime_arguments(                                             \
-            cached_program_t& cached_program,                                               \
-            const operation_attributes_t& operation_attributes,                             \
-            const tensor_args_t& tensor_args,                                               \
-            tensor_return_value_t& output);                                                 \
+#define DEFINE_SOFTMAX_BACKWARD_FACTORY(factory_name)             \
+    struct factory_name {                                         \
+        static tt::tt_metal::ProgramDescriptor create_descriptor( \
+            const operation_attributes_t& operation_attributes,   \
+            const tensor_args_t& tensor_args,                     \
+            tensor_return_value_t& output);                       \
     };
 
     DEFINE_SOFTMAX_BACKWARD_FACTORY(MorehSoftmaxBackwardCLargeFactory)
@@ -83,28 +71,24 @@ struct MorehSoftmaxBackwardOperation {
 
     static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
     static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
-    static void validate_on_program_cache_hit(const operation_attributes_t&, const tensor_args_t&);
     static void validate_inputs(const operation_attributes_t&, const tensor_args_t&);
     static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
     static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
     static MorehSoftmaxBackwardOpParallelizationStrategy get_parallelization_strategy(
         const operation_attributes_t&, const tensor_args_t&);
-
-    static std::tuple<operation_attributes_t, tensor_args_t> invoke(
-        const Tensor& output_tensor,
-        const Tensor& output_grad_tensor,
-        uint32_t dim,
-        const std::optional<Tensor>& input_grad_tensor,
-        MorehSoftmaxBackwardOp op,
-        MorehSoftmaxBackwardOpParallelizationStrategy strategy,
-        const std::optional<MemoryConfig>& memory_config,
-        const std::optional<DeviceComputeKernelConfig>& compute_kernel_config);
 };
 
 }  // namespace ttnn::operations::moreh::moreh_softmax_backward
 
 namespace ttnn::prim {
-constexpr auto moreh_softmax_backward = ttnn::register_operation<
-    "ttnn::prim::moreh_softmax_backward",
-    ttnn::operations::moreh::moreh_softmax_backward::MorehSoftmaxBackwardOperation>();
+ttnn::operations::moreh::moreh_softmax_backward::MorehSoftmaxBackwardOperation::tensor_return_value_t
+moreh_softmax_backward(
+    const Tensor& output_tensor,
+    const Tensor& output_grad_tensor,
+    uint32_t dim,
+    const std::optional<Tensor>& input_grad_tensor,
+    ttnn::operations::moreh::moreh_softmax_backward::MorehSoftmaxBackwardOp op,
+    ttnn::operations::moreh::moreh_softmax_backward::MorehSoftmaxBackwardOpParallelizationStrategy strategy,
+    const std::optional<MemoryConfig>& memory_config,
+    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config);
 }

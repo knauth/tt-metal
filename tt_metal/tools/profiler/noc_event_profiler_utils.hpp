@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -13,43 +13,34 @@
 #include <utility>
 #include <nlohmann/json.hpp>
 #include <enchantum/enchantum.hpp>
+#include <fstream>
 
-#include "fabric_types.hpp"
+#include <tt-metalium/experimental/fabric/fabric_types.hpp>
 #include "tt_cluster.hpp"
 #include "fabric/fabric_host_utils.hpp"
 #include "fabric/fabric_context.hpp"
-#include "fabric.hpp"
+#include <tt-metalium/experimental/fabric/fabric.hpp>
 #include "tt_metal.hpp"
 
-namespace tt {
-
-namespace tt_metal {
+namespace tt::tt_metal {
 
 // precomputes the mapping between EDM router physical coordinate locations and their associated fabric channel IDs
 class FabricRoutingLookup {
 public:
     // both of these are keyed by physical chip id!
-    using EthCoreToChannelMap = std::map<std::tuple<chip_id_t, CoreCoord>, tt::tt_fabric::chan_id_t>;
+    using EthCoreToChannelMap = std::map<std::tuple<ChipId, CoreCoord>, tt::tt_fabric::chan_id_t>;
 
-    // Default constructor for cases where lookup is not built (e.g., non-1D fabric)
-    FabricRoutingLookup() = default;
-
-    FabricRoutingLookup(const IDevice* device) {
+    FabricRoutingLookup() {
         using namespace tt::tt_fabric;
 
         Cluster& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
 
         // get sorted list of all physical chip ids
         auto physical_chip_id_set = cluster.user_exposed_chip_ids();
-        std::vector<chip_id_t> physical_chip_ids(physical_chip_id_set.begin(), physical_chip_id_set.end());
+        std::vector<ChipId> physical_chip_ids(physical_chip_id_set.begin(), physical_chip_id_set.end());
         std::sort(physical_chip_ids.begin(), physical_chip_ids.end());
 
-        for (chip_id_t chip_id_src : physical_chip_ids) {
-            if (device->is_mmio_capable() && (cluster.get_cluster_type() == tt::tt_metal::ClusterType::TG)) {
-                // skip lauching on gateways for TG
-                continue;
-            }
-
+        for (ChipId chip_id_src : physical_chip_ids) {
             // NOTE: soc desc is for chip_id_src, not device->id()
             const auto& soc_desc = cluster.get_soc_desc(chip_id_src);
             // Build a mapping of (eth_core --> eth_chan)
@@ -62,7 +53,7 @@ public:
 
     // lookup Eth Channel ID given a physical chip id and physical EDM router core coordinate
     std::optional<tt::tt_fabric::chan_id_t> getRouterEthCoreToChannelLookup(
-        chip_id_t phys_chip_id, CoreCoord eth_router_phys_core_coord) const {
+        ChipId phys_chip_id, CoreCoord& eth_router_phys_core_coord) const {
         auto it = eth_core_to_channel_lookup_.find(std::make_tuple(phys_chip_id, eth_router_phys_core_coord));
         if (it != eth_core_to_channel_lookup_.end()) {
             return it->second;
@@ -80,7 +71,7 @@ inline void dumpClusterCoordinatesAsJson(const std::filesystem::path& filepath) 
     nlohmann::ordered_json cluster_json;
     cluster_json["physical_chip_to_eth_coord"] = nlohmann::ordered_json();
     for (auto& [chip_id, eth_core] : cluster.get_user_chip_ethernet_coordinates()) {
-        eth_coord_t eth_coord = eth_core;
+        EthCoord eth_coord = eth_core;
         auto& entry = cluster_json["physical_chip_to_eth_coord"][std::to_string(chip_id)];
         entry["rack"] = eth_coord.rack;
         entry["shelf"] = eth_coord.shelf;
@@ -102,7 +93,7 @@ inline void dumpRoutingInfo(const std::filesystem::path& filepath) {
     const Cluster& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
 
     topology_json["mesh_shapes"] = nlohmann::ordered_json::array();
-    for (auto [mesh_id, mesh_shape] : tt::tt_fabric::get_physical_mesh_shapes()) {
+    for (const auto& [mesh_id, mesh_shape] : tt::tt_fabric::get_physical_mesh_shapes()) {
         topology_json["mesh_shapes"].push_back({
             {"mesh_id", mesh_id.get()},
             {"shape", std::vector(mesh_shape.cbegin(), mesh_shape.cend())},
@@ -111,15 +102,19 @@ inline void dumpRoutingInfo(const std::filesystem::path& filepath) {
 
     topology_json["cluster_type"] = enchantum::to_string(cluster.get_cluster_type());
 
+    topology_json["device_id_to_fabric_node_id"] = nlohmann::ordered_json::object();
+    for (auto physical_chip_id : cluster.get_cluster_desc()->get_all_chips()) {
+        auto fabric_node_id = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(physical_chip_id);
+        topology_json["device_id_to_fabric_node_id"][std::to_string(physical_chip_id)] = {
+            fabric_node_id.mesh_id.get(), fabric_node_id.chip_id};
+    }
+
     topology_json["fabric_config"] = enchantum::to_string(tt::tt_metal::MetalContext::instance().get_fabric_config());
     if (tt::tt_metal::MetalContext::instance().get_fabric_config() != tt_fabric::FabricConfig::DISABLED) {
         topology_json["routing_planes"] = nlohmann::ordered_json::array();
-        topology_json["device_id_to_fabric_node_id"] = nlohmann::ordered_json::object();
         for (auto physical_chip_id : cluster.get_cluster_desc()->get_all_chips()) {
             auto fabric_node_id = tt::tt_fabric::get_fabric_node_id_from_physical_chip_id(physical_chip_id);
             auto device_routing_planes = nlohmann::ordered_json::array();
-            topology_json["device_id_to_fabric_node_id"][std::to_string(physical_chip_id)] = {
-                fabric_node_id.mesh_id.get(), fabric_node_id.chip_id};
 
             for (const auto& direction : tt::tt_fabric::FabricContext::routing_directions) {
                 auto eth_routing_planes_in_dir =
@@ -132,7 +127,7 @@ inline void dumpRoutingInfo(const std::filesystem::path& filepath) {
                 }
 
                 for (int j = 0; j < eth_routing_planes_in_dir.size(); j++) {
-                    chip_id_t eth_channel = eth_routing_planes_in_dir[j];
+                    ChipId eth_channel = eth_routing_planes_in_dir[j];
                     device_routing_planes[j]["ethernet_channels"][enchantum::to_string(direction)] = eth_channel;
                 }
             }
@@ -157,7 +152,7 @@ inline void dumpRoutingInfo(const std::filesystem::path& filepath) {
 
 // determines the implied unicast/multicast start distance and range in tt_fabric::LowLatencyRoutingFields
 inline std::tuple<int, int> get_low_latency_routing_start_distance_and_range(uint32_t llrf_value) {
-    using LLRF = tt::tt_fabric::LowLatencyRoutingFields;
+    using LLRF = tt::tt_fabric::RoutingFieldsConstants::LowLatency;
 
     uint32_t value = llrf_value;
     int start_distance = 1;
@@ -182,5 +177,4 @@ inline std::tuple<int, int> get_routing_start_distance_and_range(uint8_t routing
     return {start_distance, range};
 }
 
-}  // namespace tt_metal
-}  // namespace tt
+}  // namespace tt::tt_metal

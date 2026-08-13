@@ -1,11 +1,12 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "tt_metal/api/tt-metalium/fabric_edm_packet_header.hpp"
-#include "dataflow_api.h"
+#include "fabric/fabric_edm_packet_header.hpp"
+#include "api/dataflow/dataflow_api.h"
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_worker_adapters.hpp"
 #include "tt_metal/fabric/hw/inc/packet_header_pool.h"
+#include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
 
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_flow_control_helpers.hpp"
 
@@ -20,17 +21,11 @@ static FORCE_INLINE void setup_packet_header(
     volatile PACKET_HEADER_TYPE* pkt_hdr, size_t num_hops, tt::tt_fabric::ChipSendType chip_send_type) {
     if (num_hops > 0) {
         if (chip_send_type == tt::tt_fabric::CHIP_UNICAST) {
-            pkt_hdr->to_chip_unicast(num_hops);
+            fabric_set_unicast_route<false>(pkt_hdr, num_hops);
         } else {
             pkt_hdr->to_chip_multicast(tt::tt_fabric::MulticastRoutingCommandHeader{1, static_cast<uint8_t>(num_hops)});
         }
     }
-}
-
-static inline uint64_t get_timestamp() {
-    uint32_t timestamp_low = reg_read(RISCV_DEBUG_REG_WALL_CLOCK_L);
-    uint32_t timestamp_high = reg_read(RISCV_DEBUG_REG_WALL_CLOCK_H);
-    return (((uint64_t)timestamp_high) << 32) | timestamp_low;
 }
 
 void kernel_main() {
@@ -40,7 +35,6 @@ void kernel_main() {
     const size_t fabric_write_dest_bank_addr = get_arg_val<uint32_t>(arg_idx++);
     const size_t fabric_write_dest_noc_x = get_arg_val<uint32_t>(arg_idx++);
     const size_t fabric_write_dest_noc_y = get_arg_val<uint32_t>(arg_idx++);
-
 
     bool is_starting_worker = get_arg_val<uint32_t>(arg_idx++);
     const size_t num_times_to_connect = get_arg_val<uint32_t>(arg_idx++);
@@ -60,9 +54,9 @@ void kernel_main() {
     arg_idx += num_num_messages;
 
     const size_t source_l1_cb_index = get_arg_val<uint32_t>(arg_idx++);
-    size_t packet_size_index = get_arg_val<uint32_t>(arg_idx++);;
-    size_t num_messages_index = get_arg_val<uint32_t>(arg_idx++);;
-    size_t stall_duration_index = get_arg_val<uint32_t>(arg_idx++);;
+    size_t packet_size_index = get_arg_val<uint32_t>(arg_idx++);
+    size_t num_messages_index = get_arg_val<uint32_t>(arg_idx++);
+    size_t stall_duration_index = get_arg_val<uint32_t>(arg_idx++);
 
     auto fabric_connection =
         tt::tt_fabric::WorkerToFabricEdmSender::build_from_args<ProgrammableCoreType::TENSIX>(arg_idx);
@@ -73,7 +67,7 @@ void kernel_main() {
     auto* pkt_hdr_fwd = PacketHeaderPool::allocate_header();
 
     if (is_starting_worker) {
-        DPRINT << "Is starting worker\n";
+        DPRINT("Is starting worker\n");
         *connection_token_ptr += 1;
     }
 
@@ -99,13 +93,17 @@ void kernel_main() {
         pkt_hdr_fwd->to_noc_unicast_write(NocUnicastCommandHeader{noc0_dest_addr_fwd}, packet_size);
 
         while (*connection_token_ptr != 1) {
+            // On Blackhole, we need to invalidate the cache to make sure the token is read
+            // from SRAM and we are not spinning on a stale value.
+            invalidate_l1_cache();
             noc_async_write(source_l1_buffer_address, noc0_dest_addr_fwd, packet_size);
         }
         *connection_token_ptr = 0;
 
         if (stall_duration) {
             auto start = get_timestamp();
-            while (get_timestamp() - start < stall_duration) {}
+            while (get_timestamp() - start < stall_duration) {
+            }
         }
         fabric_connection.open();
 

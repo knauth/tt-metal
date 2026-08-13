@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -8,9 +8,10 @@ import evaluate
 import pytest
 import torch
 from loguru import logger
-from transformers import BertForQuestionAnswering, BertTokenizer, pipeline
+from transformers import BertForQuestionAnswering, BertTokenizer
 
 import ttnn
+from models.common.utility_functions import profiler
 from models.datasets.dataset_squadv2 import squadv2_1K_samples_input, squadv2_answer_decode_batch
 from models.demos.metal_BERT_large_11.tt.bert_model import TtBertBatchDram
 from models.demos.metal_BERT_large_11.tt.model_config import (
@@ -18,7 +19,7 @@ from models.demos.metal_BERT_large_11.tt.model_config import (
     get_tt_cache_path,
     skip_unsupported_config,
 )
-from models.utility_functions import disable_persistent_kernel_cache, enable_persistent_kernel_cache, profiler
+from models.demos.utils.qa_pipeline_compat import QuestionAnsweringPipeline
 
 
 def load_inputs(input_path, batch):
@@ -56,14 +57,13 @@ def run_bert_question_and_answering_inference_squadv2(
 
     # set up huggingface model - TT model will use weights from this model
     model_name = str(model_location_generator(model_version, model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
     hugging_face_reference_model.eval()
 
     # set up tokenizer
     tokenizer_name = str(model_location_generator(model_version, model_subdir="Bert"))
     tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
-    nlp = pipeline(
-        "question-answering",
+    nlp = QuestionAnsweringPipeline(
         model=hugging_face_reference_model,
         tokenizer=tokenizer,
     )
@@ -73,8 +73,9 @@ def run_bert_question_and_answering_inference_squadv2(
     ]
     question = BATCH_SIZE * ["What discipline did Winkelmann create?"]
 
-    inputs = tokenizer.batch_encode_plus(
-        zip(question, context),
+    inputs = tokenizer(
+        text=question,
+        text_pair=context,
         max_length=seq_len,
         padding="max_length",
         # truncation=True,
@@ -182,14 +183,13 @@ def run_bert_question_and_answering_inference(
 
     # set up huggingface model - TT model will use weights from this model
     model_name = str(model_location_generator(model_version, model_subdir="Bert"))
-    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name, torchscript=False)
+    hugging_face_reference_model = BertForQuestionAnswering.from_pretrained(model_name)
     hugging_face_reference_model.eval()
 
     # set up tokenizer
     tokenizer_name = str(model_location_generator(model_version, model_subdir="Bert"))
     tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
-    nlp = pipeline(
-        "question-answering",
+    nlp = QuestionAnsweringPipeline(
         model=hugging_face_reference_model,
         tokenizer=tokenizer,
     )
@@ -214,8 +214,9 @@ def run_bert_question_and_answering_inference(
 
     # encode input context+question strings
     profiler.start(f"processing_input_one")
-    bert_input = tokenizer.batch_encode_plus(
-        zip(question, context),
+    bert_input = tokenizer(
+        text=question,
+        text_pair=context,
         max_length=seq_len,
         padding="max_length",
         truncation=True,
@@ -271,7 +272,6 @@ def run_bert_question_and_answering_inference(
     tt_embedding_inputs = tt_bert_model.embeddings.preprocess_embedding_inputs(**bert_input)
 
     profiler.enable()
-    enable_persistent_kernel_cache()
 
     ##### Run Forward on TT Model Start
     profiler.start(f"model_run_for_inference")
@@ -365,7 +365,6 @@ def test_demo(
 ):
     model_config_str = "BFLOAT8_B-SHARDED"
     skip_unsupported_config(device, model_config_str, batch)
-    disable_persistent_kernel_cache()
 
     return run_bert_question_and_answering_inference(
         model_version="phiyodr/bert-large-finetuned-squad2",
@@ -390,7 +389,6 @@ def test_demo(
 def test_demo_squadv2(model_location_generator, device, batch, loop_count):
     model_config_str = "BFLOAT8_B-SHARDED"
     skip_unsupported_config(device, model_config_str, batch)
-    disable_persistent_kernel_cache()
 
     return run_bert_question_and_answering_inference_squadv2(
         model_version="phiyodr/bert-large-finetuned-squad2",

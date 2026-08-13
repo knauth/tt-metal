@@ -1,28 +1,24 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
-#include <functional>
+#include "ttnn/operations/experimental/transformer/rotary_embedding_llama_fused_qk/device/rotary_embedding_llama_fused_qk_device_operation_types.hpp"
+#include "ttnn/device_operation.hpp"
+#include <tt-metalium/program_descriptors.hpp>
 
-#include "ttnn/tensor/tensor.hpp"
-#include "ttnn/run_operation.hpp"
-#include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+namespace ttnn::experimental::prim {
 
-namespace tt {
-namespace tt_metal {
+struct RotaryEmbeddingLlamaFusedQKProgramFactory {
+    // Contract (1): single ProgramDescriptor.  All seven working CBs
+    // (q/k inputs, cos/sin/trans_mat, q/k outputs) are sharded and bind through
+    // CBDescriptor::buffer so the framework patches dynamic addresses on cache hit.
+    // The single compute kernel takes one per-core runtime arg to select q vs k work.
+    static tt::tt_metal::ProgramDescriptor create_descriptor(
+        const RotaryEmbeddingLlamaFusedQkParams& operation_attributes,
+        const RotaryEmbeddingLlamaFusedQkInputs& tensor_args,
+        RotaryEmbeddingLlamaFusedQkResult& tensor_return_value);
+};
 
-tt::tt_metal::operation::ProgramWithCallbacks rotary_embedding_llama_fused_qk_multi_core_sharded(
-    const Tensor& q_input,
-    const Tensor& k_input,
-    const Tensor& cos,
-    const Tensor& sin,
-    const Tensor& trans_mat,
-    Tensor& q_output,
-    Tensor& k_output,
-    ttnn::DeviceComputeKernelConfig compute_kernel_config,
-    bool row_major_QK);
-
-}  // namespace tt_metal
-}  // namespace tt
+}  // namespace ttnn::experimental::prim

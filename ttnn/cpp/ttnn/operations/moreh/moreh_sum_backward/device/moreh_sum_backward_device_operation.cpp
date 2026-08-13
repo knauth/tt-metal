@@ -1,8 +1,10 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "moreh_sum_backward_device_operation.hpp"
+#include "ttnn/tensor/tensor_ops.hpp"
+#include "ttnn/device_operation.hpp"
 
 #include "ttnn/operations/moreh/moreh_helper_functions.hpp"
 #include "ttnn/tensor/tensor.hpp"
@@ -12,7 +14,7 @@ void MorehSumBackwardOperation::validate_inputs(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     const auto& output_grad = tensor_args.output_grad;
     const auto& input = tensor_args.input;
-    auto& input_grad = tensor_args.input_grad;
+    const auto& input_grad = tensor_args.input_grad;
 
     const auto keepdim = operation_attributes.keepdim;
     const auto dims = operation_attributes.dims;
@@ -34,10 +36,17 @@ void MorehSumBackwardOperation::validate_inputs(
     // validate output_grad shape
     if (keepdim) {
         for (int i = 0; i < input_rank; ++i) {
-            TT_FATAL(input_shape_wo_padding[i] >= output_grad_shape_wo_padding[i], "Error");
+            TT_FATAL(
+                input_shape_wo_padding[i] >= output_grad_shape_wo_padding[i],
+                "Input shape without padding[{}] ({}) must be >= output grad shape without padding[{}] ({})",
+                i,
+                input_shape_wo_padding[i],
+                i,
+                output_grad_shape_wo_padding[i]);
         }
     } else {
         std::vector<uint32_t> expected_output_grad_shape;
+        expected_output_grad_shape.reserve(input_rank);
         std::vector<uint32_t> reduced_dims(input_rank, 0);
         for (auto dim : dims) {
             TT_FATAL(dim < input_rank, "dim {} < input_rank {}", dim, input_rank);
@@ -64,7 +73,13 @@ void MorehSumBackwardOperation::validate_inputs(
         uint32_t rank = output_grad_shape_wo_padding.rank();
         TT_FATAL(expected_rank == rank, "expected_rank {} == rank {}", expected_rank, rank);
         for (int i = 0; i < rank; ++i) {
-            TT_FATAL(expected_output_grad_shape[i] >= output_grad_shape_wo_padding[i], "Error");
+            TT_FATAL(
+                expected_output_grad_shape[i] >= output_grad_shape_wo_padding[i],
+                "Expected output grad shape[{}] ({}) must be >= output grad shape without padding[{}] ({})",
+                i,
+                expected_output_grad_shape[i],
+                i,
+                output_grad_shape_wo_padding[i]);
             log_debug(
                 tt::LogOp,
                 "rank {} expected_output_grad_shape {}, output_grad_shape_wo_padding {}",
@@ -81,17 +96,7 @@ void MorehSumBackwardOperation::validate_inputs(
     }
 }
 
-MorehSumBackwardOperation::program_factory_t MorehSumBackwardOperation::select_program_factory(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    return ProgramFactory{};
-}
-
 void MorehSumBackwardOperation::validate_on_program_cache_miss(
-    const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
-    validate_inputs(operation_attributes, tensor_args);
-};
-
-void MorehSumBackwardOperation::validate_on_program_cache_hit(
     const operation_attributes_t& operation_attributes, const tensor_args_t& tensor_args) {
     validate_inputs(operation_attributes, tensor_args);
 };
@@ -102,7 +107,7 @@ MorehSumBackwardOperation::spec_return_value_t MorehSumBackwardOperation::comput
         return tensor_args.input_grad->tensor_spec();
     }
     TT_FATAL(tensor_args.input.has_value(), "input tensor should not be std::nullopt.");
-    return TensorSpec(
+    return tt::tt_metal::TensorSpec(
         tensor_args.input->logical_shape(),
         TensorLayout(tensor_args.input->dtype(), PageConfig(Layout::TILE), operation_attributes.memory_config));
 };
@@ -116,22 +121,25 @@ MorehSumBackwardOperation::tensor_return_value_t MorehSumBackwardOperation::crea
     return create_device_tensor(compute_output_specs(operation_attributes, tensor_args), tensor_args.input->device());
 }
 
-std::tuple<MorehSumBackwardOperation::operation_attributes_t, MorehSumBackwardOperation::tensor_args_t>
-MorehSumBackwardOperation::invoke(
+}  // namespace ttnn::operations::moreh::moreh_sum_backward
+
+namespace ttnn::prim {
+ttnn::operations::moreh::moreh_sum_backward::MorehSumBackwardOperation::tensor_return_value_t moreh_sum_backward(
     const Tensor& output_grad,
     const std::optional<Tensor>& input,
-    tt::stl::Span<const int64_t> dims,
+    ttsl::Span<const int64_t> dims,
     bool keepdim,
     const std::optional<Tensor>& input_grad,
     const std::optional<MemoryConfig>& memory_config,
     const std::optional<DeviceComputeKernelConfig>& compute_kernel_config) {
-    return {
-        operation_attributes_t{
-            ttnn::SmallVector<int64_t>(dims.begin(), dims.end()),
-            keepdim,
-            memory_config.value_or(output_grad.memory_config()),
-            init_device_compute_kernel_config(
-                output_grad.device()->arch(), compute_kernel_config, MathFidelity::HiFi4)},
-        tensor_args_t{output_grad, input, input_grad}};
+    using OperationType = ttnn::operations::moreh::moreh_sum_backward::MorehSumBackwardOperation;
+    auto operation_attributes = OperationType::operation_attributes_t{
+        ttsl::SmallVector<int64_t>(dims.begin(), dims.end()),
+        keepdim,
+        memory_config.value_or(output_grad.memory_config()),
+        init_device_compute_kernel_config(
+            output_grad.device()->arch(), compute_kernel_config, tt::tt_metal::MathFidelity::HiFi4)};
+    auto tensor_args = OperationType::tensor_args_t{output_grad, input, input_grad};
+    return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
-}  // namespace ttnn::operations::moreh::moreh_sum_backward
+}  // namespace ttnn::prim

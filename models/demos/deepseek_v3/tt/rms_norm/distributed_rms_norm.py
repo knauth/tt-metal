@@ -1,15 +1,15 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC.
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 from pathlib import Path
+from typing import Any
 
 import torch
-import ttnn.experimental
 from transformers.configuration_utils import PretrainedConfig
 
 import ttnn
-from models.demos.deepseek_v3.tt.ccl_1d import CCL1D
+from models.demos.deepseek_v3.tt.ccl import CCL
 from models.demos.deepseek_v3.tt.rms_norm.rms_norm_base import RMSNormBase
 from models.demos.deepseek_v3.utils.config_dataclass import (
     AllGatherAsyncConfig,
@@ -19,7 +19,12 @@ from models.demos.deepseek_v3.utils.config_dataclass import (
     RMSNormPostAllGatherConfig,
     RMSNormPreAllGatherConfig,
 )
-from models.demos.deepseek_v3.utils.config_helpers import even_int_div, get_state_dicts, save_and_get_path
+from models.demos.deepseek_v3.utils.config_helpers import (
+    COMPUTE_KERNEL_CONFIG_HIFI4_NOFP32_ACC,
+    even_int_div,
+    get_state_dicts,
+    shard_and_save,
+)
 from models.demos.deepseek_v3.utils.run_config import (
     MESH_DEVICE_STATE_DICT_KEY,
     ModelDecodeConfig,
@@ -32,8 +37,6 @@ from models.demos.deepseek_v3.utils.run_config import (
 
 
 class DistributedRMSNorm(RMSNormBase):
-    MAX_BATCH_SIZE = 32
-
     @classmethod
     def convert_weights(
         cls,
@@ -42,26 +45,25 @@ class DistributedRMSNorm(RMSNormBase):
         output_path: Path,
         mesh_device: ttnn.Device,
     ) -> WeightConfig:
-        torch_metaweight = get_state_dicts(state_dicts, "weight", shape=(hf_config.hidden_size,), dtype=torch.bfloat16)
+        torch_metaweight = get_state_dicts(state_dicts, "weight", dtype=torch.bfloat16)
         num_shards = torch_metaweight.shape[0]
-        assert num_shards == mesh_device.shape[0], "Number of state dictsdoes not match the number of rows."
-
-        tt_weight = ttnn.as_tensor(
-            torch_metaweight.reshape(
-                (num_shards, 1, -1, ttnn.TILE_SIZE)
-            ),  # Reshape to tile width sticks for optimal performance
-            device=mesh_device,
-            dtype=ttnn.bfloat16,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_device.shape, dims=(0, -2)),
-        )
+        assert num_shards == mesh_device.shape[0], "Number of state dicts does not match the number of rows."
 
         # Save to disk with standard naming - "rmsnorm" must match the op name used in the model config
         # so that RunConfig can populate it with the actual weight tensors at runtime
         return {
             "rms_norm_post_all_gather": {
-                "weight": save_and_get_path(output_path / "rmsnorm.weight", tt_weight),
+                "weight": shard_and_save(
+                    output_path / "rmsnorm.weight",
+                    torch_metaweight.reshape(
+                        (num_shards, 1, -1, ttnn.TILE_SIZE)
+                    ),  # Reshape to tile width sticks for optimal performance
+                    shard_dims=(0, -2),
+                    mesh_device=mesh_device,
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
             }
         }
 
@@ -84,7 +86,12 @@ class DistributedRMSNorm(RMSNormBase):
         )  # type: ignore
 
     @classmethod
-    def decode_model_config(cls, hf_config: PretrainedConfig, mesh_device: ttnn.Device) -> ModelDecodeConfig:
+    def decode_model_config(
+        cls,
+        hf_config: PretrainedConfig,
+        mesh_device: ttnn.Device,
+        batch_size_per_row: int,
+    ) -> ModelDecodeConfig:
         """Generate decode configuration for this module.
 
         Args:
@@ -97,7 +104,7 @@ class DistributedRMSNorm(RMSNormBase):
         shard_core_grid = ttnn.CoreGrid(x=4, y=7)
         memory_config = ttnn.create_sharded_memory_config(
             shape=(
-                cls.MAX_BATCH_SIZE,
+                ttnn.core.roundup(batch_size_per_row, ttnn.TILE_SIZE),
                 ttnn.core.roundup(
                     even_int_div(hf_config.hidden_size, shard_core_grid.num_cores * mesh_device.shape[1]),
                     ttnn.TILE_SIZE,
@@ -133,39 +140,83 @@ class DistributedRMSNorm(RMSNormBase):
             "input_memory_config": memory_config,
             "rms_norm_pre_all_gather": RMSNormPreAllGatherConfig(
                 dtype=ttnn.bfloat16,
+                compute_kernel_config=COMPUTE_KERNEL_CONFIG_HIFI4_NOFP32_ACC,
             ),
             "all_gather": AllGatherAsyncConfig(
                 dim=3,
                 cluster_axis=1,
                 mesh_device=MeshDeviceStub(mesh_device.shape),
                 memory_config=rms_norm_stats_memory_config,
-                topology=ttnn.Topology.Linear,
             ),
             "rms_norm_post_all_gather": RMSNormPostAllGatherConfig(
                 epsilon=hf_config.rms_norm_eps,
                 weight=FromWeightConfig(MeshDeviceStub(mesh_device.shape)),
                 dtype=ttnn.bfloat16,
+                compute_kernel_config=COMPUTE_KERNEL_CONFIG_HIFI4_NOFP32_ACC,
             ),
         }
 
     @classmethod
-    def create_state(cls, hf_config: PretrainedConfig, mesh_device: ttnn.Device, ccl: CCL1D) -> ModelState:
+    def create_state(cls, hf_config: PretrainedConfig, mesh_device: ttnn.Device, ccl: CCL) -> ModelState:
         """Create the model state for this module.
 
         Args:
             hf_config: HuggingFace model configuration object
             mesh_device: TTNN mesh device the model will be placed later on
-            ccl: CCL1D instance for async CCLs
+            ccl: CCL instance for async CCLs
 
         Returns:
             ModelState containing the state information for this module
         """
         return {
             MESH_DEVICE_STATE_DICT_KEY: mesh_device,
-            "all_gather": {
-                "multi_device_global_semaphore": ccl.get_semaphore(1),
-            },
+            "ccl": ccl,
         }
+
+    @staticmethod
+    def _fwd_rms_norm_pre_all_gather(x: ttnn.Tensor, cfg: dict, program_config: Any) -> ttnn.Tensor:
+        """Wrapper for distributed RMS norm part 1: compute local statistics.
+
+        Args:
+            x: Input tensor
+            cfg: Config for rms_norm_pre_all_gather (cfg["rms_norm_pre_all_gather"])
+            program_config: Program config (computed externally via _get_pc)
+
+        Returns:
+            Local statistics tensor
+        """
+        return ttnn.rms_norm_pre_all_gather(x, program_config=program_config, **cfg["rms_norm_pre_all_gather"])
+
+    @staticmethod
+    def _fwd_all_gather_stats(stats: ttnn.Tensor, cfg: dict, ccl) -> ttnn.Tensor:
+        """Wrapper for all-gather statistics.
+
+        Args:
+            stats: Local statistics tensor
+            cfg: Config containing all_gather settings (cfg["all_gather"])
+            ccl: CCL runtime object
+
+        Returns:
+            Gathered statistics tensor
+        """
+        return ttnn.experimental.all_gather_async(stats, **ccl.populate_all_gather_runtime_args(cfg["all_gather"]))
+
+    @staticmethod
+    def _fwd_rms_norm_post_all_gather(
+        x: ttnn.Tensor, stats: ttnn.Tensor, cfg: dict, program_config: Any
+    ) -> ttnn.Tensor:
+        """Wrapper for distributed RMS norm part 2: apply normalization with gathered stats.
+
+        Args:
+            x: Input tensor (same as input to pre_all_gather)
+            stats: Gathered statistics tensor
+            cfg: Config for rms_norm_post_all_gather (cfg["rms_norm_post_all_gather"])
+            program_config: Program config (computed externally via _get_pc)
+
+        Returns:
+            Normalized output tensor
+        """
+        return ttnn.rms_norm_post_all_gather(x, stats, program_config=program_config, **cfg["rms_norm_post_all_gather"])
 
     @classmethod
     def _rmsnorm_forward(cls, x: ttnn.Tensor, cfg: RunPrefillConfig | RunDecodeConfig) -> ttnn.Tensor:
@@ -181,19 +232,15 @@ class DistributedRMSNorm(RMSNormBase):
 
         program_config = cls._get_pc(x.memory_config())
         # Run distributed rmsnorm part 1
-        tt_stats = ttnn.rms_norm_pre_all_gather(x, program_config=program_config, **cfg["rms_norm_pre_all_gather"])
+        tt_stats = cls._fwd_rms_norm_pre_all_gather(x, cfg, program_config=program_config)
 
         # AllGather stats
-        tt_gathered_stats = ttnn.experimental.all_gather_async(tt_stats, **cfg["all_gather"])
+        ccl = cfg["ccl"]
+        tt_gathered_stats = cls._fwd_all_gather_stats(tt_stats, cfg, ccl)
         ttnn.deallocate(tt_stats)
 
         # Run distributed rmsnorm part 2
-        tt_out = ttnn.rms_norm_post_all_gather(
-            x,
-            tt_gathered_stats,
-            program_config=program_config,
-            **cfg["rms_norm_post_all_gather"],
-        )
-        ttnn.deallocate(tt_stats)
+        tt_out = cls._fwd_rms_norm_post_all_gather(x, tt_gathered_stats, cfg, program_config=program_config)
+        ttnn.deallocate(tt_gathered_stats)
 
         return tt_out

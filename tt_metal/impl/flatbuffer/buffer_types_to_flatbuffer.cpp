@@ -1,10 +1,12 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "flatbuffer/buffer_types_to_flatbuffer.hpp"
 #include "flatbuffer/program_types_to_flatbuffer.hpp"
 #include "lightmetal/lightmetal_capture.hpp"  // For LightMetalCaptureContext
+
+#include <vector>
 
 namespace tt::tt_metal {
 
@@ -27,12 +29,15 @@ flatbuffer::TensorMemoryLayout to_flatbuffer(TensorMemoryLayout layout) {
         case TensorMemoryLayout::HEIGHT_SHARDED: return flatbuffer::TensorMemoryLayout::HeightSharded;
         case TensorMemoryLayout::WIDTH_SHARDED: return flatbuffer::TensorMemoryLayout::WidthSharded;
         case TensorMemoryLayout::BLOCK_SHARDED: return flatbuffer::TensorMemoryLayout::BlockSharded;
+        case TensorMemoryLayout::ND_SHARDED: return flatbuffer::TensorMemoryLayout::NdSharded;
+        default: TT_THROW("Unsupported TensorMemoryLayout to flatbuffer.");
     }
-    TT_THROW("Unsupported TensorMemoryLayout to flatbuffer.");
 }
 
 // For page sizes, keep lambda usage consistent across types.
-static inline uint32_t to_flatbuffer(const uint32_t& value) { return value; }
+namespace {
+uint32_t to_flatbuffer(const uint32_t& value) { return value; }
+}  // namespace
 
 // Original type defined in circular_buffer_config.hpp
 flatbuffers::Offset<flatbuffer::CircularBufferConfig> to_flatbuffer(
@@ -41,9 +46,22 @@ flatbuffers::Offset<flatbuffer::CircularBufferConfig> to_flatbuffer(
     auto create_fb_vec_of_structs = [&](const auto& array, auto fb_type_tag) {
         using FlatBufferType = decltype(fb_type_tag);
         std::vector<FlatBufferType> vec;
+        vec.reserve(array.size());
         for (size_t i = 0; i < array.size(); i++) {
             if (array[i]) {
-                vec.push_back(FlatBufferType{i, to_flatbuffer(*array[i])});
+                vec.push_back(FlatBufferType{static_cast<uint32_t>(i), to_flatbuffer(*array[i])});
+            }
+        }
+        return builder.CreateVectorOfStructs(vec);
+    };
+
+    auto create_fb_vec_of_unpack_face_geometry = [&](const auto& array) {
+        std::vector<flatbuffer::CBConfigUnpackFaceGeometry> vec;
+        vec.reserve(array.size());
+        for (size_t i = 0; i < array.size(); i++) {
+            if (array[i]) {
+                vec.push_back(flatbuffer::CBConfigUnpackFaceGeometry{
+                    static_cast<uint32_t>(i), array[i]->face_r_dim, array[i]->num_faces});
             }
         }
         return builder.CreateVectorOfStructs(vec);
@@ -80,7 +98,8 @@ flatbuffers::Offset<flatbuffer::CircularBufferConfig> to_flatbuffer(
         create_fb_vec_of_uint8(config.remote_buffer_indices()),
         config.dynamic_cb(),
         config.max_size(),
-        config.buffer_size());
+        config.buffer_size(),
+        create_fb_vec_of_unpack_face_geometry(config.unpack_face_geometry()));
 }
 
 // TODO: Opportunity to share with TTNN. This was straight up copied from tensor_spec_flatbuffer.cpp
@@ -93,29 +112,10 @@ flatbuffer::ShardOrientation to_flatbuffer(ShardOrientation orientation) {
     TT_THROW("Unsupported ShardOrientation to flatbuffer.");
 }
 
-flatbuffer::ShardMode to_flatbuffer(ShardMode shard_mode) {
-    switch (shard_mode) {
-        case ShardMode::LOGICAL: return flatbuffer::ShardMode::Logical;
-        case ShardMode::PHYSICAL: return flatbuffer::ShardMode::Physical;
-    }
-    TT_THROW("Unsupported ShardMode to flatbuffer.");
-}
-
 flatbuffers::Offset<flatbuffer::ShardSpec> to_flatbuffer(
     const ShardSpec& spec, flatbuffers::FlatBufferBuilder& builder) {
-    flatbuffers::Offset<flatbuffer::ShardShape> physical_shard_shape = 0;
-    if (spec.physical_shard_shape.has_value()) {
-        const auto& phys_shape = *spec.physical_shard_shape;
-        physical_shard_shape = flatbuffer::CreateShardShape(builder, phys_shape[0], phys_shape[1]);
-    }
     return flatbuffer::CreateShardSpec(
-        builder,
-        to_flatbuffer(builder, spec.grid),
-        spec.shape[0],
-        spec.shape[1],
-        to_flatbuffer(spec.orientation),
-        to_flatbuffer(spec.mode),
-        physical_shard_shape);
+        builder, to_flatbuffer(builder, spec.grid), spec.shape[0], spec.shape[1], to_flatbuffer(spec.orientation));
 }
 
 flatbuffers::Offset<flatbuffer::BufferDistributionSpec> to_flatbuffer(

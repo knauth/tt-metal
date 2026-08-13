@@ -1,65 +1,139 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
 #include <stdint.h>
-#include <tt-metalium/fabric_edm_types.hpp>
-#include <tt-metalium/fabric_types.hpp>
-#include <tt-metalium/mesh_graph.hpp>                   // FabricType
-#include <umd/device/types/cluster_descriptor_types.h>  // chip_id_t
+#include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+#include <tt-metalium/experimental/fabric/fabric_types.hpp>
+#include <tt-metalium/experimental/fabric/mesh_graph.hpp>  // FabricType
+#include <tt-metalium/experimental/fabric/physical_grouping_descriptor.hpp>
+#include <umd/device/types/cluster_descriptor_types.hpp>  // ChipId
 #include <llrt/tt_cluster.hpp>
-#include <tt-metalium/erisc_datamover_builder.hpp>
+#include <tt_stl/assert.hpp>
+#include "erisc_datamover_builder.hpp"
 #include <set>
+#include <map>
 #include <vector>
 #include <unordered_map>
 #include <queue>
 #include <functional>
 #include <unordered_set>
 #include <optional>
+#include <filesystem>
+#include <string>
+#include <climits>
+#include <unistd.h>
+
+namespace tt::tt_metal {
+class PhysicalSystemDescriptor;
+}  // namespace tt::tt_metal
+
 namespace tt::tt_fabric {
+
+class TopologyMapper;
 
 class FabricNodeId;
 bool is_tt_fabric_config(tt::tt_fabric::FabricConfig fabric_config);
 
-uint32_t get_sender_channel_count(tt::tt_fabric::Topology topology);
-uint32_t get_downstream_edm_count(tt::tt_fabric::Topology topology);
+FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, bool is_ubb_galaxy);
 
-void set_routing_mode(uint16_t routing_mode);
-void set_routing_mode(Topology topology, tt::tt_fabric::FabricConfig fabric_config, uint32_t dimension = 1);
+// Returns whether a declared torus axis realizes a distinct wrap edge. Use bare
+// has_flag only for declared intent, never to decide realized routing topology.
+inline bool has_genuine_torus_axis(FabricType fabric_type, const MeshShape& mesh_shape, uint32_t axis) {
+    TT_FATAL(mesh_shape.dims() == 2, "Genuine torus-axis query requires a 2D mesh shape, got {}", mesh_shape);
+    TT_FATAL(axis < mesh_shape.dims(), "Torus axis must be within mesh shape {}, got {}", mesh_shape, axis);
+    return has_flag(fabric_type, torus_flag_for_axis(axis)) && is_genuine_torus_dim(mesh_shape[axis]);
+}
 
-FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, tt::tt_metal::ClusterType cluster_type);
+// Helper to validate that requested FabricType doesn't require more connectivity than available FabricType provides
+// Returns true if requested_type requires more connections than available_type provides
+// mesh_shape: [rows, cols], used to compare realized per-axis torus connectivity.
+bool requires_more_connectivity(FabricType requested_type, FabricType available_type, const MeshShape& mesh_shape);
+
+// Compute maximum 1D hops across all meshes in topology
+// Returns max(rows-1, cols-1) across all meshes, representing longest linear path
+// Returns 0 for empty input or single-chip meshes
+uint32_t compute_max_1d_hops(const std::vector<MeshShape>& mesh_shapes);
+
+// Compute maximum 2D hops across all meshes in topology
+// Returns (rows-1) + (cols-1) for largest mesh, representing Manhattan distance corner-to-corner
+// Returns 0 for empty input or single-chip meshes
+uint32_t compute_max_2d_hops(const std::vector<MeshShape>& mesh_shapes);
 
 std::vector<uint32_t> get_forwarding_link_indices_in_direction(
-    const FabricNodeId& src_fabric_node_id, const FabricNodeId& dst_fabric_node_id, RoutingDirection direction);
-
-void get_optimal_noc_for_edm(
-    FabricEriscDatamoverBuilder& edm_builder1,
-    FabricEriscDatamoverBuilder& edm_builder2,
-    uint32_t num_links,
-    Topology topology);
+    const ControlPlane& control_plane,
+    const FabricNodeId& src_fabric_node_id,
+    const FabricNodeId& dst_fabric_node_id,
+    RoutingDirection direction);
 
 // Helper: Build adjacency map and discover corners/edges using BFS
+using AdjacencyMap = std::unordered_map<ChipId, std::vector<ChipId>>;
 struct IntraMeshAdjacencyMap {
-    std::unordered_map<chip_id_t, std::vector<chip_id_t>> adjacency_map;
-    std::vector<chip_id_t> corners;  // Should always be size 2 for 1D meshes, 4 for 2D meshes, populated in order of closest to chip 0 by default
-    std::vector<chip_id_t> edges;    // Should always be size 2 for 1D meshes, 4 for 2D meshes, populated in order of closest to chip 0 by default
-    std::uint32_t ns_size;  // North-South size (rows)
-    std::uint32_t ew_size;  // East-West size (columns)
+    AdjacencyMap adjacency_map;
+    std::vector<ChipId> corners;  // Should always be size 2 for 1D meshes, 4 for 2D meshes, populated in order of
+                                  // closest to chip 0 by default
+    std::vector<ChipId> edges;  // Should always be size 2 for 1D meshes, 4 for 2D meshes, populated in order of closest
+                                // to chip 0 by default
+    std::uint32_t ns_size{};         // North-South size (rows)
+    std::uint32_t ew_size{};         // East-West size (columns)
 };
 
-IntraMeshAdjacencyMap build_mesh_adjacency_map(
-    const std::set<chip_id_t>& user_chip_ids,
-    const tt::tt_metal::distributed::MeshShape& mesh_shape,
-    std::function<std::vector<chip_id_t>(chip_id_t)> get_adjacent_chips_func,
-    std::optional<chip_id_t> start_chip_id = std::nullopt);
+// Serialize chip IDs to mesh coordinates mapping to a YAML file
+// Uses TopologyMapper to get the mapping between logical and physical chip IDs
+void serialize_mesh_coordinates_to_file(
+    const TopologyMapper& topology_mapper, const std::filesystem::path& output_file_path);
 
-// Helper: Convert 1D mesh adjacency map to row-major vector representation
-std::vector<chip_id_t> convert_1d_mesh_adjacency_to_row_major_vector(const IntraMeshAdjacencyMap& topology_info);
+// Serialize ASIC ID to Fabric node ID mappings to a YAML file
+// Categorizes mappings by mesh and host, showing which ASICs map to which Fabric nodes
+void serialize_asic_to_fabric_node_mapping_to_file(
+    const TopologyMapper& topology_mapper, const std::filesystem::path& output_file_path);
 
-// Helper: Convert 2D mesh adjacency map to row-major vector representation
-std::vector<chip_id_t> convert_2d_mesh_adjacency_to_row_major_vector(
-    const IntraMeshAdjacencyMap& topology_info, std::optional<chip_id_t> nw_corner_chip_id = std::nullopt);
+/**
+ * @brief Find and load a Physical Grouping Descriptor with the standard search order.
+ *
+ * If pgd_path is provided, use that path directly.
+ * Otherwise, if TT_METAL_PHYSICAL_GROUPING_DESCRIPTOR_PATH is set, use that path.
+ * Otherwise search:
+ * 1. /data/scaleout_configs/<TT_CLUSTER_NAME>/<name>_physical_grouping_descriptor.textproto
+ * 2. TT_METAL_HOME/tests/.../physical_groupings/<name>_physical_grouping_descriptor.textproto
+ * 3. Arch/cluster-type default under TT_METAL_HOME/tests/.../physical_groupings/
+ *
+ * Throws if an explicit path/env is set but missing, or if no descriptor is found in the search paths.
+ * When psd is provided, Blackhole Galaxy revision selects rev_ab vs rev_c PGD.
+ */
+PhysicalGroupingDescriptor find_and_load_physical_grouping_descriptor(
+    const std::optional<std::filesystem::path>& pgd_path = std::nullopt,
+    const tt::tt_metal::PhysicalSystemDescriptor* physical_system_descriptor = nullptr);
+
+/**
+ * @brief Best-effort variant of find_and_load_physical_grouping_descriptor.
+ *
+ * Same search order; returns nullopt instead of throwing when no descriptor is found
+ * (ControlPlane / TopologyMapper soft-skip).
+ */
+std::optional<PhysicalGroupingDescriptor> try_find_and_load_physical_grouping_descriptor(
+    const std::optional<std::filesystem::path>& pgd_path = std::nullopt,
+    const tt::tt_metal::PhysicalSystemDescriptor* physical_system_descriptor = nullptr);
+// Serialize the resolved inter-mesh port assignment to a YAML file (golden-comparable, debug-logged).
+// Builds per-boundary entries "D<chip>ch<chan>(<DIR>)>M<peer_mesh>D<peer_chip>ch<peer_chan>" from the
+// control-plane maps, fully sorted so the output is deterministic and independent of the physical host.
+void serialize_intermesh_port_assignment_to_file(
+    const std::map<FabricNodeId, std::unordered_map<chan_id_t, RoutingDirection>>& exit_node_directions,
+    const std::map<FabricNodeId, std::unordered_map<chan_id_t, std::pair<FabricNodeId, chan_id_t>>>&
+        intermesh_chan_to_peer,
+    const std::filesystem::path& output_file_path);
 
 }  // namespace tt::tt_fabric
+
+namespace tt::tt_metal {
+
+// Get the local hostname
+inline std::string get_host_name() {
+    char hostname[HOST_NAME_MAX + 1];
+    gethostname(hostname, sizeof(hostname));
+    return std::string(hostname);
+}
+
+}  // namespace tt::tt_metal

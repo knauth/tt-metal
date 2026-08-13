@@ -1,31 +1,33 @@
-// SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/dataflow/endpoints.h"
+#include "experimental/kernel_args.h"
 
 void kernel_main() {
-    uint32_t dst_addr  = get_arg_val<uint32_t>(0);
-    uint32_t dst_dram_bank_id = get_arg_val<uint32_t>(1);
-    uint32_t num_tiles = get_arg_val<uint32_t>(2);
-    uint32_t cb_id_out0 = get_arg_val<uint32_t>(3);
-    uint32_t ublock_size_tiles = get_arg_val<uint32_t>(4);
-    bool writer_only = get_arg_val<uint32_t>(5);
+    uint32_t dst_addr = get_arg(args::dst_addr);
+    uint32_t dst_dram_bank_id = get_arg(args::dst_dram_bank_id);
+    uint32_t num_tiles = get_arg(args::num_tiles);
+    uint32_t ublock_size_tiles = get_arg(args::ublock_size_tiles);
+    bool writer_only = get_arg(args::writer_only);
 
-    uint32_t ublock_size_bytes = get_tile_size(cb_id_out0) * ublock_size_tiles;
+    DataflowBuffer dfb(dfb::in);
+    uint32_t ublock_size_bytes = dfb.get_entry_size() * ublock_size_tiles;
+    Noc noc;
+    AllocatorBank<AllocatorBankType::DRAM> dram_dst;
 
     for (uint32_t i = 0; i < num_tiles; i += ublock_size_tiles) {
-        uint64_t dst_noc_addr = get_noc_addr_from_bank_id<true>(dst_dram_bank_id, dst_addr);
         if (writer_only == false) {
-            cb_wait_front(cb_id_out0, ublock_size_tiles);
+            dfb.wait_front(ublock_size_tiles);
         }
-        uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
+        noc.async_write(dfb, dram_dst, ublock_size_bytes, {}, {.bank_id = dst_dram_bank_id, .addr = dst_addr});
 
-        noc_async_write(l1_read_addr, dst_noc_addr, ublock_size_bytes);
-
-        noc_async_write_barrier();
+        noc.async_write_barrier();
         if (writer_only == false) {
-            cb_pop_front(cb_id_out0, ublock_size_tiles);
+            dfb.pop_front(ublock_size_tiles);
         }
         dst_addr += ublock_size_bytes;
     }

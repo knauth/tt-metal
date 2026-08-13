@@ -1,19 +1,19 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
 from loguru import logger
-from typing_extensions import override
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
+from models.common.utility_functions import comp_pcc
 from models.demos.qwen25_vl.reference.functional import qwen2_5_vision_transformer_preprocess
-from models.demos.qwen25_vl.tt.attention import Attention as QwenVLAttentionModule
 from models.demos.qwen25_vl.tt.model_config import VisionModelArgs
 from models.demos.qwen25_vl.tt.patch_merger import PatchMerger
 from models.demos.qwen25_vl.tt.rope import RotarySetup
 from models.demos.qwen25_vl.tt.vision_block import VisionBlock
+from models.tt_transformers.tt.attention import Attention
 from models.tt_transformers.tt.common import get_rot_transformation_mat
 from models.tt_transformers.tt.load_checkpoints import (
     convert_hf_to_meta,
@@ -21,7 +21,6 @@ from models.tt_transformers.tt.load_checkpoints import (
     standardize_hf_keys_multimodal,
 )
 from models.tt_transformers.tt.model import Transformer as TTTransformer
-from models.utility_functions import comp_pcc
 
 
 class VisionTransformer(LightweightModule):
@@ -56,7 +55,7 @@ class VisionTransformer(LightweightModule):
 
         # Create transformation matrix for RoPE QK prefill
         transformation_mat_torch = get_rot_transformation_mat(
-            args.head_dim
+            args.vision_head_dim
         )  # todo)) args.head_dim is ignored inside the function
         self.transformation_mats = {
             "prefill": ttnn.as_tensor(
@@ -117,9 +116,9 @@ class VisionTransformer(LightweightModule):
         self,
         x,
         unpadded_seq_len,
+        rot_mats,
         cu_seqlens,
         cu_window_seqlens,
-        rot_mats,
     ):
         """
         Forward pass through the Vision Transformer blocks.
@@ -182,7 +181,7 @@ class DropInVisionTransformer(torch.nn.Module):
         self.debug = debug
 
         state_dict = standardize_hf_keys_multimodal(reference_model.state_dict())
-        state_dict = convert_hf_to_meta(state_dict, model_args.head_dim)
+        state_dict = convert_hf_to_meta(state_dict, model_args.vision_head_dim)
         state_dict_prefix = model_args.get_state_dict_prefix("VisionTransformer")
         state_dict = {f"{state_dict_prefix}.{k}": v for k, v in state_dict.items()}
 
@@ -235,15 +234,11 @@ class DropInVisionTransformer(torch.nn.Module):
             cu_seqlens, cu_window_seqlens, position_embeddings, window_index = qwen2_5_vision_transformer_preprocess(
                 seq_len=unpadded_seq_len,
                 grid_thw=grid_thw,
-                head_dim=self.model_args.head_dim,
+                head_dim=self.model_args.vision_head_dim,
                 spatial_merge_size=self.model_args.hf_config.vision_config.spatial_merge_size,
                 window_size=self.model_args.hf_config.vision_config.window_size,
                 patch_size=self.model_args.hf_config.vision_config.patch_size,
             )
-
-            # Ensure cu_seqlens and cu_window_seqlens are tensors on the correct device
-            cu_seqlens = cu_seqlens.to(pixel_values.device)
-            cu_window_seqlens = cu_window_seqlens.to(pixel_values.device)
 
             # 3. Use reference model's patch embedding
             patch_input = self.reference_model.patch_embed(pixel_values)
@@ -290,9 +285,16 @@ class DropInVisionTransformer(torch.nn.Module):
             tt_out = self.tt_model(
                 tt_input,
                 unpadded_seq_len=unpadded_seq_len,
-                cu_seqlens=cu_seqlens,
-                cu_window_seqlens=cu_window_seqlens,
                 rot_mats=rot_mats,  # Use rot_mats generated in this forward pass
+                cu_seqlens=ttnn.from_torch(
+                    cu_seqlens, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.model_args.mesh_device
+                ),
+                cu_window_seqlens=ttnn.from_torch(
+                    cu_window_seqlens,
+                    dtype=ttnn.uint32,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    device=self.model_args.mesh_device,
+                ),
             )
 
             # deallocate device tensors that are not needed by decode
@@ -333,6 +335,22 @@ class DropInVisionTransformer(torch.nn.Module):
 
 
 class Transformer(TTTransformer):
+    # --- On-device greedy decode correctness on batch-32 (#48037) ---
+    # Symptom: on-device sampling produced gibberish at batch-32 (BERTScore F1 ~0.34)
+    # but is correct at batch-1, and host argmax of the same batch-32 run is correct
+    # (F1 0.791) -> the decode forward is fine; only the on-device sampling path is wrong
+    # at batch-32. Root cause: with allow_force_argmax disabled (the non-Galaxy default),
+    # greedy decode (temperature=0 -> k=1,p=0,temp=1) goes through the heavy top-k/top-p
+    # multi-all-gather sampling pipeline, which is what corrupts at batch-32, rather than
+    # the simple single-gather argmax path.
+    #
+    # Fix: route greedy decode through the force-argmax path (enabled in __init__ below),
+    # and re-stage the decode trace inputs from host every step + run the sampling op
+    # eagerly so the all-gather re-acquires a fresh multi_device_global_semaphore each
+    # step instead of reusing a stale one frozen into a captured trace.
+    _tt_vllm_always_refresh_decode_trace_inputs = True
+    _tt_disable_sampling_trace = True
+
     def __init__(
         self,
         args,
@@ -343,6 +361,14 @@ class Transformer(TTTransformer):
         paged_attention_config=None,
         use_paged_kv_cache=False,
     ):
+        # Enable the single-gather force-argmax sampling path for greedy decode. The
+        # non-Galaxy default (default_sampling_force_argmax) sets allow_force_argmax=False,
+        # which forces greedy decode onto the heavy top-k/top-p pipeline that corrupts at
+        # batch-32 (#48037). Must be set before super().__init__ builds the sampling module.
+        ag_cfg = dict(args.model_config.get("SAMPLING_AG_CONFIG", {}) or {})
+        ag_cfg["allow_force_argmax"] = True
+        args.model_config["SAMPLING_AG_CONFIG"] = ag_cfg
+
         # Call parent constructor with vision-specific classes
         super().__init__(
             args=args,
@@ -352,14 +378,33 @@ class Transformer(TTTransformer):
             weight_cache_path=weight_cache_path,
             paged_attention_config=paged_attention_config,
             use_paged_kv_cache=use_paged_kv_cache,
-            attention_class=QwenVLAttentionModule,
+            attention_class=Attention,
             rope_setup_class=RotarySetup,
         )
 
-    @override
-    def prepare_inputs_prefill(self, tokens, start_pos=0, page_table=None, chunk_page_table=None):
+    def _prepare_cos_sin(self, rot_mats):
+        cos_matrix = rot_mats[0]
+        sin_matrix = rot_mats[1]
+        assert cos_matrix.shape[0] == sin_matrix.shape[0], "cos_matrix and sin_matrix must have the same batch size"
+        outputs = []
+        for mat in (cos_matrix, sin_matrix):
+            outputs.append(
+                ttnn.from_torch(
+                    # [INFO] Qwen2.5 VL produces cos and sin matrices with shape [batch_size, 1, seq_len, head_dim]
+                    mat.expand(cos_matrix.shape[0], -1, -1, -1),
+                    device=self.mesh_device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=self.rope_setup.datatype,
+                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+                ),
+            )
+        return outputs
+
+    def prepare_inputs_prefill(self, tokens, rot_mats, start_pos=0, page_table=None, chunk_page_table=None):
+        assert isinstance(rot_mats[0], torch.Tensor)
+        assert isinstance(rot_mats[1], torch.Tensor)
         # tokens is actually embeddings
-        assert tokens.dim() == 3, "tokens should be a 3D tensor"
+        assert tokens.dim() == 3, "tokens should be a 3D tensor"  # [batch_size = 1, seq_len, head_dim]
         S = tokens.shape[-2]
         tokens_embd = ttnn.from_torch(
             tokens.unsqueeze(1),
@@ -372,12 +417,13 @@ class Transformer(TTTransformer):
         )
 
         # Slice the rot mats to the prefill seqlen
+        cos_matrix, sin_matrix = self._prepare_cos_sin(rot_mats=rot_mats)
         assert (
-            self.rope_setup.cos_matrix.shape[2] >= start_pos + S
-        ), f"Padded prefill end idx {start_pos + S} exceeds max seq len {self.rope_setup.cos_matrix.shape[2]}"
+            cos_matrix.shape[2] >= start_pos + S
+        ), f"Padded prefill end idx {start_pos + S} exceeds max seq len {cos_matrix.shape[2]}"
         tt_rot_mats_prefill = [
-            self.rope_setup.cos_matrix[:, :, start_pos : start_pos + S, :],
-            self.rope_setup.sin_matrix[:, :, start_pos : start_pos + S, :],
+            cos_matrix[:, :, start_pos : start_pos + S, :],
+            sin_matrix[:, :, start_pos : start_pos + S, :],
         ]
 
         if page_table is not None:

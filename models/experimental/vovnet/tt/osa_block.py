@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,6 +11,13 @@ from models.experimental.vovnet.tt.sequential_append_list import (
 from models.experimental.vovnet.tt.effective_se_module import (
     TtEffectiveSEModule,
 )
+
+try:
+    from tracy import signpost
+
+    use_signpost = True
+except ModuleNotFoundError:
+    use_signpost = False
 
 
 class TtOsaBlock:
@@ -51,6 +58,9 @@ class TtOsaBlock:
         )
 
     def forward(self, x: ttnn.Tensor) -> ttnn.Tensor:
+        if use_signpost:
+            signpost(header="osa_block")
+
         output = [ttnn.to_layout(x, layout=ttnn.TILE_LAYOUT)]
         if self.conv_reduction is not None:
             x = self.conv_reduction.forward(x)

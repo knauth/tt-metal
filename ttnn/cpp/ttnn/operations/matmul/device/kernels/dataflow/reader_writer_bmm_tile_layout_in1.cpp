@@ -1,115 +1,159 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include <stdint.h>
 
-#include "dataflow_api.h"
+#include "api/dataflow/dataflow_api.h"
+#include "api/dataflow/noc.h"
+#include "api/dataflow/dataflow_buffer.h"
+#include "api/tensor/noc_traits.h"
 
 void kernel_main() {
-    // in0/in1 common args
-    const uint32_t num_blocks = get_arg_val<uint32_t>(0);
-
-    // batch args
-    const uint32_t batch = get_arg_val<uint32_t>(1);
-    const uint32_t bcast_B = get_arg_val<uint32_t>(2);
-    const uint32_t MtNt = get_arg_val<uint32_t>(3);  // if 0
-    const uint32_t KtNt = get_arg_val<uint32_t>(4);
-
+    // RUNTIME ARGS
+    // READER
+    uint32_t rt_args_idx = 0;
     // in1 tensor args
-    const uint32_t in1_tensor_addr = get_arg_val<uint32_t>(5);
-    uint32_t in1_tensor_start_tile_id = get_arg_val<uint32_t>(6);
-    const uint32_t in1_tensor_stride_w = get_arg_val<uint32_t>(7);
-    const uint32_t in1_tensor_stride_h = get_arg_val<uint32_t>(8);
-    const uint32_t in1_tensor_next_block_stride = get_arg_val<uint32_t>(9);
-
-    // in1 block args
-    const uint32_t in1_block_w = get_arg_val<uint32_t>(10);
-    const uint32_t in1_block_h = get_arg_val<uint32_t>(11);
-    const uint32_t in1_block_num_tiles = get_arg_val<uint32_t>(12);
+    const uint32_t in1_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);
+    uint32_t in1_tensor_start_tile_id = get_arg_val<uint32_t>(rt_args_idx++);
+    // batch args
+    const uint32_t batch = get_arg_val<uint32_t>(rt_args_idx++);
 
     // WRITER
     // out tensor args
-    const uint32_t out_tensor_addr = get_arg_val<uint32_t>(13);
-    uint32_t out_tensor_start_tile_id = get_arg_val<uint32_t>(14);
-    const uint32_t out_tensor_stride_w = get_arg_val<uint32_t>(15);
-    const uint32_t out_tensor_stride_h = get_arg_val<uint32_t>(16);
-    const uint32_t out_tensor_next_subblock_stride_w = get_arg_val<uint32_t>(17);
-    const uint32_t out_tensor_next_subblock_stride_h = get_arg_val<uint32_t>(18);
+    const uint32_t out_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);
+    uint32_t out_tensor_start_tile_id = get_arg_val<uint32_t>(rt_args_idx++);
 
-    // out subblock args
-    const uint32_t out_subblock_w = get_arg_val<uint32_t>(19);
-    const uint32_t out_subblock_h = get_arg_val<uint32_t>(20);
-    const uint32_t out_subblock_tile_count = get_arg_val<uint32_t>(21);
-    const uint32_t out_num_subblocks_w = get_arg_val<uint32_t>(22);
-    const uint32_t out_num_subblocks_h = get_arg_val<uint32_t>(23);
-
-    // Don't need batch; same as batch from READER args
+#ifdef FUSE_BIAS
+    // bias tensor args
+    const uint32_t in3_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);
+    const uint32_t in3_tensor_start_tile_id = get_arg_val<uint32_t>(rt_args_idx++);
+#endif
 
     // COMPILE TIME ARGS
-    // interleaved accessor args
-    constexpr bool in1_is_dram = get_compile_time_arg_val(0) == 1;
-    constexpr bool out_is_dram = get_compile_time_arg_val(1) == 1;
-
-    constexpr uint32_t cb_id_in1 = 1;
+    // READER
+    // in1 tensor args
+    constexpr uint32_t in1_tensor_stride_w = get_compile_time_arg_val(0);
+    constexpr uint32_t in1_tensor_stride_h = get_compile_time_arg_val(1);
+    constexpr uint32_t in1_tensor_next_block_stride = get_compile_time_arg_val(2);
+    // in1 block args
+    constexpr uint32_t in1_block_w = get_compile_time_arg_val(3);
+    constexpr uint32_t in1_block_h = get_compile_time_arg_val(4);
+    constexpr uint32_t in1_block_num_tiles = get_compile_time_arg_val(5);
+    // in0/in1 common args
+    constexpr uint32_t num_blocks = get_compile_time_arg_val(6);
+    // batch args
+    constexpr uint32_t bcast_B = get_compile_time_arg_val(7);
+    constexpr uint32_t KtNt = get_compile_time_arg_val(8);
 
     // WRITER
-    constexpr uint32_t cb_id_out0 = tt::CBIndex::c_4;
+    // out tensor args
+    constexpr uint32_t out_tensor_stride_w = get_compile_time_arg_val(9);
+    constexpr uint32_t out_tensor_stride_h = get_compile_time_arg_val(10);
+    constexpr uint32_t out_tensor_next_subblock_stride_w = get_compile_time_arg_val(11);
+    constexpr uint32_t out_tensor_next_subblock_stride_h = get_compile_time_arg_val(12);
+    constexpr uint32_t out_subblock_w = get_compile_time_arg_val(13);
+    constexpr uint32_t out_subblock_h = get_compile_time_arg_val(14);
+    constexpr uint32_t out_subblock_tile_count = get_compile_time_arg_val(15);
+    constexpr uint32_t out_num_subblocks_w = get_compile_time_arg_val(16);
+    constexpr uint32_t out_num_subblocks_h = get_compile_time_arg_val(17);
+    // batch args
+    constexpr uint32_t MtNt = get_compile_time_arg_val(18);
+
+    constexpr uint32_t dfb_id_in1 = get_named_compile_time_arg_val("cb_in1");
+    // WRITER
+    constexpr uint32_t dfb_id_out0 = get_named_compile_time_arg_val("cb_out");
+
+    constexpr auto in1_args = TensorAccessorArgs<19>();
+    constexpr auto out_args = TensorAccessorArgs<in1_args.next_compile_time_args_offset()>();
+#ifdef FUSE_BIAS
+    // bias accessor CT args follow the output accessor
+    constexpr auto bias_args = TensorAccessorArgs<out_args.next_compile_time_args_offset()>();
+    constexpr uint32_t dfb_id_in3 = get_named_compile_time_arg_val("cb_bias");
+#endif
+
+    Noc noc;
+    DataflowBuffer dfb_in1(dfb_id_in1);
+    DataflowBuffer dfb_out(dfb_id_out0);
+
+#ifdef FUSE_BIAS
+    // Load the whole per-batch [M, N] bias block once.
+    // It's reused across all of this core's batch iterations (broadcast over batch).
+    constexpr uint32_t bias_block_ntiles = out_subblock_h * out_num_subblocks_h * in1_block_w;  // M*N tiles
+    const uint32_t bias_single_tile_size_bytes = get_tile_size(dfb_id_in3);
+    DataflowBuffer dfb_in3(dfb_id_in3);
+    const auto s3 = TensorAccessor(bias_args, in3_tensor_addr);
+    dfb_in3.reserve_back(bias_block_ntiles);
+    uint32_t in3_write_offset = 0;
+    uint32_t in3_tensor_tile_id = in3_tensor_start_tile_id;
+    for (uint32_t t = 0; t < bias_block_ntiles; ++t) {
+        noc.async_read(
+            s3,
+            dfb_in3,
+            bias_single_tile_size_bytes,
+            {.page_id = in3_tensor_tile_id},
+            {.offset_bytes = in3_write_offset});
+        in3_write_offset += bias_single_tile_size_bytes;
+        in3_tensor_tile_id += 1;  // [M, N] bias is row-major contiguous (stride 1)
+    }
+    noc.async_read_barrier();
+    dfb_in3.push_back(bias_block_ntiles);
+#endif
 
 #ifdef IN1_SHARDED
     const uint32_t in1_num_tiles = batch * num_blocks * in1_block_h * in1_block_w;
-    cb_reserve_back(cb_id_in1, in1_num_tiles);
-    cb_push_back(cb_id_in1, in1_num_tiles);
+    dfb_in1.reserve_back(in1_num_tiles);
+    dfb_in1.push_back(in1_num_tiles);
 #else
-    const uint32_t in1_single_tile_size_bytes = get_tile_size(cb_id_in1);
-    const DataFormat in1_data_format = get_dataformat(cb_id_in1);
-    constexpr const uint32_t in1_tile_hw = get_tile_hw(cb_id_in1);
-    const InterleavedAddrGenFast<in1_is_dram, in1_tile_hw> s1 = {
-        .bank_base_address = in1_tensor_addr, .page_size = in1_single_tile_size_bytes, .data_format = in1_data_format};
-    uint32_t l1_write_addr_in1;
-#endif
+    const uint32_t in1_single_tile_size_bytes = get_tile_size(dfb_id_in1);
+    // Tiles whose size is not a multiple of the DRAM alignment are padded to it in DRAM and the in1
+    // CB pages are sized to match (see the program factory), so tiles are laid out in L1 at the
+    // padded stride while the NOC reads the unpadded tile of data into each padded slot. No-op when
+    // the tile size is already aligned.
+    const uint32_t in1_aligned_tile_size_bytes =
+        (in1_single_tile_size_bytes + (DRAM_ALIGNMENT - 1)) & ~(DRAM_ALIGNMENT - 1);
+    const auto s1 = TensorAccessor(in1_args, in1_tensor_addr);
+#endif  // IN1_SHARDED
 
 #ifndef OUT_SHARDED
-    const uint32_t output_single_tile_size_bytes = get_tile_size(cb_id_out0);
-    const DataFormat output_data_format = get_dataformat(cb_id_out0);
-    constexpr const uint32_t output_tile_hw = get_tile_hw(cb_id_out0);
-
-    const InterleavedAddrGenFast<out_is_dram, output_tile_hw> s = {
-        .bank_base_address = out_tensor_addr,
-        .page_size = output_single_tile_size_bytes,
-        .data_format = output_data_format};
-#endif
+    const uint32_t output_single_tile_size_bytes = get_tile_size(dfb_id_out0);
+    const auto s = TensorAccessor(out_args, out_tensor_addr);
+#endif  // OUT_SHARDED
 
 #if not defined IN1_SHARDED or not defined OUT_SHARDED
     for (uint32_t b = 0; b < batch; ++b) {
 #ifndef IN1_SHARDED
         uint32_t in1_tensor_current_block_start_tile_id = in1_tensor_start_tile_id;
         for (uint32_t block = 0; block < num_blocks; ++block) {
-            cb_reserve_back(cb_id_in1, in1_block_num_tiles);
+            dfb_in1.reserve_back(in1_block_num_tiles);
 
-            l1_write_addr_in1 = get_write_ptr(cb_id_in1);
+            uint32_t in1_write_offset = 0;
 
             uint32_t in1_tensor_row_start_tile_id = in1_tensor_current_block_start_tile_id;
             for (uint32_t h = 0; h < in1_block_h; ++h) {
                 uint32_t in1_tensor_tile_id = in1_tensor_row_start_tile_id;
                 for (uint32_t w = 0; w < in1_block_w; ++w) {
-                    noc_async_read_tile(in1_tensor_tile_id, s1, l1_write_addr_in1);
-
-                    l1_write_addr_in1 += in1_single_tile_size_bytes;
+                    noc.async_read(
+                        s1,
+                        dfb_in1,
+                        in1_single_tile_size_bytes,
+                        {.page_id = in1_tensor_tile_id},
+                        {.offset_bytes = in1_write_offset});
+                    in1_write_offset += in1_aligned_tile_size_bytes;
                     in1_tensor_tile_id += in1_tensor_stride_w;
                 }
                 in1_tensor_row_start_tile_id += in1_tensor_stride_h;
             }
             in1_tensor_current_block_start_tile_id += in1_tensor_next_block_stride;
 
-            noc_async_read_barrier();
+            noc.async_read_barrier();
 
-            cb_push_back(cb_id_in1, in1_block_num_tiles);
+            dfb_in1.push_back(in1_block_num_tiles);
         }
         if (bcast_B == 0) {
             in1_tensor_start_tile_id += KtNt;
         }
-#endif
+#endif  // IN1_SHARDED
 
 #ifndef OUT_SHARDED
         // WRITER
@@ -119,33 +163,38 @@ void kernel_main() {
             for (uint32_t sbw = 0; sbw < out_num_subblocks_w; ++sbw) {
                 uint32_t out_tensor_sb_row_start_tile_id = out_tensor_sbw_start_tile_id;
 
-                cb_wait_front(cb_id_out0, out_subblock_tile_count);
-                uint32_t l1_read_addr = get_read_ptr(cb_id_out0);
+                dfb_out.wait_front(out_subblock_tile_count);
+                uint32_t out_read_offset = 0;
 
                 for (uint32_t h = 0; h < out_subblock_h; ++h) {
                     uint32_t out_tensor_tile_id = out_tensor_sb_row_start_tile_id;
                     for (uint32_t w = 0; w < out_subblock_w; ++w) {
-                        noc_async_write_tile(out_tensor_tile_id, s, l1_read_addr);
+                        noc.async_write(
+                            dfb_out,
+                            s,
+                            output_single_tile_size_bytes,
+                            {.offset_bytes = out_read_offset},
+                            {.page_id = out_tensor_tile_id});
 
-                        l1_read_addr += output_single_tile_size_bytes;
+                        out_read_offset += output_single_tile_size_bytes;
 
                         out_tensor_tile_id += out_tensor_stride_w;
                     }
                     out_tensor_sb_row_start_tile_id += out_tensor_stride_h;
                 }
 
-                noc_async_write_barrier();
-                cb_pop_front(cb_id_out0, out_subblock_tile_count);
+                noc.async_write_barrier();
+                dfb_out.pop_front(out_subblock_tile_count);
                 out_tensor_sbw_start_tile_id += out_tensor_next_subblock_stride_w;
             }
             out_tensor_sbh_start_tile_id += out_tensor_next_subblock_stride_h;
         }
         out_tensor_start_tile_id += MtNt;
-#endif
+#endif  // OUT_SHARDED
     }
-#endif
+#endif  // not defined IN1_SHARDED or not defined OUT_SHARDED
 
 #ifdef OUT_SHARDED
-    cb_wait_front(cb_id_out0, batch * out_num_subblocks_h * out_num_subblocks_w * out_subblock_w * out_subblock_h);
-#endif
+    dfb_out.wait_front(batch * out_num_subblocks_h * out_num_subblocks_w * out_subblock_w * out_subblock_h);
+#endif  // OUT_SHARDED
 }

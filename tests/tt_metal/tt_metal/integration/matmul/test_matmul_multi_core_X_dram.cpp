@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -26,25 +26,25 @@
 #include <variant>
 #include <vector>
 
-#include <tt-metalium/assert.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/buffer_types.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/device.hpp>
 #include "mesh_dispatch_fixture.hpp"
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/hal_types.hpp>
 #include "hostdevcommon/kernel_structs.h"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include "matmul_test_utils.hpp"
 #include <tt-metalium/program.hpp>
 #include <tt_stl/span.hpp>
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include "tt_metal/test_utils/deprecated/tensor.hpp"
-#include "umd/device/types/arch.h"
+#include <tt-metalium/tensor_accessor_args.hpp>
+#include <umd/device/types/arch.hpp>
 
 namespace tt::tt_metal {
 
@@ -60,7 +60,7 @@ struct MatmulConfig {
 };
 
 std::tuple<distributed::MeshWorkload, tt_metal::KernelHandle, tt_metal::KernelHandle> create_program(
-    std::shared_ptr<distributed::MeshDevice> mesh_device,
+    const std::shared_ptr<distributed::MeshDevice>& /*mesh_device*/,
     const MatmulConfig& cfg,
     int num_cores_r,
     int num_cores_c,
@@ -74,7 +74,7 @@ std::tuple<distributed::MeshWorkload, tt_metal::KernelHandle, tt_metal::KernelHa
     auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
     distributed::MeshWorkload workload;
     tt_metal::Program program = tt_metal::CreateProgram();
-    distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+    workload.add_program(device_range, std::move(program));
     auto& program_ = workload.get_programs().at(device_range);
 
     uint32_t single_tile_size = 2 * 1024;
@@ -119,15 +119,15 @@ std::tuple<distributed::MeshWorkload, tt_metal::KernelHandle, tt_metal::KernelHa
                     .set_page_size(ouput_cb_index, single_tile_size)
                     .set_page_size(interm0_cb_index, single_tile_size);
             if (cfg.multi_dram) {
-                auto cb_src0 = tt_metal::CreateCircularBuffer(program_, all_cores, cb_src0_config);
-                auto cb_src1 = tt_metal::CreateCircularBuffer(program_, all_cores, cb_src1_config);
-                auto cb_output = tt_metal::CreateCircularBuffer(program_, CoreRangeSet({all_cores}), cb_output_config);
+                tt_metal::CreateCircularBuffer(program_, all_cores, cb_src0_config);
+                tt_metal::CreateCircularBuffer(program_, all_cores, cb_src1_config);
+                tt_metal::CreateCircularBuffer(program_, CoreRangeSet({all_cores}), cb_output_config);
             } else {
                 CoreCoord core = {(std::size_t)j, (std::size_t)i};
                 CoreRangeSet cores(std::set<CoreRange>{CoreRange(core, core)});
-                auto cb_src0 = tt_metal::CreateCircularBuffer(program_, core, cb_src0_config);
-                auto cb_src1 = tt_metal::CreateCircularBuffer(program_, core, cb_src1_config);
-                auto cb_output = tt_metal::CreateCircularBuffer(program_, cores, cb_output_config);
+                tt_metal::CreateCircularBuffer(program_, core, cb_src0_config);
+                tt_metal::CreateCircularBuffer(program_, core, cb_src1_config);
+                tt_metal::CreateCircularBuffer(program_, cores, cb_output_config);
             }
         }
     }
@@ -174,7 +174,7 @@ std::tuple<distributed::MeshWorkload, tt_metal::KernelHandle, tt_metal::KernelHa
         uint(out_subblock_w),
         uint(out_subblock_num_tiles)};
 
-    auto mm_kernel = tt_metal::CreateKernel(
+    tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/compute/matmul_large_block_zm.cpp",
         all_cores,
@@ -183,7 +183,7 @@ std::tuple<distributed::MeshWorkload, tt_metal::KernelHandle, tt_metal::KernelHa
     return {std::move(workload), mm_reader_kernel, unary_writer_kernel};
 }
 
-bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh_device) {
+bool matmul_multi_core_single_dram(const std::shared_ptr<distributed::MeshDevice>& mesh_device) {
     bool pass = true;
     CoreCoord compute_with_storage_grid_size = mesh_device->compute_with_storage_grid_size();
     int num_cores_r = compute_with_storage_grid_size.y;
@@ -240,7 +240,7 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
             out_subblock_h,
             out_subblock_w);
 
-    auto device = mesh_device->get_devices()[0];
+    auto* device = mesh_device->get_devices()[0];
     auto zero_coord = distributed::MeshCoordinate(0, 0);
     auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
     auto& program_ = workload.get_programs().at(device_range);
@@ -253,7 +253,7 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
             tt_metal::get_row_slice(tensor.get_values(), num_cores_r, i, M * 32, K * 32);
         for (int j = 0; j < num_cores_c; j++) {
             std::vector<bfloat16> weights_slice = tt_metal::get_col_slice(identity, num_cores_c, j, K * 32, N * 32);
-            int core_index = i * num_cores_c + j;
+            int core_index = (i * num_cores_c) + j;
             CoreCoord core = {(std::size_t)j, (std::size_t)i};
 
             uint32_t dram_buffer_src0_addr = (core_index * per_core_M * K * single_tile_size) + dram_unreserved_base;
@@ -262,7 +262,6 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
             int dram_src1_channel_id = 1;
             uint32_t dram_buffer_dst_addr =
                 (core_index * per_core_M * per_core_N * single_tile_size) + dram_unreserved_base;
-            int dram_dst_channel_id = 2;
 
             uint32_t dram_buffer_size_act =
                 single_tile_size * per_core_M * K;  // num_tiles of FP16_B, hard-coded in the reader/writer kernels
@@ -289,7 +288,7 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
 
             auto activations_tilized = tilize_swizzled(activation_slice, per_core_M * 32, K * 32);
             auto activations_tile_layout =
-                convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(activations_tilized));
+                convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(activations_tilized));
             auto activations = pack_bfloat16_vec_into_uint32_vec(activations_tile_layout);
             auto activations_tile_transposed = tt_metal::transpose_tiles(activations, per_core_M, K, in0_block_w);
             pass &= tt_metal::detail::WriteToDeviceDRAMChannel(
@@ -297,7 +296,7 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
 
             auto identity_tilized = tilize_swizzled(weights_slice, K * 32, per_core_N * 32);
             auto weights_tile_layout =
-                convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(identity_tilized));
+                convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(identity_tilized));
             auto weights = pack_bfloat16_vec_into_uint32_vec(weights_tile_layout);
             pass &= tt_metal::detail::WriteToDeviceDRAMChannel(
                 device, dram_src1_channel_id, dram_buffer_src1_addr, weights);
@@ -343,7 +342,7 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
         for (int j = 0; j < num_cores_c; j++) {
             auto per_core_golden = tt_metal::get_col_slice(golden_row, num_cores_c, j, per_core_M * 32, N * 32);
             std::vector<uint32_t> result_vec;
-            int core_index = i * num_cores_c + j;
+            int core_index = (i * num_cores_c) + j;
             uint32_t dram_buffer_dst_addr =
                 (core_index * per_core_M * per_core_N * single_tile_size) + dram_unreserved_base;
             int dram_dst_channel_id = 2;
@@ -355,7 +354,7 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
                 result_vec);
             auto result_bfp16 = unpack_uint32_vec_into_bfloat16_vec(result_vec);
             auto result_flat_layout =
-                convert_layout_tile_nfaces_to_tile_swizzled(tt::stl::make_const_span(result_bfp16));
+                convert_layout_tile_nfaces_to_tile_swizzled(ttsl::make_const_span(result_bfp16));
             auto result_untilized = untilize_swizzled(result_flat_layout, per_core_M * 32, per_core_N * 32);
             pass &= (per_core_golden == result_untilized);
         }
@@ -365,7 +364,7 @@ bool matmul_multi_core_single_dram(std::shared_ptr<distributed::MeshDevice> mesh
 }
 
 bool assign_runtime_args_to_program(
-    std::shared_ptr<distributed::MeshDevice> mesh_device,
+    const std::shared_ptr<distributed::MeshDevice>& /*mesh_device*/,
     distributed::MeshWorkload& workload,
     int num_cores_r,
     int num_cores_c,
@@ -443,10 +442,10 @@ bool assign_runtime_args_to_program(
             };
 
             const std::array writer_args = {
-                (std::uint32_t)out_dram_addr,                                          // out_tensor_addr
-                (std::uint32_t)core_idx_x * per_core_N + core_idx_y * per_core_M * N,  // out_tensor_start_tile_id
-                (std::uint32_t)1,                                                      // out_tensor_stride_w
-                (std::uint32_t)N,                                                      // out_tensor_stride_h
+                (std::uint32_t)out_dram_addr,                                              // out_tensor_addr
+                ((std::uint32_t)core_idx_x * per_core_N) + (core_idx_y * per_core_M * N),  // out_tensor_start_tile_id
+                (std::uint32_t)1,                                                          // out_tensor_stride_w
+                (std::uint32_t)N,                                                          // out_tensor_stride_h
                 (std::uint32_t)out_subblock_w,      // out_tensor_next_subblock_stride_w
                 (std::uint32_t)out_subblock_h * N,  // out_tensor_next_subblock_stride_h
 
@@ -465,7 +464,7 @@ bool assign_runtime_args_to_program(
 }
 
 bool matmul_multi_core_multi_dram(
-    tt_metal::MeshDispatchFixture* fixture, std::shared_ptr<distributed::MeshDevice> mesh_device) {
+    tt_metal::MeshDispatchFixture* fixture, const std::shared_ptr<distributed::MeshDevice>& mesh_device) {
     bool pass = true;
     int num_cores_r = mesh_device->compute_with_storage_grid_size().y;
     int num_cores_c = mesh_device->compute_with_storage_grid_size().x;
@@ -477,7 +476,6 @@ bool matmul_multi_core_multi_dram(
     int in0_block_w = 2;
     int per_core_M = M / num_cores_r;
     int per_core_N = N / num_cores_c;
-    uint32_t single_tile_size = 2 * 1024;
     log_info(LogTest, "num_cores_r={}, num_cores_c={}", num_cores_r, num_cores_c);
     log_info(LogTest, "M = {}, N = {}, K = {}", M, N, K);
     log_info(LogTest, "Activation = {}x{}", M * 32, K * 32);
@@ -519,10 +517,8 @@ bool matmul_multi_core_multi_dram(
             out_subblock_h,
             out_subblock_w);
 
-    auto device = mesh_device->get_devices()[0];
     auto zero_coord = distributed::MeshCoordinate(0, 0);
     auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
-    auto& program_ = workload.get_programs().at(device_range);
     // CommandQueue& cq = device->command_queue();
 
     ////////////////////////////////////////////////////////////////////////////
@@ -531,7 +527,7 @@ bool matmul_multi_core_multi_dram(
     log_debug(LogTest, "Scattering inputs (activation & weights) to dram channels using tiled layout");
     auto activations_tilized = tilize_swizzled(tensor.get_values(), M * 32, K * 32);
     auto activations_tile_layout =
-        convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(activations_tilized));
+        convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(activations_tilized));
     auto activations = pack_bfloat16_vec_into_uint32_vec(activations_tile_layout);
     distributed::DeviceLocalBufferConfig local_buffer_config = {
         .page_size = 1024 * 2, .buffer_type = tt_metal::BufferType::DRAM, .bottom_up = false};
@@ -541,7 +537,7 @@ bool matmul_multi_core_multi_dram(
 
     pass &= move_tiles_to_dram(mesh_device, activations, M, K, activation_buffer);
     auto identity_tilized = tilize_swizzled(identity, K * 32, N * 32);
-    auto weights_tile_layout = convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(identity_tilized));
+    auto weights_tile_layout = convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(identity_tilized));
     auto weights = pack_bfloat16_vec_into_uint32_vec(weights_tile_layout);
     distributed::ReplicatedBufferConfig weight_buffer_config = {.size = weights.size() * sizeof(uint32_t)};
     auto weight_buffer = distributed::MeshBuffer::create(weight_buffer_config, local_buffer_config, mesh_device.get());
@@ -594,7 +590,7 @@ bool matmul_multi_core_multi_dram(
             result_iter += 512;
             auto result_bfp16 = unpack_uint32_vec_into_bfloat16_vec(result_vec);
             auto result_flat_layout =
-                convert_layout_tile_nfaces_to_tile_swizzled(tt::stl::make_const_span(result_bfp16));
+                convert_layout_tile_nfaces_to_tile_swizzled(ttsl::make_const_span(result_bfp16));
 
             pass &= (golden_tile == result_flat_layout);
         }
@@ -609,14 +605,14 @@ TEST_F(MeshDispatchFixture, TensixMatmulMultiCoreSingleDRAM) {
     if (!getenv("TT_METAL_SLOW_DISPATCH_MODE")) {
         log_info(LogTest, "This test is only supported in slow dispatch mode");
         GTEST_SKIP();
-    } else if (this->arch_ == tt::ARCH::WORMHOLE_B0) {
+    }
+    if (this->arch_ == tt::ARCH::WORMHOLE_B0) {
         log_info(tt::LogTest, "This test is disabled in WH B0");
         GTEST_SKIP();
     }
 
-    for (unsigned int id = 0; id < devices_.size(); id++) {
-        ASSERT_TRUE(
-            unit_tests_common::matmul::test_matmul_multi_core_X_dram::matmul_multi_core_single_dram(devices_.at(id)));
+    for (const auto& device : devices_) {
+        ASSERT_TRUE(unit_tests_common::matmul::test_matmul_multi_core_X_dram::matmul_multi_core_single_dram(device));
     }
 }
 

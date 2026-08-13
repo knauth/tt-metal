@@ -1,22 +1,26 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
 #include <initializer_list>
+#include <string>
 #include <variant>
 #include <vector>
 
+#include <tt-metalium/buffer.hpp>
+#include <tt-metalium/circular_buffer.hpp>
 #include <tt-metalium/dispatch_core_common.hpp>
 #include <tt-metalium/runtime_args_data.hpp>
 #include <tt-metalium/program.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/sub_device_types.hpp>
 #include <tt_stl/span.hpp>
-#include <tt-metalium/lightmetal_binary.hpp>
 #include <tt-metalium/profiler_types.hpp>
 #include <tt-metalium/profiler_optional_metadata.hpp>
+#include <tt-metalium/kernel_types.hpp>
+#include <tt-metalium/circular_buffer_config.hpp>
 
 /** @file */
 
@@ -30,27 +34,35 @@
  * https://www.tablesgenerator.com/markdown_tables
  * */
 
-class CoreRange;
-class CoreRangeSet;
+namespace tt::tt_metal {
 
-namespace tt {
-
-namespace tt_metal {
-
-class CommandQueue;
 struct TraceDescriptor;
 
 class Program;
 class IDevice;
 class Trace;
-class CircularBuffer;
-class Event;
 class Buffer;
 class GlobalSemaphore;
+class CoreRange;
+class CoreRangeSet;
+class MeshTensor;
 
 // ==================================================
 //                  HOST API: Device management
 // ==================================================
+
+// clang-format off
+/**
+ * Sets the root directory for TT Metal meta data files like kernel sources.
+ *
+ * Return value: void
+ *
+ * | Argument  | Description                                 | Type                | Valid range | Required |
+ * |-----------|---------------------------------------------|---------------------|-------------|----------|
+ * | root_dir  | Path to the root directory                  | const std::string & |             | No       |
+ */
+// clang-format on
+void SetRootDir(const std::string& root_dir);
 
 /**
  * Returns number of Tenstorrent devices that can be targeted
@@ -73,7 +85,7 @@ bool IsGalaxyCluster();
  */
 size_t GetNumPCIeDevices();
 
-chip_id_t GetPCIeDeviceID(chip_id_t device_id);
+ChipId GetPCIeDeviceID(ChipId device_id);
 
 // clang-format off
 /**
@@ -83,11 +95,11 @@ chip_id_t GetPCIeDeviceID(chip_id_t device_id);
  *
  * | Argument   | Description                | Type            | Valid Range                       | Required |
  * |------------|----------------------------|-----------------|-----------------------------------|----------|
- * | device_id  | ID of the device to target| chip_id_t (int) | 0 to (GetNumAvailableDevices - 1) | Yes      |
+ * | device_id  | ID of the device to target| ChipId (int) | 0 to (GetNumAvailableDevices - 1) | Yes      |
  * */
 // clang-format on
 IDevice* CreateDevice(
-    chip_id_t device_id,
+    ChipId device_id,
     uint8_t num_hw_cqs = 1,
     size_t l1_small_size = DEFAULT_L1_SMALL_SIZE,
     size_t trace_region_size = DEFAULT_TRACE_REGION_SIZE,
@@ -103,11 +115,11 @@ IDevice* CreateDevice(
  *
  * | Argument   | Description                | Type            | Valid Range                       | Required |
  * |------------|----------------------------|-----------------|-----------------------------------|----------|
- * | device_id  | ID of the device to target| chip_id_t (int) | 0 to (GetNumAvailableDevices - 1) | Yes      |
+ * | device_id  | ID of the device to target| ChipId (int) | 0 to (GetNumAvailableDevices - 1) | Yes      |
  * */
 // clang-format on
 IDevice* CreateDeviceMinimal(
-    chip_id_t device_id, uint8_t num_hw_cqs = 1, const DispatchCoreConfig& dispatch_core_config = DispatchCoreConfig{});
+    ChipId device_id, uint8_t num_hw_cqs = 1, const DispatchCoreConfig& dispatch_core_config = DispatchCoreConfig{});
 
 // clang-format off
 /**
@@ -137,50 +149,50 @@ Program CreateProgram();
 
 // clang-format off
 /**
- * Creates a data movement kernel with no compile time arguments and adds it to the program.
+ * Creates a data movement or compute kernel with the given config and adds it to the program.
  *
  * Return value: Kernel ID (uintptr_t)
  *
- * | Argument     | Description                                                                                                                                 | Type                                                     | Valid Range | Required |
- * |--------------|---------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|-------------|----------|
- * | program      | The program to which this kernel will be added to                                                                                           | Program &                                                |             | Yes      |
- * | file_name    | Path to kernel src. Assumed to be absolute/relative to CWD, but will fall back to relative path from TT_METAL_HOME/TT_METAL_KERNEL_PATH.    | const std::string &                                      |             | Yes      |
- * | core_spec    | Either a single logical core, a range of logical cores or a set of logical core ranges that indicate which cores kernel is placed on        | const std::variant<CoreCoord, CoreRange, CoreRangeSet> & |             | Yes      |
- * | config       | Config for data movement or compute kernel                                                                                                  | const std::variant<DataMovementConfig,ComputeConfig,EthernetConfig> &   |             | No       |
+ * | Argument     | Description                                                                                                                                 | Type                                                                     | Valid Range | Required |
+ * |--------------|---------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------|-------------|----------|
+ * | program      | The program to which this kernel will be added to                                                                                           | Program &                                                                |             | Yes      |
+ * | file_name    | Path to kernel src. Assumed to be absolute/relative to CWD, but will fall back to relative path from TT_METAL_HOME/TT_METAL_KERNEL_PATH.    | const std::string &                                                      |             | Yes      |
+ * | core_spec    | Either a single logical core, a range of logical cores or a set of logical core ranges that indicate which cores kernel is placed on        | const std::variant<CoreCoord, CoreRange, CoreRangeSet> &                 |             | Yes      |
+ * | config       | Config for data movement or compute kernel                                                                                                  | const std::variant<DataMovementConfig, ComputeConfig> &                  |             | Yes      |
  */
 // clang-format on
 KernelHandle CreateKernel(
     Program& program,
     const std::string& file_name,
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config);
+    const std::variant<DataMovementConfig, ComputeConfig>& config);
 
 // clang-format off
 /**
- * Creates a compute or data movement kernel with the given compile time arguments and adds it to the program.
+ * Creates a data movement or compute kernel from source code with the given config and adds it to the program.
  *
  * Return value: Kernel ID (uintptr_t)
  *
- * | Argument           | Description                                                                                                                          | Type                                                     | Valid Range | Required |
- * |--------------------|--------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|-------------|----------|
- * | program            | The program to which this kernel will be added to                                                                                    | Program &                                                |             | Yes      |
- * | kernel_src_code    | Source code for kernel                                                                                                               | const std::string &                                      |             | Yes      |
- * | core_spec          | Either a single logical core, a range of logical cores or a set of logical core ranges that indicate which cores kernel is placed on | const std::variant<CoreCoord, CoreRange, CoreRangeSet> & |             | Yes      |
- * | config             | Config for data movement or compute kernel                                                                                           | const std::variant<DataMovementConfig,ComputeConfig,EthernetConfig> &   |             | No       |
+ * | Argument           | Description                                                                                                                          | Type                                                                    | Valid Range | Required |
+ * |--------------------|--------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------|-------------|----------|
+ * | program            | The program to which this kernel will be added to                                                                                    | Program &                                                               |             | Yes      |
+ * | kernel_src_code    | Source code for kernel                                                                                                               | const std::string &                                                     |             | Yes      |
+ * | core_spec          | Either a single logical core, a range of logical cores or a set of logical core ranges that indicate which cores kernel is placed on | const std::variant<CoreCoord, CoreRange, CoreRangeSet> &                |             | Yes      |
+ * | config             | Config for data movement or compute kernel                                                                                           | const std::variant<DataMovementConfig, ComputeConfig> &                 |             | Yes      |
  */
 // clang-format on
 KernelHandle CreateKernelFromString(
     Program& program,
     const std::string& kernel_src_code,
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    const std::variant<DataMovementConfig, ComputeConfig, EthernetConfig>& config);
+    const std::variant<DataMovementConfig, ComputeConfig>& config);
 
 // clang-format off
 // ==================================================
 //                  HOST API: buffers
 // ==================================================
 /**
- * Creates a Circular Buffer (CB) in L1 memory of all cores within core ranges (inclusive) and adds it to the program. There can be a total of NUM_CIRCULAR_BUFFERS (32) circular buffers per core.
+ * Creates a Circular Buffer (CB) in L1 memory of all cores within core ranges (inclusive) and adds it to the program. The number of CBs is architecture-specific.
  * Circular buffers hold data and have an associated config which indicates usage of the address space.
  * If the config is specified for multiple buffer indices, the circular buffer address space is shared and each buffer index can potentially have a unique view of the shared space.
  *
@@ -262,6 +274,9 @@ void UpdateCircularBufferPageSize(Program& program, CBHandle cb_handle, uint8_t 
  */
 // clang-format on
 void UpdateDynamicCircularBufferAddress(Program& program, CBHandle cb_handle, const Buffer& buffer);
+void UpdateDynamicCircularBufferAddress(
+    Program& program, CBHandle cb_handle, const Buffer& buffer, uint32_t address_offset);
+void UpdateDynamicCircularBufferAddress(Program& program, CBHandle cb_handle, const MeshTensor& tensor);
 
 // clang-format off
 /**
@@ -280,6 +295,9 @@ void UpdateDynamicCircularBufferAddress(Program& program, CBHandle cb_handle, co
 void UpdateDynamicCircularBufferAddressAndTotalSize(
     Program& program, CBHandle cb_handle, const Buffer& buffer, uint32_t total_size);
 
+void UpdateDynamicCircularBufferAddressAndTotalSize(
+    Program& program, CBHandle cb_handle, const MeshTensor& tensor, uint32_t total_size);
+
 // clang-format off
 /**
  * Initializes semaphore on all cores within core range (inclusive). Each core can have up to eight 4B semaphores aligned to L1_ALIGNMENT.
@@ -289,16 +307,12 @@ void UpdateDynamicCircularBufferAddressAndTotalSize(
  * | Argument      | Description                                          | Type                                                      | Valid Range  | Required |
  * |---------------|------------------------------------------------------|-----------------------------------------------------------|--------------|----------|
  * | program       | The program to which semaphore will be added to      | Program &                                                 |              | Yes      |
- * | core_spec     | Range of the Tensix co-ordinates using the semaphore | const std::variant<CoreRange,CoreRangeSet> &              |              | Yes      |
+ * | core_spec     | Range of the Tensix coordinates using the semaphore  | const std::variant<CoreRange,CoreRangeSet> &              |              | Yes      |
  * | initial_value | Initial value of the semaphore                       | uint32_t                                                  |              | Yes      |
- * | core_type     | Tensix or Ethernet core to create semaphore on.      | CoreType                                                  |              | No       |
  */
 // clang-format on
 uint32_t CreateSemaphore(
-    Program& program,
-    const std::variant<CoreRange, CoreRangeSet>& core_spec,
-    uint32_t initial_value,
-    CoreType core_type = CoreType::WORKER);
+    Program& program, const std::variant<CoreRange, CoreRangeSet>& core_spec, uint32_t initial_value);
 
 // clang-format off
 /**
@@ -310,7 +324,7 @@ uint32_t CreateSemaphore(
  * | Argument       | Description                                            | Type                                                      | Valid Range  | Required |
  * |----------------|--------------------------------------------------------|-----------------------------------------------------------|--------------|----------|
  * | device         | The device to create the semaphore on                  | IDevice*                                                  |              | Yes      |
- * | cores          | Range of the Tensix co-ordinates using the semaphore   | const CoreRangeSet &                                      |              | Yes      |
+ * | cores          | Range of the Tensix coordinates using the semaphore    | const CoreRangeSet &                                      |              | Yes      |
  * | initial_value  | Initial value of the semaphore                         | uint32_t                                                  |              | Yes      |
  * | buffer_type    | Buffer type to store the semaphore                     | BufferType                                                | L1 types     | No       |
  */
@@ -328,7 +342,7 @@ GlobalSemaphore CreateGlobalSemaphore(
  * | Argument       | Description                                            | Type                                                      | Valid Range  | Required |
  * |----------------|--------------------------------------------------------|-----------------------------------------------------------|--------------|----------|
  * | device         | The device to create the semaphore on                  | IDevice*                                                  |              | Yes      |
- * | cores          | Range of the Tensix co-ordinates using the semaphore   | CoreRangeSet &&                                           |              | Yes      |
+ * | cores          | Range of the Tensix coordinates using the semaphore    | CoreRangeSet &&                                           |              | Yes      |
  * | initial_value  | Initial value of the semaphore                         | uint32_t                                                  |              | Yes      |
  * | buffer_type    | Buffer type to store the semaphore                     | BufferType                                                | L1 types     | No       |
  */
@@ -449,12 +463,10 @@ void AssignGlobalBufferToProgram(const std::shared_ptr<Buffer>& buffer, Program&
 // ==================================================
 //           COMPILE & EXECUTE KENRNELS
 // ==================================================
-// clang-format on
-using RuntimeArgs = std::vector<std::variant<Buffer*, uint32_t>>;
-// clang-format off
 /**
  * Set runtime args for a kernel that are sent to the core during runtime. This API needs to be called to update the runtime args for the kernel.
- * Maximum of 341 allowed runtime args per core (unique and common runtime args count toward same limit).
+ * The number of runtime args per core (unique and common runtime args count toward the same limit) is bounded by the
+ * available L1 kernel-config space for the target core type; max_runtime_args is a conservative portable floor.
  *
  * Return value: void
  *
@@ -463,19 +475,20 @@ using RuntimeArgs = std::vector<std::variant<Buffer*, uint32_t>>;
  * | program      | The program containing kernels, circular buffers, semaphores           | const Program &                                        |                                                                     | Yes      |
  * | kernel_id    | ID of the kernel that will receive the runtime args                    | KernelHandle (uint64_t)                                |                                                                     | Yes      |
  * | core_spec    | Location of Tensix core(s) where the runtime args will be written      | const std::variant<CoreCoord,CoreRange,CoreRangeSet> & | Any logical Tensix core coordinate(s) on which the kernel is placed | Yes      |
- * | runtime_args | The runtime args to be written                                         | stl::Span<const uint32_t>                              |                                                                     | Yes      |
+ * | runtime_args | The runtime args to be written                                         | ttsl::Span<const uint32_t>                              |                                                                     | Yes      |
  */
 // clang-format on
 void SetRuntimeArgs(
     const Program& program,
     KernelHandle kernel,
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    stl::Span<const uint32_t> runtime_args);
+    ttsl::Span<const uint32_t> runtime_args);
 
 // clang-format off
 /**
  * Set runtime args for a kernel that are sent to the core during runtime. This API needs to be called to update the runtime args for the kernel.
- * Maximum of 255 allowed runtime args per core (unique and common runtime args count toward same limit).
+ * The number of runtime args per core (unique and common runtime args count toward the same limit) is bounded by the
+ * available L1 kernel-config space for the target core type; max_runtime_args is a conservative portable floor.
  *
  * Return value: void
  *
@@ -484,19 +497,20 @@ void SetRuntimeArgs(
  * | program      | The program containing kernels, circular buffers, semaphores           | const Program &                                        |                                                                     | Yes      |
  * | kernel_id    | ID of the kernel that will receive the runtime args                    | KernelHandle (uint64_t)                                |                                                                     | Yes      |
  * | core_spec    | Location of Tensix core(s) where the runtime args will be written      | const std::variant<CoreCoord,CoreRange,CoreRangeSet> & | Any logical Tensix core coordinate(s) on which the kernel is placed | Yes      |
- * | runtime_args | The runtime args to be written                                         | initializer_list<const uint32_t>                       |                                                                     | Yes      |
+ * | runtime_args | The runtime args to be written                                         | initializer_list<uint32_t>                       |                                                                     | Yes      |
  */
 // clang-format on
 void SetRuntimeArgs(
     const Program& program,
     KernelHandle kernel,
     const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    std::initializer_list<const uint32_t> runtime_args);
+    std::initializer_list<uint32_t> runtime_args);
 
 // clang-format off
 /**
  * Set multiple runtime arguments of a kernel at once during runtime, each mapping to a specific core. The runtime args for each core may be unique.
- * Maximum of 341 allowed runtime args per core (unique and common runtime args count toward same limit).
+ * The number of runtime args per core (unique and common runtime args count toward the same limit) is bounded by the
+ * available L1 kernel-config space for the target core type; max_runtime_args is a conservative portable floor.
  *
  * Return value: void
  *
@@ -516,49 +530,9 @@ void SetRuntimeArgs(
 
 // clang-format off
 /**
- * Set runtime args for a kernel that are sent to the specified cores using the command queue. This API must be used when Asynchronous Command Queue Mode is enabled.
- * Maximum of 341 allowed runtime args per core (unique and common runtime args count toward same limit).
- *
- * Return value: void
- *
- * | Argument     | Description                                                            | Type                                                   | Valid Range                                                                | Required |
- * |--------------|------------------------------------------------------------------------|--------------------------------------------------------|----------------------------------------------------------------------------|----------|
- * | device       | The device that runtime args are being written to.                     | IDevice*                                               |                                                                            | Yes      |
- * | kernel       | The kernel that will recieve these runtime args.                       | std::shared_ptr<Kernel>                                |                                                                            | Yes      |
- * | core_spec    | Location of Tensix core(s) where the runtime args will be written      | const std::variant<CoreCoord,CoreRange,CoreRangeSet> & | Any set of logical Tensix core coordinates on which the kernel is placed   | Yes      |
- * | runtime_args | The runtime args to be written                                         | std::shared_ptr<RuntimeArgs>                           |                                                                            | Yes      |
-*/
-// clang-format on
-void SetRuntimeArgs(
-    IDevice* device,
-    const std::shared_ptr<Kernel>& kernel,
-    const std::variant<CoreCoord, CoreRange, CoreRangeSet>& core_spec,
-    const std::shared_ptr<RuntimeArgs>& runtime_args);
-
-// clang-format off
-/**
- * Set multiple runtime arguments of a kernel using the command queue. Each core can have distinct arguments. This API must be used when Asynchronous Command Queue Mode is enabled.
- * Maximum of 341 allowed runtime args per core (unique and common runtime args count toward same limit).
- *
- * Return value: void
- * | Argument     | Description                                                            | Type                                                   | Valid Range                                                                | Required |
- * |--------------|------------------------------------------------------------------------|--------------------------------------------------------|----------------------------------------------------------------------------|----------|
- * | device       | The device that runtime args are being written to.                     | IDevice*                                               |                                                                            | Yes      |
- * | kernel       | The kernel that will recieve these runtime args.                       | std::shared_ptr<Kernel>                                |                                                                            | Yes      |
- * | core_spec    | Location of Tensix core(s) where the runtime args will be written      | const std::vector< CoreCoord > &                       | Any set of logical Tensix core coordinates on which the kernel is placed   | Yes      |
- * | runtime_args | The runtime args to be written                                         | const std::vector<std::shared_ptr<RuntimeArgs>>        | Outer vector size must be equal to size of core_spec vector                | Yes      |
- */
-// clang-format on
-void SetRuntimeArgs(
-    IDevice* device,
-    const std::shared_ptr<Kernel>& kernel,
-    const std::vector<CoreCoord>& core_spec,
-    const std::vector<std::shared_ptr<RuntimeArgs>>& runtime_args);
-
-// clang-format off
-/**
  * Set common (shared by all cores) runtime args for a kernel that are sent to all cores during runtime. This API needs to be called to update the common runtime args for the kernel.
- * Maximum of 341 allowed runtime args per core (unique and common runtime args count toward same limit).
+ * The number of runtime args per core (unique and common runtime args count toward the same limit) is bounded by the
+ * available L1 kernel-config space for the target core type; max_runtime_args is a conservative portable floor.
  *
  * Return value: void
  *
@@ -566,15 +540,16 @@ void SetRuntimeArgs(
  * |--------------|------------------------------------------------------------------------|--------------------------------------------------------|---------------------------------------------------------------------|----------|
  * | program      | The program containing kernels, circular buffers, semaphores           | const Program &                                        |                                                                     | Yes      |
  * | kernel_id    | ID of the kernel that will receive the runtime args                    | KernelHandle (uint64_t)                                |                                                                     | Yes      |
- * | runtime_args | The runtime args to be written                                         | stl::Span<const uint32_t>                              |                                                                     | Yes      |
+ * | runtime_args | The runtime args to be written                                         | ttsl::Span<const uint32_t>                              |                                                                     | Yes      |
  */
 // clang-format on
-void SetCommonRuntimeArgs(const Program& program, KernelHandle kernel_id, stl::Span<const uint32_t> runtime_args);
+void SetCommonRuntimeArgs(const Program& program, KernelHandle kernel_id, ttsl::Span<const uint32_t> runtime_args);
 
 // clang-format off
 /**
  * Set common (shared by all cores) runtime args for a kernel that are sent to all cores during runtime. This API needs to be called to update the common runtime args for the kernel.
- * Maximum of 341 allowed runtime args per core (unique and common runtime args count toward same limit).
+ * The number of runtime args per core (unique and common runtime args count toward the same limit) is bounded by the
+ * available L1 kernel-config space for the target core type; max_runtime_args is a conservative portable floor.
  *
  * Return value: void
  *
@@ -582,11 +557,10 @@ void SetCommonRuntimeArgs(const Program& program, KernelHandle kernel_id, stl::S
  * |--------------|------------------------------------------------------------------------|--------------------------------------------------------|---------------------------------------------------------------------|----------|
  * | program      | The program containing kernels, circular buffers, semaphores           | const Program &                                        |                                                                     | Yes      |
  * | kernel_id    | ID of the kernel that will receive the runtime args                    | KernelHandle (uint64_t)                                |                                                                     | Yes      |
- * | runtime_args | The runtime args to be written                                         | std::initializer_list<const uint32_t>                  |                                                                     | Yes      |
+ * | runtime_args | The runtime args to be written                                         | std::initializer_list<uint32_t>                  |                                                                     | Yes      |
  */
 // clang-format on
-void SetCommonRuntimeArgs(
-    const Program& program, KernelHandle kernel_id, std::initializer_list<const uint32_t> runtime_args);
+void SetCommonRuntimeArgs(const Program& program, KernelHandle kernel_id, std::initializer_list<uint32_t> runtime_args);
 
 // clang-format off
 /**
@@ -633,243 +607,6 @@ RuntimeArgsData& GetCommonRuntimeArgs(const Program& program, KernelHandle kerne
 
 // clang-format off
 /**
- * Reads a buffer from the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                            | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|----------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                        | Yes      |
- * | buffer         | The device buffer we are reading from                                             | Buffer & or std::shared_ptr<Buffer> |                                        | Yes      |
- * | dst            | The memory where the result will be stored                                        | void*                               |                                        | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                | Only blocking mode supported currently | Yes      |
- */
-// clang-format on
-void EnqueueReadBuffer(
-    CommandQueue& cq,
-    const std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>>& buffer,
-    void* dst,
-    bool blocking);
-
-// clang-format off
-/**
- * Reads a buffer from the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                            | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|----------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                        | Yes      |
- * | buffer         | The device buffer we are reading from                                             | Buffer & or std::shared_ptr<Buffer> |                                        | Yes      |
- * | dst            | The vector where the results that are read will be stored                         | vector<DType> &                     |                                        | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                | Only blocking mode supported currently | Yes      |
- */
-// clang-format on
-template <typename DType>
-void EnqueueReadBuffer(CommandQueue& cq, Buffer& buffer, std::vector<DType>& dst, bool blocking) {
-    dst.resize(buffer.page_size() * buffer.num_pages() / sizeof(DType));
-    EnqueueReadBuffer(cq, buffer, static_cast<void*>(dst.data()), blocking);
-}
-template <typename DType>
-void EnqueueReadBuffer(CommandQueue& cq, std::shared_ptr<Buffer> buffer, std::vector<DType>& dst, bool blocking) {
-    EnqueueReadBuffer(cq, *buffer, dst, blocking);
-}
-
-// clang-format off
-/**
- * Reads a specified region of the buffer from the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                    | Yes      |
- * | buffer         | The device buffer we are reading from                                             | Buffer & or std::shared_ptr<Buffer> |                                    | Yes      |
- * | dst            | The memory where the result will be stored                                        | void*                               |                                    | Yes      |
- * | region         | The region of the buffer that we are reading from                                 | const BufferRegion &                |                                    | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                |                                    | Yes      |
- */
-// clang-format on
-void EnqueueReadSubBuffer(
-    CommandQueue& cq,
-    std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>> buffer,
-    void* dst,
-    const BufferRegion& region,
-    bool blocking);
-
-// clang-format off
-/**
- * Reads a specified region of the buffer from the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                    | Yes      |
- * | buffer         | The device buffer we are reading from                                             | Buffer & or std::shared_ptr<Buffer> |                                    | Yes      |
- * | dst            | The vector where the results that are read will be stored                         | vector<DType> &                     |                                    | Yes      |
- * | region         | The region of the buffer that we are reading from                                 | const BufferRegion &                |                                    | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                |                                    | Yes      |
- */
-// clang-format on
-template <typename DType>
-void EnqueueReadSubBuffer(
-    CommandQueue& cq, Buffer& buffer, std::vector<DType>& dst, const BufferRegion& region, bool blocking) {
-    dst.resize(region.size / sizeof(DType));
-    EnqueueReadSubBuffer(cq, buffer, static_cast<void*>(dst.data()), region, blocking);
-}
-template <typename DType>
-void EnqueueReadSubBuffer(
-    CommandQueue& cq,
-    std::shared_ptr<Buffer> buffer,
-    std::vector<DType>& dst,
-    const BufferRegion& region,
-    bool blocking) {
-    EnqueueReadSubBuffer(cq, *buffer, dst, region, blocking);
-}
-
-// clang-format off
-/**
- * Writes a buffer to the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                    | Yes      |
- * | buffer         | The device buffer we are writing to                                               | Buffer & or std::shared_ptr<Buffer> |                                    | Yes      |
- * | src            | The vector we are writing to the device                                           | vector<DType> &                     |                                    | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                |                                    | Yes      |
- */
-// clang-format on
-template <typename DType>
-void EnqueueWriteBuffer(
-    CommandQueue& cq,
-    const std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>>& buffer,
-    std::vector<DType>& src,
-    bool blocking) {
-    EnqueueWriteBuffer(cq, buffer, src.data(), blocking);
-}
-
-// clang-format off
-/**
- * Writes a buffer to the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                    | Yes      |
- * | buffer         | The device buffer we are writing to                                               | Buffer & or std::shared_ptr<Buffer> |                                    | Yes      |
- * | src            | The memory we are writing to the device                                           | HostDataType                        |                                    | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                |                                    | Yes      |
- */
-// clang-format on
-void EnqueueWriteBuffer(
-    CommandQueue& cq,
-    const std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>>& buffer,
-    HostDataType src,
-    bool blocking);
-
-// clang-format off
-/**
- * Writes a specified region of the buffer to the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                    | Yes      |
- * | buffer         | The device buffer we are writing to                                               | Buffer & or std::shared_ptr<Buffer> |                                    | Yes      |
- * | src            | The memory we are writing to the device                                           | HostDataType                        |                                    | Yes      |
- * | region         | The region of the buffer that we are writing to                                   | const BufferRegion &                |                                    | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                |                                    | Yes      |
- */
-// clang-format on
-void EnqueueWriteSubBuffer(
-    CommandQueue& cq,
-    const std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>>& buffer,
-    HostDataType src,
-    const BufferRegion& region,
-    bool blocking);
-
-// clang-format off
-/**
- * Writes a specified region of the buffer to the device
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                                | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                      |                                    | Yes      |
- * | buffer         | The device buffer we are writing to                                               | Buffer & or std::shared_ptr<Buffer> |                                    | Yes      |
- * | src            | The memory we are writing to the device                                           | std::vector<DType>&                 |                                    | Yes      |
- * | region         | The region of the buffer that we are writing to the device                        | const BufferRegion &                |                                    | Yes      |
- * | blocking       | Whether or not this is a blocking operation                                       | bool                                |                                    | Yes      |
- */
-// clang-format on
-template <typename DType>
-void EnqueueWriteSubBuffer(
-    CommandQueue& cq,
-    const std::variant<std::reference_wrapper<Buffer>, std::shared_ptr<Buffer>>& buffer,
-    std::vector<DType>& src,
-    const BufferRegion& region,
-    bool blocking) {
-    EnqueueWriteSubBuffer(cq, buffer, src.data(), region, blocking);
-}
-
-// clang-format off
-/**
- * Writes a program to the device and launches it
- *
- * Return value: void
- *
- * | Argument     | Description                                                            | Type                               | Valid Range                        | Required |
- * |--------------|------------------------------------------------------------------------|------------------------------------|------------------------------------|----------|
- * | cq           | The command queue object which dispatches the command to the hardware  | CommandQueue &                     |                                    | Yes      |
- * | program      | The program that will be executed on the device that cq is bound to    | Program &                          |                                    | Yes      |
- * | blocking     | Whether or not this is a blocking operation                            | bool                               |                                    | Yes      |
- */
-// clang-format on
-void EnqueueProgram(CommandQueue& cq, Program& program, bool blocking);
-
-// clang-format off
-/**
- * Blocks until all previously dispatched commands on the device have completed
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                          | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                |                                    | Yes      |
- * | sub_device_ids | The sub-device ids to wait for completion on. If empty, waits for all sub-devices | tt::stl::Span<const uint32_t> |                                    | No       |
- */
-// clang-format on
-void Finish(CommandQueue& cq, tt::stl::Span<const SubDeviceId> sub_device_ids = {});
-
-// clang-format off
-/**
- * Begin Light Metal Binary capturing on host and all devices. This will trace host API calls and device (metal trace) workloads to a
- * binary blob returned to caller when tracing is finished, which can later be rerun directly from binary.
- * Note: This LightMetalBinary Trace/Replay feature is currently under active development and is not fully supported, use at own risk.
- *
- * Return value: void
- */
-// clang-format on
-void LightMetalBeginCapture();
-
-// clang-format off
-/**
- * Ends Light Metal Binary capturing on host and all devices returns the binary blob to the user.
- * Note: This LightMetalBinary Trace/Replay feature is currently under active development and is not fully supported, use at own risk.
- *
- * Return value: LightMetalBinary
- */
-// clang-format on
-LightMetalBinary LightMetalEndCapture();
-
-// clang-format off
-/**
  * Read device side profiler data for all devices in the mesh device
  *
  * This function only works in PROFILER builds. Please refer to the "Device Program Profiler" section for more information.
@@ -890,71 +627,29 @@ void ReadMeshDeviceProfilerResults(
 
 // clang-format off
 /**
- * Enqueues a command to record an Event on the device for a given CQ, and updates the Event object for the user.
+ * Push the current command queue id to the stack.
  * Return value: void
- * | Argument       | Description                                                                       | Type                          | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------|------------------------------------|----------|
- * | cq             | The command queue object which dispatches the command to the hardware             | CommandQueue &                |                                    | Yes      |
- * | event          | An event that will be populated by this function, and inserted in CQ              | std::shared_ptr<Event>        |                                    | Yes      |
- * | sub_device_ids | The sub-device ids to wait for completion on. If empty, waits for all sub-devices | tt::stl::Span<const uint32_t> |                                    | No       |
+ * | Argument     | Description                                                                       | Type                          | Valid Range                        | Required |
+ * |--------------|-----------------------------------------------------------------------------------|-------------------------------|------------------------------------|----------|
+ * | cq_id        | The command queue id to push.                                                     | uint8_t                       |                                    | Yes      |
  */
 // clang-format on
-void EnqueueRecordEvent(
-    CommandQueue& cq, const std::shared_ptr<Event>& event, tt::stl::Span<const SubDeviceId> sub_device_ids = {});
+void PushCurrentCommandQueueIdForThread(uint8_t cq_id);
 
 // clang-format off
 /**
- * Enqueues a command on the device for a given CQ (non-blocking). The command on device will block and wait for completion of the specified event (which may be in another CQ).
- * Return value: void
- * | Argument     | Description                                                            | Type                          | Valid Range                        | Required |
- * |--------------|------------------------------------------------------------------------|-------------------------------|------------------------------------|----------|
- * | cq           | The command queue object which dispatches the command to the hardware  | CommandQueue &                |                                    | Yes      |
- * |              | and waits for the event to complete.                                   |                               |                                    |          |
- * | event        | The event object that this CQ will wait on for completion.             | std::shared_ptr<Event>        |                                    | Yes      |
+ * Pop the current command queue id from the stack.
+ * Return value: uint8_t
  */
 // clang-format on
-void EnqueueWaitForEvent(CommandQueue& cq, const std::shared_ptr<Event>& event);
+uint8_t PopCurrentCommandQueueIdForThread();
 
 // clang-format off
 /**
- * Blocking function for host to synchronize (wait) on an event completion on device.
- * Return value: void
- * | Argument     | Description                                                            | Type                          | Valid Range                        | Required |
- * |--------------|------------------------------------------------------------------------|-------------------------------|------------------------------------|----------|
- * | event        | The event object that host will wait on for completion.                | std::shared_ptr<Event>        |                                    | Yes      |
+ * Get the current command queue id.
+ * Return value: uint8_t
  */
 // clang-format on
-void EventSynchronize(const std::shared_ptr<Event>& event);
+uint8_t GetCurrentCommandQueueIdForThread();
 
-// clang-format off
-/**
- * Host will query an event for completion status on device.
- * Return value: bool.  True if event is completed, false otherwise.
- * | Argument     | Description                                                            | Type                          | Valid Range                        | Required |
- * |--------------|------------------------------------------------------------------------|-------------------------------|------------------------------------|----------|
- * | event        | The event object that host will query for completion.                  | std::shared_ptr<Event>        |                                    | Yes      |
- */
-// clang-format on
-bool EventQuery(const std::shared_ptr<Event>& event);
-
-// clang-format off
-/**
- * Synchronize the device with host by waiting for all operations to complete.
- * If cq_id is provided then only the operations associated with that cq_id are waited for,
- * otherwise operations for all command queues are waited on.
- *
- * Return value: void
- *
- * | Argument       | Description                                                                       | Type                          | Valid Range                        | Required |
- * |----------------|-----------------------------------------------------------------------------------|-------------------------------|------------------------------------|----------|
- * | device         | The device to synchronize.                                                        | IDevice*                      |                                    | Yes      |
- * | cq_id          | The specific command queue id to synchronize  .                                   | uint8_t                       |                                    | No       |
- * | sub_device_ids | The sub-device ids to wait for completion on. If empty, waits for all sub-devices | tt::stl::Span<const uint32_t> |                                    | No       |
- */
-// clang-format on
-void Synchronize(
-    IDevice* device, std::optional<uint8_t> cq_id = std::nullopt, tt::stl::Span<const SubDeviceId> sub_device_ids = {});
-
-}  // namespace tt_metal
-
-}  // namespace tt
+}  // namespace tt::tt_metal

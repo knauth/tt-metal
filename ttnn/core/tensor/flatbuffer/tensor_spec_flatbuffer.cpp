@@ -1,45 +1,28 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 #include "tensor/flatbuffer/tensor_spec_flatbuffer.hpp"
 
+#include <tt-metalium/experimental/per_core_allocation/memory_config.hpp>
+#include <tt-metalium/experimental/tensor_serialization_support.hpp>
+
 namespace ttnn {
-namespace {
-
-CoreCoord from_flatbuffer(const flatbuffer::CoreCoord* core_coord) {
-    return CoreCoord{core_coord->x(), core_coord->y()};
-}
-
-CoreRange from_flatbuffer(const flatbuffer::CoreRange* core_range) {
-    return CoreRange{
-        {core_range->start()->x(), core_range->start()->y()}, {core_range->end()->x(), core_range->end()->y()}};
-}
 
 CoreRangeSet from_flatbuffer(const flatbuffer::CoreRangeSet* core_range_set) {
     std::vector<CoreRange> ranges;
+    ranges.reserve(core_range_set->ranges()->size());
     for (const auto* range : *core_range_set->ranges()) {
         ranges.emplace_back(
-            CoreCoord{range->start()->x(), range->start()->y()}, CoreCoord{range->end()->x(), range->end()->y()});
+            tt::tt_metal::CoreCoord{range->start()->x(), range->start()->y()}, tt::tt_metal::CoreCoord{range->end()->x(), range->end()->y()});
     }
-    return CoreRangeSet{ranges};
-}
-
-flatbuffers::Offset<flatbuffer::CoreCoord> to_flatbuffer(
-    flatbuffers::FlatBufferBuilder& builder, const CoreCoord& core_coord) {
-    return flatbuffer::CreateCoreCoord(builder, core_coord.x, core_coord.y);
-}
-
-flatbuffers::Offset<flatbuffer::CoreRange> to_flatbuffer(
-    flatbuffers::FlatBufferBuilder& builder, const CoreRange& core_range) {
-    auto start = flatbuffer::CreateCoreCoord(builder, core_range.start_coord.x, core_range.start_coord.y);
-    auto end = flatbuffer::CreateCoreCoord(builder, core_range.end_coord.x, core_range.end_coord.y);
-    return flatbuffer::CreateCoreRange(builder, start, end);
+    return CoreRangeSet{std::move(ranges)};
 }
 
 flatbuffers::Offset<flatbuffer::CoreRangeSet> to_flatbuffer(
     flatbuffers::FlatBufferBuilder& builder, const CoreRangeSet& core_range_set) {
     std::vector<flatbuffers::Offset<flatbuffer::CoreRange>> range_offsets;
+    range_offsets.reserve(core_range_set.ranges().size());
     for (const auto& range : core_range_set.ranges()) {
         auto start = flatbuffer::CreateCoreCoord(builder, range.start_coord.x, range.start_coord.y);
         auto end = flatbuffer::CreateCoreCoord(builder, range.end_coord.x, range.end_coord.y);
@@ -48,6 +31,44 @@ flatbuffers::Offset<flatbuffer::CoreRangeSet> to_flatbuffer(
     auto ranges_vector = builder.CreateVector(range_offsets);
     return flatbuffer::CreateCoreRangeSet(builder, ranges_vector);
 }
+
+tt::tt_metal::DataType from_flatbuffer(flatbuffer::DataType type) {
+    switch (type) {
+        case flatbuffer::DataType::BFloat16: return tt::tt_metal::DataType::BFLOAT16;
+        case flatbuffer::DataType::Float32: return tt::tt_metal::DataType::FLOAT32;
+        case flatbuffer::DataType::UInt32: return tt::tt_metal::DataType::UINT32;
+        case flatbuffer::DataType::BFloat8B: return tt::tt_metal::DataType::BFLOAT8_B;
+        case flatbuffer::DataType::BFloat4B: return tt::tt_metal::DataType::BFLOAT4_B;
+        case flatbuffer::DataType::UInt8: return tt::tt_metal::DataType::UINT8;
+        case flatbuffer::DataType::UInt16: return tt::tt_metal::DataType::UINT16;
+        case flatbuffer::DataType::Int32: return tt::tt_metal::DataType::INT32;
+        case flatbuffer::DataType::Int8: return tt::tt_metal::DataType::INT8;
+        case flatbuffer::DataType::Invalid: return tt::tt_metal::DataType::INVALID;
+    }
+    TT_THROW("Unsupported DataType from flatbuffer.");
+}
+
+flatbuffer::DataType to_flatbuffer(tt::tt_metal::DataType type) {
+    switch (type) {
+        case tt::tt_metal::DataType::BFLOAT16: return flatbuffer::DataType::BFloat16;
+        case tt::tt_metal::DataType::FLOAT32: return flatbuffer::DataType::Float32;
+        case tt::tt_metal::DataType::UINT32: return flatbuffer::DataType::UInt32;
+        case tt::tt_metal::DataType::BFLOAT8_B: return flatbuffer::DataType::BFloat8B;
+        case tt::tt_metal::DataType::BFLOAT4_B: return flatbuffer::DataType::BFloat4B;
+        case tt::tt_metal::DataType::UINT8: return flatbuffer::DataType::UInt8;
+        case tt::tt_metal::DataType::UINT16: return flatbuffer::DataType::UInt16;
+        case tt::tt_metal::DataType::INT32: return flatbuffer::DataType::Int32;
+        case tt::tt_metal::DataType::INT8: return flatbuffer::DataType::Int8;
+        case tt::tt_metal::DataType::FP8_E4M3: TT_THROW("FP8_E4M3 cannot be serialized to flatbuffer");
+        case tt::tt_metal::DataType::INVALID: return flatbuffer::DataType::Invalid;
+    }
+    TT_THROW("Unsupported DataType to flatbuffer.");
+}
+
+namespace {
+
+using ttnn::from_flatbuffer;
+using ttnn::to_flatbuffer;
 
 tt::tt_metal::BufferType from_flatbuffer(flatbuffer::BufferType type) {
     switch (type) {
@@ -66,23 +87,9 @@ tt::tt_metal::TensorMemoryLayout from_flatbuffer(flatbuffer::TensorMemoryLayout 
         case flatbuffer::TensorMemoryLayout::HeightSharded: return tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED;
         case flatbuffer::TensorMemoryLayout::WidthSharded: return tt::tt_metal::TensorMemoryLayout::WIDTH_SHARDED;
         case flatbuffer::TensorMemoryLayout::BlockSharded: return tt::tt_metal::TensorMemoryLayout::BLOCK_SHARDED;
+        case flatbuffer::TensorMemoryLayout::NdSharded: return tt::tt_metal::TensorMemoryLayout::ND_SHARDED;
     }
     TT_THROW("Unsupported TensorMemoryLayout from flatbuffer.");
-}
-
-tt::tt_metal::DataType from_flatbuffer(flatbuffer::DataType type) {
-    switch (type) {
-        case flatbuffer::DataType::BFloat16: return tt::tt_metal::DataType::BFLOAT16;
-        case flatbuffer::DataType::Float32: return tt::tt_metal::DataType::FLOAT32;
-        case flatbuffer::DataType::UInt32: return tt::tt_metal::DataType::UINT32;
-        case flatbuffer::DataType::BFloat8B: return tt::tt_metal::DataType::BFLOAT8_B;
-        case flatbuffer::DataType::BFloat4B: return tt::tt_metal::DataType::BFLOAT4_B;
-        case flatbuffer::DataType::UInt8: return tt::tt_metal::DataType::UINT8;
-        case flatbuffer::DataType::UInt16: return tt::tt_metal::DataType::UINT16;
-        case flatbuffer::DataType::Int32: return tt::tt_metal::DataType::INT32;
-        case flatbuffer::DataType::Invalid: return tt::tt_metal::DataType::INVALID;
-    }
-    TT_THROW("Unsupported DataType from flatbuffer.");
 }
 
 flatbuffer::TensorMemoryLayout to_flatbuffer(tt::tt_metal::TensorMemoryLayout layout) {
@@ -91,8 +98,9 @@ flatbuffer::TensorMemoryLayout to_flatbuffer(tt::tt_metal::TensorMemoryLayout la
         case tt::tt_metal::TensorMemoryLayout::HEIGHT_SHARDED: return flatbuffer::TensorMemoryLayout::HeightSharded;
         case tt::tt_metal::TensorMemoryLayout::WIDTH_SHARDED: return flatbuffer::TensorMemoryLayout::WidthSharded;
         case tt::tt_metal::TensorMemoryLayout::BLOCK_SHARDED: return flatbuffer::TensorMemoryLayout::BlockSharded;
+        case tt::tt_metal::TensorMemoryLayout::ND_SHARDED: return flatbuffer::TensorMemoryLayout::NdSharded;
+        default: TT_THROW("Unsupported TensorMemoryLayout to flatbuffer.");
     }
-    TT_THROW("Unsupported TensorMemoryLayout to flatbuffer.");
 }
 
 flatbuffer::BufferType to_flatbuffer(tt::tt_metal::BufferType type) {
@@ -106,35 +114,12 @@ flatbuffer::BufferType to_flatbuffer(tt::tt_metal::BufferType type) {
     TT_THROW("Unsupported BufferType to flatbuffer.");
 }
 
-flatbuffer::DataType to_flatbuffer(tt::tt_metal::DataType type) {
-    switch (type) {
-        case tt::tt_metal::DataType::BFLOAT16: return flatbuffer::DataType::BFloat16;
-        case tt::tt_metal::DataType::FLOAT32: return flatbuffer::DataType::Float32;
-        case tt::tt_metal::DataType::UINT32: return flatbuffer::DataType::UInt32;
-        case tt::tt_metal::DataType::BFLOAT8_B: return flatbuffer::DataType::BFloat8B;
-        case tt::tt_metal::DataType::BFLOAT4_B: return flatbuffer::DataType::BFloat4B;
-        case tt::tt_metal::DataType::UINT8: return flatbuffer::DataType::UInt8;
-        case tt::tt_metal::DataType::UINT16: return flatbuffer::DataType::UInt16;
-        case tt::tt_metal::DataType::INT32: return flatbuffer::DataType::Int32;
-        case tt::tt_metal::DataType::INVALID: return flatbuffer::DataType::Invalid;
-    }
-    TT_THROW("Unsupported DataType to flatbuffer.");
-}
-
 tt::tt_metal::ShardOrientation from_flatbuffer(flatbuffer::ShardOrientation orientation) {
     switch (orientation) {
         case flatbuffer::ShardOrientation::RowMajor: return tt::tt_metal::ShardOrientation::ROW_MAJOR;
         case flatbuffer::ShardOrientation::ColMajor: return tt::tt_metal::ShardOrientation::COL_MAJOR;
     }
     TT_THROW("Unsupported ShardOrientation from flatbuffer.");
-}
-
-tt::tt_metal::ShardMode from_flatbuffer(flatbuffer::ShardMode mode) {
-    switch (mode) {
-        case flatbuffer::ShardMode::Physical: return tt::tt_metal::ShardMode::PHYSICAL;
-        case flatbuffer::ShardMode::Logical: return tt::tt_metal::ShardMode::LOGICAL;
-    }
-    TT_THROW("Unsupported ShardMode from flatbuffer.");
 }
 
 flatbuffer::ShardOrientation to_flatbuffer(tt::tt_metal::ShardOrientation orientation) {
@@ -145,19 +130,13 @@ flatbuffer::ShardOrientation to_flatbuffer(tt::tt_metal::ShardOrientation orient
     TT_THROW("Unsupported ShardOrientation to flatbuffer.");
 }
 
-flatbuffer::ShardMode to_flatbuffer(tt::tt_metal::ShardMode shard_mode) {
-    switch (shard_mode) {
-        case tt::tt_metal::ShardMode::LOGICAL: return flatbuffer::ShardMode::Logical;
-        case tt::tt_metal::ShardMode::PHYSICAL: return flatbuffer::ShardMode::Physical;
-    }
-    TT_THROW("Unsupported ShardMode to flatbuffer.");
-}
-
 flatbuffer::ShardDistributionStrategy to_flatbuffer(tt::tt_metal::ShardDistributionStrategy strategy) {
     switch (strategy) {
         case tt::tt_metal::ShardDistributionStrategy::ROUND_ROBIN_1D:
             return flatbuffer::ShardDistributionStrategy::ROUND_ROBIN_1D;
         case tt::tt_metal::ShardDistributionStrategy::GRID_2D: return flatbuffer::ShardDistributionStrategy::GRID_2D;
+        case tt::tt_metal::ShardDistributionStrategy::CONTIGUOUS_1D:
+            return flatbuffer::ShardDistributionStrategy::CONTIGUOUS_1D;
     }
     TT_THROW("Unsupported ShardDistributionStrategy to flatbuffer.");
 }
@@ -167,6 +146,8 @@ tt::tt_metal::ShardDistributionStrategy from_flatbuffer(flatbuffer::ShardDistrib
         case flatbuffer::ShardDistributionStrategy::ROUND_ROBIN_1D:
             return tt::tt_metal::ShardDistributionStrategy::ROUND_ROBIN_1D;
         case flatbuffer::ShardDistributionStrategy::GRID_2D: return tt::tt_metal::ShardDistributionStrategy::GRID_2D;
+        case flatbuffer::ShardDistributionStrategy::CONTIGUOUS_1D:
+            return tt::tt_metal::ShardDistributionStrategy::CONTIGUOUS_1D;
     }
     TT_THROW("Unsupported ShardDistributionStrategy from flatbuffer.");
 }
@@ -175,28 +156,19 @@ tt::tt_metal::ShardSpec from_flatbuffer(const flatbuffer::ShardSpec* spec) {
     CoreRangeSet grid = from_flatbuffer(spec->grid());
     std::array<uint32_t, 2> shape = {spec->shape_h(), spec->shape_w()};
     tt::tt_metal::ShardOrientation orientation = from_flatbuffer(spec->orientation());
-    tt::tt_metal::ShardMode mode = from_flatbuffer(spec->shard_mode());
-    if (const auto* fb_shard_shape = spec->physical_shard_shape()) {
-        std::array<uint32_t, 2> physical_shard_shape = {fb_shard_shape->height(), fb_shard_shape->width()};
-        return tt::tt_metal::ShardSpec(grid, shape, physical_shard_shape, orientation);
-    }
-    return tt::tt_metal::ShardSpec(grid, shape, orientation, mode);
+    return tt::tt_metal::ShardSpec(grid, shape, orientation);
 }
 
 flatbuffers::Offset<flatbuffer::ShardSpec> to_flatbuffer(
     const tt::tt_metal::ShardSpec& spec, flatbuffers::FlatBufferBuilder& builder) {
     flatbuffers::Offset<flatbuffer::ShardShape> physical_shard_shape = 0;
-    if (spec.physical_shard_shape.has_value()) {
-        const auto& phys_shape = *spec.physical_shard_shape;
-        physical_shard_shape = flatbuffer::CreateShardShape(builder, phys_shape[0], phys_shape[1]);
-    }
     return flatbuffer::CreateShardSpec(
         builder,
         to_flatbuffer(builder, spec.grid),
         spec.shape[0],
         spec.shape[1],
         to_flatbuffer(spec.orientation),
-        to_flatbuffer(spec.mode),
+        flatbuffer::ShardModeDeprecated::Physical,
         physical_shard_shape);
 }
 
@@ -213,7 +185,7 @@ flatbuffers::Offset<flatbuffer::NdShardSpec> to_flatbuffer(
 
 tt::tt_metal::NdShardSpec from_flatbuffer(const flatbuffer::NdShardSpec* spec) {
     return tt::tt_metal::NdShardSpec(
-        Shape(SmallVector<uint32_t>(spec->shard_shape()->cbegin(), spec->shard_shape()->cend())),
+        Shape(ttsl::SmallVector<uint32_t>(spec->shard_shape()->cbegin(), spec->shard_shape()->cend())),
         from_flatbuffer(spec->grid()),
         from_flatbuffer(spec->orientation()),
         from_flatbuffer(spec->shard_distribution_strategy()));
@@ -234,11 +206,12 @@ tt::tt_metal::TensorLayout from_flatbuffer(const flatbuffer::TensorLayout* layou
         }
     }();
 
-    return tt::tt_metal::TensorLayout::restore_from_serialized(
+    return tt::tt_metal::restore_tensor_layout_from_serialized(
         from_flatbuffer(layout->data_type()),
         page_config,
         ttnn::from_flatbuffer(layout->memory_config()),
-        tt::tt_metal::Alignment(SmallVector<uint32_t>(layout->alignment()->cbegin(), layout->alignment()->cend())));
+        tt::tt_metal::Alignment(
+            ttsl::SmallVector<uint32_t>(layout->alignment()->cbegin(), layout->alignment()->cend())));
 }
 
 flatbuffers::Offset<flatbuffer::TensorLayout> to_flatbuffer(
@@ -257,7 +230,8 @@ flatbuffers::Offset<flatbuffer::TensorLayout> to_flatbuffer(
             flatbuffer::CreateTilePageConfig(builder, flat_tile).Union(),
             ttnn::to_flatbuffer(layout.get_memory_config(), builder),
             flat_alignment);
-    } else if (page_config.get_layout() == tt::tt_metal::Layout::ROW_MAJOR) {
+    }
+    if (page_config.get_layout() == tt::tt_metal::Layout::ROW_MAJOR) {
         return flatbuffer::CreateTensorLayout(
             builder,
             to_flatbuffer(layout.get_data_type()),
@@ -287,7 +261,8 @@ flatbuffers::Offset<flatbuffer::MemoryConfig> to_flatbuffer(
         to_flatbuffer(config.buffer_type()),
         shard_spec,
         nd_shard_spec,
-        config.created_with_nd_shard_spec());
+        config.created_with_nd_shard_spec(),
+        tt::tt_metal::experimental::per_core_allocation::is_per_core_allocation(config));
 }
 
 tt::tt_metal::MemoryConfig from_flatbuffer(const flatbuffer::MemoryConfig* config) {
@@ -299,12 +274,16 @@ tt::tt_metal::MemoryConfig from_flatbuffer(const flatbuffer::MemoryConfig* confi
     if (config->nd_shard_spec()) {
         nd_shard_spec = from_flatbuffer(config->nd_shard_spec());
     }
-    return tt::tt_metal::MemoryConfig::create_with_prepopulated_shard_specs(
+    auto memory_config = tt::tt_metal::create_memory_config_with_prepopulated_shard_specs(
         from_flatbuffer(config->memory_layout()),
         from_flatbuffer(config->buffer_type()),
         shard_spec,
         nd_shard_spec,
         config->created_with_nd_shard_spec());
+    if (config->per_core_allocation()) {
+        tt::tt_metal::experimental::per_core_allocation::set_per_core_allocation(memory_config, true);
+    }
+    return memory_config;
 }
 
 flatbuffers::Offset<flatbuffer::TensorSpec> to_flatbuffer(
@@ -316,7 +295,7 @@ flatbuffers::Offset<flatbuffer::TensorSpec> to_flatbuffer(
 
 tt::tt_metal::TensorSpec from_flatbuffer(const flatbuffer::TensorSpec* spec) {
     return tt::tt_metal::TensorSpec(
-        Shape(SmallVector<uint32_t>(spec->shape()->cbegin(), spec->shape()->cend())),
+        Shape(ttsl::SmallVector<uint32_t>(spec->shape()->cbegin(), spec->shape()->cend())),
         from_flatbuffer(spec->tensor_layout()));
 }
 

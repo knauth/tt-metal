@@ -1,8 +1,7 @@
-# SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+# SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
-import ttnn
 import torch.nn as nn
 from models.experimental.swin_v2.tt.tt_mlp import TtMLP
 from models.experimental.swin_v2.tt.tt_shifted_window_attention_v2 import TtShiftedWindowAttentionV2
@@ -37,6 +36,6 @@ class TtSwinTransformerBlock(nn.Module):
             [int(dim * mlp_ratio), dim],
             device,
             parameters.mlp,
-            activation_layer=ttnn.gelu,
+            activation_layer="gelu",
             inplace=None,
         )

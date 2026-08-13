@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,7 +9,7 @@ from torchvision import models
 from loguru import logger
 
 from models.experimental.vgg.reference.vgg import vgg16_bn
-from models.utility_functions import comp_pcc
+from models.common.utility_functions import comp_pcc
 
 
 _batch_size = 1

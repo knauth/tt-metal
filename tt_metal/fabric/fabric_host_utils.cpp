@@ -1,96 +1,61 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
+// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "control_plane.hpp"
+#include <tt-metalium/experimental/fabric/control_plane.hpp>
 #include "fabric_host_utils.hpp"
 
-#include <tt-metalium/fabric.hpp>
-#include <tt-metalium/fabric_edm_types.hpp>
-#include <tt-metalium/fabric_types.hpp>
-#include <tt-metalium/assert.hpp>
-#include <umd/device/types/cluster_descriptor_types.h>  // chip_id_t
-#include <tt-metalium/metal_soc_descriptor.h>
-#include "impl/context/metal_context.hpp"
-#include <tt-metalium/erisc_datamover_builder.hpp>
+#include <tt-metalium/experimental/fabric/fabric.hpp>
+#include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
+#include <tt-metalium/experimental/fabric/fabric_types.hpp>
+#include <tt-metalium/experimental/fabric/topology_mapper.hpp>
+#include <tt_stl/assert.hpp>
+#include <umd/device/types/cluster_descriptor_types.hpp>  // ChipId
+#include <tt-metalium/experimental/fabric/physical_system_descriptor.hpp>
+#include "erisc_datamover_builder.hpp"
 #include <set>
 #include <vector>
 #include <algorithm>
-#include "fabric/hw/inc/fabric_routing_mode.h"
+#include <cctype>
+#include <cstring>
+#include <stdexcept>
 #include "fabric_context.hpp"
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
+#include <filesystem>
+#include <fstream>
+#include <fmt/format.h>
+#include <yaml-cpp/yaml.h>
+#include <tt-logger/tt-logger.hpp>
+#include <llrt/tt_cluster.hpp>
+#include "impl/context/metal_context.hpp"
 
 namespace tt::tt_fabric {
 
 namespace {
 
-// Computes BFS distance map from a start chip to all reachable chips using the provided adjacency map.
-std::unordered_map<chip_id_t, std::uint32_t> compute_distances(
-    chip_id_t start_chip, const std::unordered_map<chip_id_t, std::vector<chip_id_t>>& adjacency_map) {
-    std::unordered_map<chip_id_t, std::uint32_t> dist;
-    std::queue<chip_id_t> q;
-    dist[start_chip] = 0;
-    q.push(start_chip);
-
-    while (!q.empty()) {
-        auto cur = q.front();
-        q.pop();
-
-        auto it = adjacency_map.find(cur);
-        if (it != adjacency_map.end()) {
-            for (auto nbr : it->second) {
-                if (dist.find(nbr) == dist.end()) {
-                    dist[nbr] = dist.at(cur) + 1;
-                    q.push(nbr);
-                }
-            }
+// Mock cluster mapping export uses cluster descriptor filenames (basename). Strip MPI-rank uniquifier
+// suffix appended during PSD discovery when multiple ranks share the same descriptor basename.
+HostName hostname_for_mapping_export(const HostName& hostname) {
+    if (!tt::tt_metal::MetalContext::instance().rtoptions().get_mock_enabled()) {
+        return hostname;
+    }
+    constexpr std::string_view cluster_desc_suffix = ".yaml";
+    const auto pos = hostname.rfind(cluster_desc_suffix);
+    if (pos == std::string::npos || pos + cluster_desc_suffix.size() >= hostname.size()) {
+        return hostname;
+    }
+    const std::string tail = hostname.substr(pos + cluster_desc_suffix.size());
+    if (tail.size() <= 1 || tail.front() != '_') {
+        return hostname;
+    }
+    for (char c : tail.substr(1)) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return hostname;
         }
     }
-    return dist;
-}
-
-void create_1d_mesh_view_with_dfs(
-    const std::unordered_map<chip_id_t, std::vector<chip_id_t>>& adjacency_map,
-    chip_id_t start_chip,
-    uint32_t num_chips,
-    std::vector<chip_id_t>& path) {
-    std::unordered_set<chip_id_t> visited;
-    visited.insert(start_chip);
-
-    path.reserve(num_chips);
-    path.push_back(start_chip);
-
-    // Internal recursive helper function
-    std::function<bool(chip_id_t)> dfs = [&](chip_id_t current_chip) -> bool {
-        if (path.size() == num_chips) {
-            return true;
-        }
-
-        auto it = adjacency_map.find(current_chip);
-        if (it == adjacency_map.end()) {
-            return false;  // No neighbors
-        }
-
-        for (chip_id_t nbr : it->second) {
-            if (visited.find(nbr) == visited.end()) {
-                path.push_back(nbr);
-                visited.insert(nbr);
-
-                if (dfs(nbr)) {
-                    return true;
-                }
-
-                // Backtrack
-                path.pop_back();
-                visited.erase(nbr);
-            }
-        }
-        return false;  // No valid path found from this node
-    };
-
-    dfs(start_chip);
+    return hostname.substr(0, pos + cluster_desc_suffix.size());
 }
 
 }  // namespace
@@ -99,62 +64,86 @@ bool is_tt_fabric_config(tt::tt_fabric::FabricConfig fabric_config) {
     return is_1d_fabric_config(fabric_config) || is_2d_fabric_config(fabric_config);
 }
 
-uint32_t get_sender_channel_count(tt::tt_fabric::Topology topology) {
-    if (topology == Topology::Mesh) {
-        return FabricEriscDatamoverConfig::num_sender_channels_2d;
-    } else {
-        return FabricEriscDatamoverConfig::num_sender_channels_1d;
+FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, bool is_ubb_galaxy) {
+    switch (fabric_config) {
+        // Issue: 32146, Special case for T3k WH devices to use Mesh fabric type instead of Torus_XY
+        // WH T3K currently do not support Torus_XY fabric type, because they do not have wrapping connections.
+        // If you want to use 1D Ring on t3k please use 1x8 MGD.
+        case tt::tt_fabric::FabricConfig::FABRIC_1D_NEIGHBOR_EXCHANGE:
+        case tt::tt_fabric::FabricConfig::FABRIC_1D_RING: {
+            if (is_ubb_galaxy) {
+                return FabricType::TORUS_XY;
+            }
+            return FabricType::MESH;
+        }
+        case tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_X: return FabricType::TORUS_X;
+        case tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_Y: return FabricType::TORUS_Y;
+        case tt::tt_fabric::FabricConfig::FABRIC_2D_TORUS_XY: return FabricType::TORUS_XY;
+        default: return FabricType::MESH;
     }
 }
 
-uint32_t get_downstream_edm_count(tt::tt_fabric::Topology topology) {
-    if (topology == Topology::Mesh) {
-        return FabricEriscDatamoverConfig::num_downstream_edms_2d;
-    } else {
-        return FabricEriscDatamoverConfig::num_downstream_edms;
+bool requires_more_connectivity(FabricType requested_type, FabricType available_type, const MeshShape& mesh_shape) {
+    for (uint32_t axis = 0; axis < 2; ++axis) {
+        if (has_genuine_torus_axis(requested_type, mesh_shape, axis) &&
+            !has_genuine_torus_axis(available_type, mesh_shape, axis)) {
+            return true;
+        }
     }
+    return false;
 }
 
-FabricType get_fabric_type(tt::tt_fabric::FabricConfig fabric_config, tt::tt_metal::ClusterType cluster_type) {
-    if (cluster_type == tt::tt_metal::ClusterType::GALAXY &&
-        fabric_config == tt::tt_fabric::FabricConfig::FABRIC_1D_RING) {
-        return FabricType::TORUS_XY;
+uint32_t compute_max_1d_hops(const std::vector<MeshShape>& mesh_shapes) {
+    if (mesh_shapes.empty()) {
+        return 0;
     }
-    return FabricType::MESH;
+
+    uint32_t max_dimension = 0;
+    for (const auto& shape : mesh_shapes) {
+        // For 1D routing, find the maximum dimension (either rows or cols)
+        // Hops = max_dimension - 1 (e.g., 8 chips in a line = 7 hops)
+        uint32_t rows = shape[0];
+        uint32_t cols = shape[1];
+        uint32_t mesh_max_dim = std::max(rows, cols);
+        max_dimension = std::max(max_dimension, mesh_max_dim);
+    }
+
+    return (max_dimension > 0) ? (max_dimension - 1) : 0;
+}
+
+uint32_t compute_max_2d_hops(const std::vector<MeshShape>& mesh_shapes) {
+    if (mesh_shapes.empty()) {
+        return 0;
+    }
+
+    uint32_t max_hops = 0;
+    for (const auto& shape : mesh_shapes) {
+        // For 2D routing, compute Manhattan distance from corner to corner
+        // Hops = (rows - 1) + (cols - 1)
+        uint32_t rows = shape[0];
+        uint32_t cols = shape[1];
+        uint32_t mesh_hops = (rows - 1) + (cols - 1);
+        max_hops = std::max(max_hops, mesh_hops);
+    }
+
+    return max_hops;
 }
 
 std::vector<uint32_t> get_forwarding_link_indices_in_direction(
-    const FabricNodeId& src_fabric_node_id, const FabricNodeId& dst_fabric_node_id, RoutingDirection direction) {
-    const auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
-    const bool is_2d_fabric = control_plane.get_fabric_context().get_fabric_topology() == Topology::Mesh;
-
+    const ControlPlane& control_plane,
+    const FabricNodeId& src_fabric_node_id,
+    const FabricNodeId& dst_fabric_node_id,
+    RoutingDirection direction) {
     const std::vector<chan_id_t>& fabric_channels =
         control_plane.get_active_fabric_eth_channels_in_direction(src_fabric_node_id, direction);
 
     // the subset of routers that support forwarding b/w those chips
     std::vector<chan_id_t> forwarding_channels;
-    if (is_2d_fabric) {
-        forwarding_channels =
-            control_plane.get_forwarding_eth_chans_to_chip(src_fabric_node_id, dst_fabric_node_id, direction);
-    } else {
-        // TODO: not going to work for Big Mesh
-        const auto src_chip_id = control_plane.get_physical_chip_id_from_fabric_node_id(src_fabric_node_id);
-        const auto dst_chip_id = control_plane.get_physical_chip_id_from_fabric_node_id(dst_fabric_node_id);
-        // for 1D check if each port has an active connection to the dst_chip_id
-        const auto& cluster = tt::tt_metal::MetalContext::instance().get_cluster();
-        const auto& soc_desc = cluster.get_soc_desc(src_chip_id);
-
-        for (const auto& channel : fabric_channels) {
-            const auto eth_core = soc_desc.get_eth_core_for_channel(channel, CoordSystem::LOGICAL);
-            auto [connected_chip_id, connected_eth_core] =
-                cluster.get_connected_ethernet_core(std::make_tuple(src_chip_id, CoreCoord{eth_core.x, eth_core.y}));
-            if (connected_chip_id == dst_chip_id) {
-                forwarding_channels.push_back(channel);
-            }
-        }
-    }
+    forwarding_channels =
+        control_plane.get_forwarding_eth_chans_to_chip(src_fabric_node_id, dst_fabric_node_id, direction);
 
     std::vector<uint32_t> link_indices;
+    link_indices.reserve(forwarding_channels.size());
     for (uint32_t i = 0; i < fabric_channels.size(); i++) {
         if (std::find(forwarding_channels.begin(), forwarding_channels.end(), fabric_channels[i]) !=
             forwarding_channels.end()) {
@@ -165,309 +154,358 @@ std::vector<uint32_t> get_forwarding_link_indices_in_direction(
     return link_indices;
 }
 
-void set_routing_mode(uint16_t routing_mode) {
-    // override for forced routing mode
-    if (routing_mode == ROUTING_MODE_UNDEFINED) {
-        return;
+void serialize_mesh_coordinates_to_file(
+    const TopologyMapper& topology_mapper, const std::filesystem::path& output_file_path) {
+    // Ensure output directory exists
+    std::filesystem::create_directories(output_file_path.parent_path());
+
+    // Get the mapping from TopologyMapper
+    const auto& mapping = topology_mapper.get_local_logical_mesh_chip_id_to_physical_chip_id_mapping();
+    const auto& mesh_graph = topology_mapper.get_mesh_graph();
+
+    // Write to file using emitter with Flow style for inline sequences
+    std::ofstream out_file(output_file_path);
+    if (!out_file.is_open()) {
+        TT_THROW("Failed to open output file: {}", output_file_path.string());
     }
 
-    // Validate dimension flags are orthogonal (only one can be set)
-    TT_FATAL(
-        __builtin_popcount(routing_mode & (ROUTING_MODE_1D | ROUTING_MODE_2D | ROUTING_MODE_3D)) == 1,
-        "Only one dimension mode (1D, 2D, 3D) can be active at once");
+    YAML::Emitter emitter;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "chips";
+    emitter << YAML::Value << YAML::BeginMap;
 
-    // Validate topology flags are orthogonal
-    TT_FATAL(
-        __builtin_popcount(
-            routing_mode & (ROUTING_MODE_RING | ROUTING_MODE_LINE | ROUTING_MODE_MESH | ROUTING_MODE_TORUS)) == 1,
-        "Only one topology mode (RING, LINE, MESH, TORUS) can be active at once");
+    // Emit each chip with flow style for the coordinate array
+    for (const auto& [fabric_node_id, physical_chip_id] : mapping) {
+        MeshCoordinate mesh_coord = mesh_graph.chip_to_coordinate(fabric_node_id.mesh_id, fabric_node_id.chip_id);
+        emitter << YAML::Key << physical_chip_id;
+        emitter << YAML::Value;
+        emitter << YAML::Flow << YAML::BeginSeq;
+        for (size_t dim = 0; dim < mesh_coord.dims(); ++dim) {
+            emitter << mesh_coord[dim];
+        }
+        emitter << YAML::EndSeq;
+    }
 
-    // Validate 1D can't be used with MESH or TORUS
-    TT_FATAL(
-        !(routing_mode & ROUTING_MODE_1D) || !(routing_mode & (ROUTING_MODE_MESH | ROUTING_MODE_TORUS)),
-        "1D routing mode cannot be combined with MESH or TORUS topology");
+    emitter << YAML::EndMap;
+    emitter << YAML::EndMap;
+    out_file << emitter.c_str();
+    out_file.close();
 
-    // Validate 2D can't be used with LINE or RING
-    TT_FATAL(
-        !(routing_mode & ROUTING_MODE_2D) || !(routing_mode & (ROUTING_MODE_LINE | ROUTING_MODE_RING)),
-        "2D routing mode cannot be combined with LINE or RING topology");
-
-    auto& control_plane = tt::tt_metal::MetalContext::instance().get_control_plane();
-    control_plane.set_routing_mode(routing_mode);
+    log_debug(tt::LogFabric, "Serialized physical chip mesh coordinate mapping to file: {}", output_file_path.string());
 }
 
-void set_routing_mode(Topology topology, tt::tt_fabric::FabricConfig fabric_config, uint32_t dimension /*, take more*/) {
-    // TODO: take more parameters to set detail routing mode
-    TT_FATAL(
-        dimension == 1 || dimension == 2 || dimension == 3,
-        "Invalid dimension {}. Supported dimensions are 1, 2, or 3",
-        dimension);
+void serialize_asic_to_fabric_node_mapping_to_file(
+    const TopologyMapper& topology_mapper, const std::filesystem::path& output_file_path) {
+    // Ensure output directory exists
+    std::filesystem::create_directories(output_file_path.parent_path());
 
-    uint16_t mode = (dimension == 3 ? ROUTING_MODE_3D : 0);
-    if (topology == Topology::Ring) {
-        mode |= (ROUTING_MODE_1D | ROUTING_MODE_RING);
-    } else if (topology == Topology::Linear) {
-        mode |= (ROUTING_MODE_1D | ROUTING_MODE_LINE);
-    } else if (topology == Topology::Mesh) {
-        mode |= (ROUTING_MODE_2D | ROUTING_MODE_MESH);
-    }
-    if (fabric_config == tt::tt_fabric::FabricConfig::FABRIC_2D_DYNAMIC) {
-        mode |= ROUTING_MODE_DYNAMIC;
-    } else {
-        mode |= ROUTING_MODE_LOW_LATENCY;
-    }
-    set_routing_mode(mode);
-}
+    const auto& mesh_graph = topology_mapper.get_mesh_graph();
+    const auto& physical_system_descriptor = topology_mapper.get_physical_system_descriptor();
 
-void get_optimal_noc_for_edm(
-    tt::tt_fabric::FabricEriscDatamoverBuilder& edm_builder1,
-    tt::tt_fabric::FabricEriscDatamoverBuilder& edm_builder2,
-    const uint32_t num_links,
-    const tt_fabric::Topology topology) {
-    constexpr uint32_t ring_noc_selection_link_threshold = 3;
-    constexpr uint32_t line_noc_selection_link_threshold = 2;
-    bool enable_noc_selection_opt = false;
-    if (topology == tt_fabric::Topology::Ring) {
-        enable_noc_selection_opt =
-            (num_links > ring_noc_selection_link_threshold) && (edm_builder1.my_noc_y != edm_builder2.my_noc_y);
-    } else {
-        enable_noc_selection_opt =
-            (num_links > line_noc_selection_link_threshold) && (edm_builder1.my_noc_y != edm_builder2.my_noc_y);
-    }
-    log_debug(
-        tt::LogTest,
-        "Fabric MeshId {} ChipId {} edm_builder1 {} {} is connecting to edm_builder2 {} {} num links {}",
-        *(edm_builder1.local_fabric_node_id.mesh_id),
-        edm_builder1.local_fabric_node_id.chip_id,
-        edm_builder1.my_noc_x,
-        edm_builder1.my_noc_y,
-        edm_builder2.my_noc_x,
-        edm_builder2.my_noc_y,
-        num_links);
+    // Structure: hostname -> mesh_id -> umd_chip_id -> {asic_position, fabric_node_id, asic_id}
+    struct AsicMapping {
+        tt::tt_metal::TrayID tray_id;
+        tt::tt_metal::ASICLocation asic_location;
+        FabricNodeId fabric_node_id;
+        tt::tt_metal::AsicID asic_id;
+    };
+    std::map<HostName, std::map<MeshId, std::map<ChipId, AsicMapping>>> mappings_by_host_mesh_and_chip;
 
-    if (enable_noc_selection_opt) {
-        if (edm_builder1.my_noc_x < edm_builder2.my_noc_x) {
-            for (uint32_t i = 0; i < edm_builder1.config.num_receiver_channels; i++) {
-                edm_builder1.config.receiver_channel_forwarding_noc_ids[i] = 0;
-                edm_builder2.config.receiver_channel_forwarding_noc_ids[i] = 1;
-            }
-            for (uint32_t i = 0; i < edm_builder1.config.num_receiver_channels; i++) {
-                edm_builder1.config.receiver_channel_local_write_noc_ids[i] = 1;
-                edm_builder2.config.receiver_channel_local_write_noc_ids[i] = 1;
-            }
-            for (uint32_t i = 0; i < edm_builder1.config.num_sender_channels; i++) {
-                edm_builder1.config.sender_channel_ack_noc_ids[i] = 1;
-                edm_builder2.config.sender_channel_ack_noc_ids[i] = 0;
-            }
-        } else if (edm_builder1.my_noc_x > edm_builder2.my_noc_x) {
-            for (uint32_t i = 0; i < edm_builder1.config.num_receiver_channels; i++) {
-                edm_builder1.config.receiver_channel_forwarding_noc_ids[i] = 1;
-                edm_builder2.config.receiver_channel_forwarding_noc_ids[i] = 0;
-            }
-            for (uint32_t i = 0; i < edm_builder1.config.num_receiver_channels; i++) {
-                edm_builder1.config.receiver_channel_local_write_noc_ids[i] = 1;
-                edm_builder2.config.receiver_channel_local_write_noc_ids[i] = 1;
-            }
-            for (uint32_t i = 0; i < edm_builder1.config.num_sender_channels; i++) {
-                edm_builder1.config.sender_channel_ack_noc_ids[i] = 0;
-                edm_builder2.config.sender_channel_ack_noc_ids[i] = 1;
-            }
-        }
-    }
-}
+    // Iterate through all meshes
+    for (const auto& mesh_id : mesh_graph.get_all_mesh_ids()) {
+        // Iterate through all fabric nodes in this mesh
+        for (const auto& [_, chip_id] : mesh_graph.get_chip_ids(mesh_id)) {
+            FabricNodeId fabric_node_id(mesh_id, chip_id);
 
-IntraMeshAdjacencyMap build_mesh_adjacency_map(
-    const std::set<chip_id_t>& user_chip_ids,
-    const tt::tt_metal::distributed::MeshShape& mesh_shape,
-    std::function<std::vector<chip_id_t>(chip_id_t)> get_adjacent_chips_func,
-    std::optional<chip_id_t> start_chip_id /* = std::nullopt */) {
-    constexpr size_t CORNER_1D_ADJACENT_CHIPS = 1;
-    constexpr size_t CORNER_ADJACENT_CHIPS = 2;
-    constexpr size_t EDGE_ADJACENT_CHIPS = 3;
-    IntraMeshAdjacencyMap topology_info;
+            try {
+                // Get ASIC ID for this fabric node
+                tt::tt_metal::AsicID asic_id = topology_mapper.get_asic_id_from_fabric_node_id(fabric_node_id);
 
-    // Store mesh dimensions in topology info
-    topology_info.ns_size = mesh_shape[0];
-    topology_info.ew_size = mesh_shape[1];
+                // Get physical chip ID (UMD chip ID) for this fabric node
+                ChipId umd_chip_id = topology_mapper.get_physical_chip_id_from_fabric_node_id(fabric_node_id);
 
-    // Determine the starting chip ID for BFS (use first chip from mesh container unless specified)
-    chip_id_t chip_0 = start_chip_id.has_value() ? *start_chip_id : *user_chip_ids.begin();
+                // Get ASIC position (tray_id and asic_location) from physical system descriptor
+                tt::tt_metal::TrayID tray_id = physical_system_descriptor.get_tray_id(asic_id);
+                tt::tt_metal::ASICLocation asic_location = physical_system_descriptor.get_asic_location(asic_id);
 
-    // BFS to populate mesh of chips based on adjacency from chip 0
-    std::queue<chip_id_t> chip_queue;
-    std::unordered_set<chip_id_t> visited_chips;
-    chip_queue.push(chip_0);
-    visited_chips.insert(chip_0);
+                // Get hostname for this fabric node (mock: cluster descriptor filename)
+                HostName hostname =
+                    hostname_for_mapping_export(topology_mapper.get_hostname_for_fabric_node_id(fabric_node_id));
 
-    bool is_1d_mesh = (topology_info.ns_size == 1) || (topology_info.ew_size == 1);
-
-    while (!chip_queue.empty()) {
-        chip_id_t current_chip = chip_queue.front();
-        chip_queue.pop();
-
-        // Get adjacent chips using the provided adjacency function
-        std::vector<chip_id_t> adjacent_chips = get_adjacent_chips_func(current_chip);
-        // Count neighbours: CORNER_ADJACENT_CHIPS → corner, EDGE_ADJACENT_CHIPS → edge, INTERIOR_ADJACENT_CHIPS →
-        // interior (we treat only links with ≥ num_ports_per_side lanes as neighbours)
-        bool is_corner = false;
-
-        if (is_1d_mesh) {
-            // For 1D meshes, corners have exactly 1 adjacent chip (endpoints)
-            is_corner = (adjacent_chips.size() == CORNER_1D_ADJACENT_CHIPS);
-        } else {
-            // For 2D meshes, corners have exactly 2 adjacent chips
-            is_corner = (adjacent_chips.size() == CORNER_ADJACENT_CHIPS);
-        }
-
-        if (is_corner) {
-            // NOTE: First one added is the corner closest to chip 0
-            //       this will be the pinned nw corner
-            topology_info.corners.push_back(current_chip);
-        } else if (adjacent_chips.size() == EDGE_ADJACENT_CHIPS) {
-            topology_info.edges.push_back(current_chip);
-        }
-
-        for (const auto& adjacent_chip : adjacent_chips) {
-            // Add chip to adjacent chips map
-            topology_info.adjacency_map[current_chip].push_back(adjacent_chip);
-
-            if (visited_chips.find(adjacent_chip) != visited_chips.end()) {
+                // Add to the mapping structure, indexed by umd_chip_id (physical chip ID)
+                AsicMapping mapping{tray_id, asic_location, fabric_node_id, asic_id};
+                mappings_by_host_mesh_and_chip[hostname][mesh_id].emplace(umd_chip_id, mapping);
+            } catch (...) {
+                // Skip unmapped fabric nodes
                 continue;
             }
-
-            // Add chip to queue and visited next set
-            chip_queue.push(adjacent_chip);
-            visited_chips.insert(adjacent_chip);
         }
     }
 
-    return topology_info;
-}
-
-std::vector<chip_id_t> convert_1d_mesh_adjacency_to_row_major_vector(const IntraMeshAdjacencyMap& topology_info) {
-    // For consistency across invocations on the same machine always start the DFS on the chip with the lowest id.
-    auto first_chip = std::min_element(topology_info.adjacency_map.begin(), topology_info.adjacency_map.end())->first;
-
-    // This vector contains a 1D view of devices in the mesh, constructed using DFS. This works since we are using a
-    // mesh topology which guarantees connectivity.
-    std::vector<chip_id_t> physical_chip_ids;
-    create_1d_mesh_view_with_dfs(
-        topology_info.adjacency_map, first_chip, topology_info.ns_size * topology_info.ew_size, physical_chip_ids);
-    return physical_chip_ids;
-}
-
-std::vector<chip_id_t> convert_2d_mesh_adjacency_to_row_major_vector(
-    const IntraMeshAdjacencyMap& topology_info, std::optional<chip_id_t> nw_corner_chip_id) {
-    // Check number of corners for 2D meshes
-    TT_FATAL(
-        topology_info.corners.size() == 4, "Expected 4 corners for 2D mesh, got {}.", topology_info.corners.size());
-
-    // Determine the northwest corner
-    chip_id_t nw_corner;
-    if (nw_corner_chip_id.has_value()) {
-        // Use the provided northwest corner chip ID if it's valid
-        nw_corner = nw_corner_chip_id.value();
-        // Verify that the provided chip is actually a corner
-        TT_FATAL(
-            std::find(topology_info.corners.begin(), topology_info.corners.end(), nw_corner) !=
-                topology_info.corners.end(),
-            "Provided chip ID {} is not a corner chip. Expected one of: {}",
-            nw_corner,
-            [&topology_info]() {
-                std::string result;
-                for (size_t i = 0; i < topology_info.corners.size(); ++i) {
-                    if (i > 0) {
-                        result += ", ";
-                    }
-                    result += std::to_string(topology_info.corners[i]);
-                }
-                return result;
-            }());
-    } else {
-        // Default behavior: use the first corner found (closest to chip 0)
-        nw_corner = topology_info.corners[0];
+    // Write to file using YAML emitter
+    std::ofstream out_file(output_file_path);
+    if (!out_file.is_open()) {
+        TT_THROW("Failed to open output file: {}", output_file_path.string());
     }
 
-    std::vector<chip_id_t> physical_chip_ids(topology_info.ns_size * topology_info.ew_size);
+    YAML::Emitter emitter;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "asic_to_fabric_node_mapping";
+    emitter << YAML::Value;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "hostnames";
+    emitter << YAML::Value << YAML::BeginSeq;
 
-    // Place northwest corner at (0, 0)
-    physical_chip_ids[0] = nw_corner;
+    // Emit each hostname as a list item
+    for (const auto& [hostname, mesh_mappings] : mappings_by_host_mesh_and_chip) {
+        emitter << YAML::BeginMap;
+        emitter << YAML::Key << "hostname";
+        emitter << YAML::Value << hostname;
 
-    // -----------------------------------------------------------------------------
-    // Corner discovery complete: we now have four corners, NW is fixed at index 0
-    // -----------------------------------------------------------------------------
+        // Emit mesh as a key with a list value
+        emitter << YAML::Key << "mesh";
+        emitter << YAML::Value << YAML::BeginSeq;
 
-    // Step 1: BFS from the NW corner to get Manhattan distances dNW[chip].
+        // Emit each mesh within this hostname
+        for (const auto& [mesh_id, chip_mappings] : mesh_mappings) {
+            // First emit mesh entry
+            emitter << YAML::BeginMap;
+            emitter << YAML::Key << "mesh";
+            emitter << YAML::Value << *mesh_id;
+            emitter << YAML::EndMap;
 
-    // Pre-compute signed mesh dimensions once to avoid repetitive casts.
-    const int mesh_cols = static_cast<int>(topology_info.ew_size);
-    const int mesh_rows = static_cast<int>(topology_info.ns_size);
+            // Then emit chips entry
+            emitter << YAML::BeginMap;
+            emitter << YAML::Key << "chips";
+            emitter << YAML::Value << YAML::BeginSeq;
 
-    // 1) Distances from NW corner.
-    auto dist_from_nw = compute_distances(nw_corner, topology_info.adjacency_map);
+            // Emit each umd_chip_id mapping (physical chip ID)
+            for (const auto& [umd_chip_id, mapping] : chip_mappings) {
+                emitter << YAML::BeginMap;
 
-    // 2) Identify the NE corner (distance of mesh_ew_size-1 from NW) and run a second
-    //    BFS from it to obtain dNE[chip].
-    chip_id_t ne_corner = nw_corner;  // initialise
-    bool ne_found = false;
-    for (auto corner : topology_info.corners) {
-        if (corner == nw_corner) {
-            continue;
-        }
-        auto it = dist_from_nw.find(corner);
-        if (it != dist_from_nw.end() && it->second == topology_info.ew_size - 1) {
-            ne_corner = corner;
-            ne_found = true;
-            break;
-        }
-    }
-    if (!ne_found) {
-        // Fall back: pick any other corner; grid may be square so distance == mesh_ew_size-1 may not hold.
-        for (auto corner : topology_info.corners) {
-            if (corner != nw_corner) {
-                ne_corner = corner;
-                ne_found = true;
-                break;
+                // Emit umd_chip_id field
+                emitter << YAML::Key << "umd_chip_id";
+                emitter << YAML::Value << umd_chip_id;
+
+                // Emit asic_position
+                emitter << YAML::Key << "asic_position";
+                emitter << YAML::Value;
+                emitter << YAML::BeginMap;
+                emitter << YAML::Key << "tray_id";
+                emitter << YAML::Value << *mapping.tray_id;
+                emitter << YAML::Key << "asic_location";
+                emitter << YAML::Value << *mapping.asic_location;
+                emitter << YAML::EndMap;
+
+                // Emit fabric_node_id
+                emitter << YAML::Key << "fabric_node_id";
+                emitter << YAML::Value;
+                emitter << YAML::BeginMap;
+                emitter << YAML::Key << "mesh_id";
+                emitter << YAML::Value << *mapping.fabric_node_id.mesh_id;
+                emitter << YAML::Key << "chip_id";
+                emitter << YAML::Value << mapping.fabric_node_id.chip_id;
+                emitter << YAML::EndMap;
+
+                // Emit asic_id as the last field
+                emitter << YAML::Key << "asic_id";
+                emitter << YAML::Value << *mapping.asic_id;
+
+                emitter << YAML::EndMap;
             }
+
+            emitter << YAML::EndSeq;
+            emitter << YAML::EndMap;
+        }
+
+        emitter << YAML::EndSeq;
+        emitter << YAML::EndMap;
+    }
+
+    emitter << YAML::EndSeq;
+    emitter << YAML::EndMap;
+    emitter << YAML::EndMap;
+    out_file << emitter.c_str();
+    out_file.close();
+
+    log_debug(tt::LogFabric, "Serialized ASIC to Fabric node ID mapping to file: {}", output_file_path.string());
+}
+
+namespace {
+
+std::optional<PhysicalGroupingDescriptor> load_pgd_if_regular_file(const std::filesystem::path& path) {
+    if (std::filesystem::exists(path) && std::filesystem::is_regular_file(path)) {
+        log_info(tt::LogFabric, "Loaded physical groupings from: {}", path.string());
+        return PhysicalGroupingDescriptor(path);
+    }
+    return std::nullopt;
+}
+
+std::vector<std::filesystem::path> build_physical_grouping_descriptor_search_paths(
+    const tt::tt_metal::PhysicalSystemDescriptor* physical_system_descriptor) {
+    const char* cluster_name_env = std::getenv("TT_CLUSTER_NAME");
+    const std::string cluster_name = cluster_name_env != nullptr ? cluster_name_env : "";
+    const char* tt_metal_home_env = std::getenv("TT_METAL_HOME");
+    const std::string tt_metal_home = tt_metal_home_env != nullptr ? tt_metal_home_env : ".";
+
+    std::vector<std::filesystem::path> search_paths;
+    search_paths.reserve(3);
+    if (!cluster_name.empty()) {
+        search_paths.push_back(
+            std::filesystem::path("/data/scaleout_configs") / cluster_name /
+            (cluster_name + "_physical_grouping_descriptor.textproto"));
+        search_paths.push_back(
+            std::filesystem::path(tt_metal_home) / "tests" / "tt_metal" / "tt_fabric" / "physical_groupings" /
+            (cluster_name + "_physical_grouping_descriptor.textproto"));
+    }
+
+    std::string arch_cluster_filename = "default_physical_grouping_descriptor.textproto";
+    auto& context = tt::tt_metal::MetalContext::instance();
+    const auto& cluster = context.get_cluster();
+    const tt::tt_metal::ClusterType cluster_type = cluster.get_cluster_type();
+    const tt::ARCH arch = cluster.arch();
+    if (cluster_type == tt::tt_metal::ClusterType::GALAXY && arch == tt::ARCH::WORMHOLE_B0) {
+        arch_cluster_filename = "wh_bh_rev_c_galaxy_physical_grouping_descriptor.textproto";
+    } else if (
+        (cluster_type == tt::tt_metal::ClusterType::BLACKHOLE_GALAXY || cluster.is_ubb_galaxy()) &&
+        arch == tt::ARCH::BLACKHOLE) {
+        if (physical_system_descriptor != nullptr && physical_system_descriptor->is_bh_galaxy_rev_c()) {
+            arch_cluster_filename = "wh_bh_rev_c_galaxy_physical_grouping_descriptor.textproto";
+        } else {
+            arch_cluster_filename = "bh_galaxy_rev_ab_physical_grouping_descriptor.textproto";
+        }
+    } else if (cluster_type == tt::tt_metal::ClusterType::T3K && arch == tt::ARCH::WORMHOLE_B0) {
+        arch_cluster_filename = "wh_t3k_physical_grouping_descriptor.textproto";
+    }
+
+    search_paths.push_back(
+        std::filesystem::path(tt_metal_home) / "tests" / "tt_metal" / "tt_fabric" / "physical_groupings" /
+        arch_cluster_filename);
+    return search_paths;
+}
+
+}  // namespace
+
+PhysicalGroupingDescriptor find_and_load_physical_grouping_descriptor(
+    const std::optional<std::filesystem::path>& pgd_path,
+    const tt::tt_metal::PhysicalSystemDescriptor* physical_system_descriptor) {
+    if (pgd_path.has_value() && !pgd_path->empty()) {
+        if (auto loaded = load_pgd_if_regular_file(*pgd_path)) {
+            return *loaded;
+        }
+        TT_THROW("Physical Grouping Descriptor path provided but file does not exist: {}", pgd_path->string());
+    }
+
+    const char* pgd_path_env = std::getenv("TT_METAL_PHYSICAL_GROUPING_DESCRIPTOR_PATH");
+    if (pgd_path_env != nullptr && std::strlen(pgd_path_env) > 0) {
+        const std::filesystem::path explicit_path(pgd_path_env);
+        if (auto loaded = load_pgd_if_regular_file(explicit_path)) {
+            return *loaded;
+        }
+        TT_THROW(
+            "TT_METAL_PHYSICAL_GROUPING_DESCRIPTOR_PATH is set but file does not exist: {}", explicit_path.string());
+    }
+
+    const auto search_paths = build_physical_grouping_descriptor_search_paths(physical_system_descriptor);
+    for (const auto& path : search_paths) {
+        if (auto loaded = load_pgd_if_regular_file(path)) {
+            return *loaded;
         }
     }
-    TT_FATAL(
-        ne_found,
-        "Ethernet mesh discovered does not match expected shape {}x{}.",
-        topology_info.ew_size,
-        topology_info.ns_size);
 
-    // BFS from NE corner.
-    auto dist_from_ne = compute_distances(ne_corner, topology_info.adjacency_map);
+    const char* cluster_name_env = std::getenv("TT_CLUSTER_NAME");
+    std::string error_msg = "Could not find Physical Grouping Descriptor file. Searched:\n";
+    for (const auto& path : search_paths) {
+        error_msg += "  - " + path.string() + "\n";
+    }
+    if (cluster_name_env != nullptr && cluster_name_env[0] != '\0') {
+        error_msg += std::string("Cluster name from TT_CLUSTER_NAME: ") + cluster_name_env + "\n";
+    } else {
+        error_msg += "TT_CLUSTER_NAME not set\n";
+    }
+    throw std::runtime_error(error_msg);
+}
 
-    // Step 3: compute (row, col) for every chip using the distance formulas
-    std::fill(physical_chip_ids.begin(), physical_chip_ids.end(), static_cast<chip_id_t>(-1));
+std::optional<PhysicalGroupingDescriptor> try_find_and_load_physical_grouping_descriptor(
+    const std::optional<std::filesystem::path>& pgd_path,
+    const tt::tt_metal::PhysicalSystemDescriptor* physical_system_descriptor) {
+    try {
+        return find_and_load_physical_grouping_descriptor(pgd_path, physical_system_descriptor);
+    } catch (const std::exception& e) {
+        log_debug(tt::LogFabric, "Physical Grouping Descriptor not loaded (soft-skip): {}", e.what());
+        return std::nullopt;
+    }
+}
 
-    for (const auto& [chip, d_nw] : dist_from_nw) {
-        TT_FATAL(dist_from_ne.count(chip), "Mesh disconnected: chip {} missing in NE BFS.", chip);
-        int d_ne = static_cast<int>(dist_from_ne.at(chip));
-        int d_nw_int = static_cast<int>(d_nw);
-        // Solve the 2-equation system:
-        //   dNW = row + col
-        //   dNE = row + (mesh_cols-1 - col)
-        int col = (mesh_cols - 1 + d_nw_int - d_ne) / 2;
-        int row = d_nw_int - col;
+void serialize_intermesh_port_assignment_to_file(
+    const std::map<FabricNodeId, std::unordered_map<chan_id_t, RoutingDirection>>& exit_node_directions,
+    const std::map<FabricNodeId, std::unordered_map<chan_id_t, std::pair<FabricNodeId, chan_id_t>>>&
+        intermesh_chan_to_peer,
+    const std::filesystem::path& output_file_path) {
+    auto dir_to_str = [](RoutingDirection d) -> const char* {
+        switch (d) {
+            case RoutingDirection::N: return "N";
+            case RoutingDirection::E: return "E";
+            case RoutingDirection::S: return "S";
+            case RoutingDirection::W: return "W";
+            case RoutingDirection::Z: return "Z";
+            case RoutingDirection::C: return "C";
+            default: return "NONE";
+        }
+    };
 
-        TT_FATAL(row >= 0 && row < mesh_rows, "Row {} out of bounds.", row);
-        TT_FATAL(col >= 0 && col < mesh_cols, "Col {} out of bounds.", col);
-
-        size_t idx = static_cast<size_t>(row) * static_cast<size_t>(mesh_cols) + static_cast<size_t>(col);
-        TT_FATAL(physical_chip_ids[idx] == static_cast<chip_id_t>(-1), "Duplicate mapping at index {}.", idx);
-        physical_chip_ids[idx] = chip;
+    std::map<std::string, std::vector<std::string>> intermesh_port_assignment;
+    for (const auto& [my_fn, chan_map] : intermesh_chan_to_peer) {
+        std::vector<chan_id_t> chans;
+        chans.reserve(chan_map.size());
+        for (const auto& [c, _peer] : chan_map) {
+            chans.push_back(c);
+        }
+        std::sort(chans.begin(), chans.end());
+        for (auto c : chans) {
+            const auto& [peer_fn, peer_chan] = chan_map.at(c);
+            RoutingDirection dir = RoutingDirection::NONE;
+            if (auto dit = exit_node_directions.find(my_fn); dit != exit_node_directions.end()) {
+                if (auto cit = dit->second.find(c); cit != dit->second.end()) {
+                    dir = cit->second;
+                }
+            }
+            intermesh_port_assignment[fmt::format("M{}->M{}", *my_fn.mesh_id, *peer_fn.mesh_id)].push_back(fmt::format(
+                "D{}ch{}({})>M{}D{}ch{}",
+                my_fn.chip_id,
+                c,
+                dir_to_str(dir),
+                *peer_fn.mesh_id,
+                peer_fn.chip_id,
+                peer_chan));
+        }
+    }
+    for (auto& [_boundary, entries] : intermesh_port_assignment) {
+        std::sort(entries.begin(), entries.end());
     }
 
-    TT_FATAL(physical_chip_ids[0] == nw_corner, "NW corner not at index 0 after embedding.");
+    std::filesystem::create_directories(output_file_path.parent_path());
 
-    for (std::uint32_t i = 0; i < physical_chip_ids.size(); ++i) {
-        TT_FATAL(physical_chip_ids[i] != static_cast<chip_id_t>(-1), "Mesh embedding incomplete at index {}.", i);
+    std::ofstream out_file(output_file_path);
+    if (!out_file.is_open()) {
+        TT_THROW("Failed to open output file: {}", output_file_path.string());
     }
+    YAML::Emitter emitter;
+    emitter << YAML::BeginMap;
+    emitter << YAML::Key << "intermesh_port_assignment" << YAML::Value << YAML::BeginMap;
+    for (const auto& [boundary, entries] : intermesh_port_assignment) {
+        emitter << YAML::Key << boundary << YAML::Value << YAML::Flow << YAML::BeginSeq;
+        for (const auto& entry : entries) {
+            emitter << entry;
+        }
+        emitter << YAML::EndSeq;
+    }
+    emitter << YAML::EndMap;
+    emitter << YAML::EndMap;
+    out_file << emitter.c_str();
+    out_file.close();
 
-    return physical_chip_ids;
+    log_debug(tt::LogFabric, "Serialized inter-mesh port assignment to file: {}", output_file_path.string());
 }
 
 }  // namespace tt::tt_fabric

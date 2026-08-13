@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2023 Tenstorrent Inc.
+// SPDX-FileCopyrightText: © 2023 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -24,23 +24,23 @@
 #include <variant>
 #include <vector>
 
-#include <tt-metalium/assert.hpp>
+#include <tt_stl/assert.hpp>
 #include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/data_types.hpp>
+#include <tt-metalium/kernel_types.hpp>
 #include <tt-metalium/device.hpp>
 #include "mesh_dispatch_fixture.hpp"
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/hal_types.hpp>
 #include "hostdevcommon/common_values.hpp"
 #include "hostdevcommon/kernel_structs.h"
-#include <tt-metalium/kernel_types.hpp>
 #include <tt-logger/tt-logger.hpp>
 #include "matmul_test_utils.hpp"
 #include <tt-metalium/program.hpp>
 #include <tt_stl/span.hpp>
 #include <tt-metalium/tt_backend_api_types.hpp>
 #include "tt_metal/test_utils/deprecated/tensor.hpp"
+#include <tt-metalium/tensor_accessor_args.hpp>
 
 namespace tt::tt_metal {
 
@@ -61,13 +61,13 @@ std::tuple<
     uint32_t,
     uint32_t>
 create_program(
-    std::shared_ptr<distributed::MeshDevice> mesh_device,
+    const std::shared_ptr<distributed::MeshDevice>& /*mesh_device*/,
     int start_core_x,
     int start_core_y,
     int num_cores_r,
     int num_cores_c,
-    int M,
-    int N,
+    int /*M*/,
+    int /*N*/,
     int K,
     int in0_block_w,
     int out_subblock_h,
@@ -78,7 +78,7 @@ create_program(
     auto device_range = distributed::MeshCoordinateRange(zero_coord, zero_coord);
     distributed::MeshWorkload workload;
     Program program = tt_metal::CreateProgram();
-    distributed::AddProgramToMeshWorkload(workload, std::move(program), device_range);
+    workload.add_program(device_range, std::move(program));
     auto& program_ = workload.get_programs().at(device_range);
 
     uint32_t single_tile_size = 2 * 1024;
@@ -133,7 +133,7 @@ create_program(
                 tt_metal::CircularBufferConfig(
                     cb0_tiles * single_tile_size, {{src0_cb_index, tt::DataFormat::Float16_b}})
                     .set_page_size(src0_cb_index, single_tile_size);
-            auto cb_src0 = tt_metal::CreateCircularBuffer(program_, core, cb_src0_config);
+            tt_metal::CreateCircularBuffer(program_, core, cb_src0_config);
 
             uint32_t src1_cb_index = tt::CBIndex::c_1;
             uint32_t cb1_tiles = in1_block_tiles * 2;  // double buffer
@@ -141,58 +141,84 @@ create_program(
                 tt_metal::CircularBufferConfig(
                     cb1_tiles * single_tile_size, {{src1_cb_index, tt::DataFormat::Float16_b}})
                     .set_page_size(src1_cb_index, single_tile_size);
-            auto cb_src1 = tt_metal::CreateCircularBuffer(program_, core, cb_src1_config);
+            tt_metal::CreateCircularBuffer(program_, core, cb_src1_config);
 
             CoreRangeSet cores(std::set<CoreRange>{CoreRange(core, core)});
             tt_metal::CircularBufferConfig cb_output_config =
                 tt_metal::CircularBufferConfig(out_CB_size, partials_and_out_data_format_spec)
                     .set_page_size(ouput_cb_index, single_tile_size)
                     .set_page_size(interm0_cb_index, single_tile_size);
-            auto cb_output = tt_metal::CreateCircularBuffer(program_, cores, cb_output_config);
+            tt_metal::CreateCircularBuffer(program_, cores, cb_output_config);
         }
     }
 
+    std::vector<uint32_t> reader_ss_cta;
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_ss_cta);
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_ss_cta);
     auto mm_reader_kernel_in0_sender_in1_sender = tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_matmul_tile_layout_in0_sender_in1_sender.cpp",
         in0_sender_in1_sender,
         tt_metal::DataMovementConfig{
-            .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = tt_metal::NOC::RISCV_0_default});
+            .processor = tt_metal::DataMovementProcessor::RISCV_1,
+            .noc = tt_metal::NOC::RISCV_0_default,
+            .compile_args = reader_ss_cta});
 
+    std::vector<uint32_t> reader_sr_cta;
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_sr_cta);
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_sr_cta);
     auto mm_reader_kernel_in0_sender_in1_receiver = tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_matmul_tile_layout_in0_sender_in1_receiver.cpp",
         in0_sender_in1_receiver,
         tt_metal::DataMovementConfig{
-            .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = tt_metal::NOC::RISCV_0_default});
+            .processor = tt_metal::DataMovementProcessor::RISCV_1,
+            .noc = tt_metal::NOC::RISCV_0_default,
+            .compile_args = reader_sr_cta});
 
+    std::vector<uint32_t> reader_rs_cta;
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_rs_cta);
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_rs_cta);
     auto mm_reader_kernel_in0_receiver_in1_sender = tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_matmul_tile_layout_in0_receiver_in1_sender.cpp",
         in0_receiver_in1_sender,
         tt_metal::DataMovementConfig{
-            .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = tt_metal::NOC::RISCV_1_default});
+            .processor = tt_metal::DataMovementProcessor::RISCV_1,
+            .noc = tt_metal::NOC::RISCV_1_default,
+            .compile_args = reader_rs_cta});
 
+    std::vector<uint32_t> reader_rr_cta;
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_rr_cta);
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(reader_rr_cta);
     auto mm_reader_kernel_in0_receiver_in1_receiver = tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_matmul_tile_layout_in0_receiver_in1_receiver.cpp",
         in0_receiver_in1_receiver,
         tt_metal::DataMovementConfig{
-            .processor = tt_metal::DataMovementProcessor::RISCV_1, .noc = tt_metal::NOC::RISCV_1_default});
+            .processor = tt_metal::DataMovementProcessor::RISCV_1,
+            .noc = tt_metal::NOC::RISCV_1_default,
+            .compile_args = reader_rr_cta});
 
+    std::vector<uint32_t> writer_cta;
+    tt::tt_metal::TensorAccessorArgs::create_dram_interleaved().append_to(writer_cta);
     auto unary_writer_kernel_noc0 = tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_matmul_tile_layout.cpp",
         all_except_left_column,
         tt_metal::DataMovementConfig{
-            .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = tt_metal::NOC::RISCV_0_default});
+            .processor = tt_metal::DataMovementProcessor::RISCV_0,
+            .noc = tt_metal::NOC::RISCV_0_default,
+            .compile_args = writer_cta});
 
     auto unary_writer_kernel_noc1 = tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_matmul_tile_layout.cpp",
         left_column,
         tt_metal::DataMovementConfig{
-            .processor = tt_metal::DataMovementProcessor::RISCV_0, .noc = tt_metal::NOC::RISCV_1_default});
+            .processor = tt_metal::DataMovementProcessor::RISCV_0,
+            .noc = tt_metal::NOC::RISCV_1_default,
+            .compile_args = writer_cta});
 
     int num_blocks = (K / in0_block_w);
 
@@ -222,7 +248,7 @@ create_program(
         uint(out_subblock_w),
         uint(out_subblock_num_tiles)};
 
-    auto mm_kernel = tt_metal::CreateKernel(
+    tt_metal::CreateKernel(
         program_,
         "tests/tt_metal/tt_metal/test_kernels/compute/matmul_large_block_zm.cpp",
         all_cores,
@@ -248,7 +274,7 @@ create_program(
 }
 
 bool write_runtime_args_to_device(
-    std::shared_ptr<distributed::MeshDevice> mesh_device,
+    const std::shared_ptr<distributed::MeshDevice>& mesh_device,
     distributed::MeshWorkload& workload,
     int start_core_x,
     int start_core_y,
@@ -366,10 +392,10 @@ bool write_runtime_args_to_device(
                 (std::uint32_t)in1_mcast_sender_semaphore_id,
                 (std::uint32_t)in1_mcast_receiver_semaphore_id};
             std::vector<uint32_t> writer_args = {
-                (std::uint32_t)out_dram_addr,                                          // out_tensor_addr
-                (std::uint32_t)core_idx_x * per_core_N + core_idx_y * per_core_M * N,  // out_tensor_start_tile_id
-                (std::uint32_t)1,                                                      // out_tensor_stride_w
-                (std::uint32_t)N,                                                      // out_tensor_stride_h
+                (std::uint32_t)out_dram_addr,                                              // out_tensor_addr
+                ((std::uint32_t)core_idx_x * per_core_N) + (core_idx_y * per_core_M * N),  // out_tensor_start_tile_id
+                (std::uint32_t)1,                                                          // out_tensor_stride_w
+                (std::uint32_t)N,                                                          // out_tensor_stride_h
                 (std::uint32_t)out_subblock_w,      // out_tensor_next_subblock_stride_w
                 (std::uint32_t)out_subblock_h * N,  // out_tensor_next_subblock_stride_h
 
@@ -403,7 +429,7 @@ bool write_runtime_args_to_device(
     return pass;
 }
 
-bool matmul_multi_core_multi_dram_in0_mcast_in1_mcast(std::shared_ptr<distributed::MeshDevice> mesh_device) {
+bool matmul_multi_core_multi_dram_in0_mcast_in1_mcast(const std::shared_ptr<distributed::MeshDevice>& mesh_device) {
     bool pass = true;
     int start_core_x = 0;
     int start_core_y = 0;
@@ -477,13 +503,13 @@ bool matmul_multi_core_multi_dram_in0_mcast_in1_mcast(std::shared_ptr<distribute
     log_debug(LogTest, "Scattering inputs (activation & weights) to dram channels using tiled layout");
     auto activations_tilized = tilize_swizzled(tensor.get_values(), M * 32, K * 32);
     auto activations_tile_layout =
-        convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(activations_tilized));
+        convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(activations_tilized));
     auto activations = pack_bfloat16_vec_into_uint32_vec(activations_tile_layout);
-    auto device = mesh_device->get_devices()[0];
+    auto* device = mesh_device->get_devices()[0];
     pass &= move_tiles_to_dram(device, activations, M, K, in0_dram_addr);
 
     auto identity_tilized = tilize_swizzled(identity, K * 32, N * 32);
-    auto weights_tile_layout = convert_layout_tile_swizzled_to_tile_nfaces(tt::stl::make_const_span(identity_tilized));
+    auto weights_tile_layout = convert_layout_tile_swizzled_to_tile_nfaces(ttsl::make_const_span(identity_tilized));
     auto weights = pack_bfloat16_vec_into_uint32_vec(weights_tile_layout);
     pass &= move_tiles_to_dram(device, weights, K, N, in1_dram_addr);
     log_debug(LogTest, "Copying inputs to dram complete");
@@ -531,14 +557,14 @@ bool matmul_multi_core_multi_dram_in0_mcast_in1_mcast(std::shared_ptr<distribute
         auto row = tt_metal::get_row_slice(golden, M, i, M * 32, N * 32);
         for (int j = 0; j < N; j++) {
             auto golden_tile = tt_metal::get_col_slice(row, N, j, 32, N * 32);
-            int tile_id = i * N + j;
+            int tile_id = (i * N) + j;
             int dram_bank = tile_id % device->num_dram_channels();
             uint32_t dram_address = ((tile_id / device->num_dram_channels()) * single_tile_size) + out_dram_addr;
             std::vector<uint32_t> result_vec;
             tt_metal::detail::ReadFromDeviceDRAMChannel(device, dram_bank, dram_address, single_tile_size, result_vec);
             auto result_bfp16 = unpack_uint32_vec_into_bfloat16_vec(result_vec);
             auto result_flat_layout =
-                convert_layout_tile_nfaces_to_tile_swizzled(tt::stl::make_const_span(result_bfp16));
+                convert_layout_tile_nfaces_to_tile_swizzled(ttsl::make_const_span(result_bfp16));
 
             // log_info(LogTest, "Tile id {} on dram bank {}, address {}", tile_id, dram_bank, dram_address);
             // print_vec_of_bfloat16(result_flat_layout, 1, "Result - tile#" + std::to_string(tile_id));
@@ -556,9 +582,9 @@ TEST_F(MeshDispatchFixture, TensixMatmulMultiCoreMultiDRAMIn0MCastIn1MCast) {
         log_info(tt::LogTest, "This test is only supported in slow dispatch mode");
         GTEST_SKIP();
     }
-    for (unsigned int id = 0; id < devices_.size(); id++) {
+    for (const auto& device : devices_) {
         ASSERT_TRUE(unit_tests_common::matmul::test_matmul_multi_core_multi_dram_in0_mcast_in1_mcast::
-                        matmul_multi_core_multi_dram_in0_mcast_in1_mcast(devices_.at(id)));
+                        matmul_multi_core_multi_dram_in0_mcast_in1_mcast(device));
     }
 }
 

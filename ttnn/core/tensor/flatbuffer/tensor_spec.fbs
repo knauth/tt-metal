@@ -25,6 +25,7 @@ enum TensorMemoryLayout: ushort {
     HeightSharded = 2,
     WidthSharded = 3,
     BlockSharded = 4,
+    NdSharded = 5,
 }
 
 enum BufferType: ushort {
@@ -43,9 +44,10 @@ enum ShardOrientation : ubyte {
 enum ShardDistributionStrategy : ubyte {
     ROUND_ROBIN_1D = 0,
     GRID_2D = 1,
+    CONTIGUOUS_1D = 2,
 }
 
-enum ShardMode : ubyte {
+enum ShardModeDeprecated : ubyte {
     Physical,
     Logical,
 }
@@ -60,8 +62,8 @@ table ShardSpec {
     shape_h: uint32;
     shape_w: uint32;
     orientation: ShardOrientation;
-    shard_mode: ShardMode;
-    physical_shard_shape: ShardShape;
+    shard_mode_deprecated: ShardModeDeprecated;
+    physical_shard_shape_deprecated: ShardShape;
 }
 
 table NdShardSpec {
@@ -80,7 +82,8 @@ enum DataType : ubyte {
     UInt8 = 5,
     UInt16 = 6,
     Int32 = 7,
-    Invalid = 8
+    Int8 = 8,
+    Invalid = 9
 }
 
 table RowMajorPageConfig {}
@@ -99,6 +102,7 @@ table MemoryConfig {
     shard_spec: ShardSpec;
     nd_shard_spec: NdShardSpec;
     created_with_nd_shard_spec: bool;
+    per_core_allocation: bool = false;
 }
 
 table TensorLayout {

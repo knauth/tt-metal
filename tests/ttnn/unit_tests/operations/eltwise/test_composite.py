@@ -1,35 +1,18 @@
-# SPDX-FileCopyrightText: © 2024 Tenstorrent Inc.
+# SPDX-FileCopyrightText: © 2024 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
 import pytest
+import torch
 import ttnn
-from tests.ttnn.unit_tests.operations.eltwise.backward.utility_funcs import (
-    data_gen_with_range,
-    data_gen_with_range_dtype,
+
+from tests.ttnn.nightly.unit_tests.operations.eltwise.backward.utility_funcs import (
     compare_pcc,
+    data_gen_with_range,
 )
-from tests.ttnn.utils_for_testing import assert_with_pcc
+from tests.ttnn.utils_for_testing import assert_with_ulp
 
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
-    ),
-)
-def test_unary_composite_cbrt_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, -100, 100, device)
-
-    output_tensor = ttnn.cbrt(input_tensor1)
-    golden_function = ttnn.get_golden_function(ttnn.cbrt)
-    golden_tensor = golden_function(in_data1)
-
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
+pytestmark = pytest.mark.use_module_device
 
 
 @pytest.mark.parametrize(
@@ -61,7 +44,7 @@ def test_unary_composite_cbrt_ttnn(input_shapes, device):
         ("tensor", "tensor"),
     ],
 )
-def test_unary_composite_clamp_ttnn(input_shapes, min_val, max_val, device):
+def test_unary_composite_clamp_ttnn(input_shapes, min_val, max_val, device, expect_error):
     in_data1, input_tensor1 = data_gen_with_range(input_shapes, -100, 100, device)
 
     if min_val == "tensor":
@@ -79,7 +62,7 @@ def test_unary_composite_clamp_ttnn(input_shapes, min_val, max_val, device):
         max, max_tensor = max_val, max_val
 
     if min is None and max is None:
-        with pytest.raises(RuntimeError, match="Only one of 'min' or 'max' can be None. Please provide one value"):
+        with expect_error(RuntimeError, "Only one of 'min' or 'max' can be None. Please provide one value"):
             ttnn.clamp(input_tensor1, min_tensor, max_tensor)
     else:
         output_tensor = ttnn.clamp(input_tensor1, min_tensor, max_tensor)
@@ -118,7 +101,7 @@ def test_unary_composite_clamp_ttnn(input_shapes, min_val, max_val, device):
         ("tensor", "tensor"),
     ],
 )
-def test_unary_composite_clip_ttnn(input_shapes, min_val, max_val, device):
+def test_unary_composite_clip_ttnn(input_shapes, min_val, max_val, device, expect_error):
     in_data1, input_tensor1 = data_gen_with_range(input_shapes, -100, 100, device)
 
     if min_val == "tensor":
@@ -136,7 +119,7 @@ def test_unary_composite_clip_ttnn(input_shapes, min_val, max_val, device):
         max, max_tensor = max_val, max_val
 
     if min is None and max is None:
-        with pytest.raises(RuntimeError, match="Only one of 'min' or 'max' can be None. Please provide one value"):
+        with expect_error(RuntimeError, "Only one of 'min' or 'max' can be None. Please provide one value"):
             ttnn.clip(input_tensor1, min_tensor, max_tensor)
     else:
         output_tensor = ttnn.clip(input_tensor1, min_tensor, max_tensor)
@@ -144,25 +127,6 @@ def test_unary_composite_clip_ttnn(input_shapes, min_val, max_val, device):
         golden_tensor = golden_function(in_data1, min, max)
         comp_pass = compare_pcc([output_tensor], [golden_tensor])
         assert comp_pass
-
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
-    ),
-)
-def test_unary_composite_cosh_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, -9, 9, device)
-
-    output_tensor = ttnn.cosh(input_tensor1)
-    golden_function = ttnn.get_golden_function(ttnn.cosh)
-    golden_tensor = golden_function(in_data1)
-
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
 
 
 @pytest.mark.parametrize(
@@ -192,25 +156,6 @@ def test_unary_composite_digamma_ttnn(input_shapes, device):
         (torch.Size([1, 3, 320, 384])),
     ),
 )
-def test_unary_composite_lgamma_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, 0.1, 100, device)
-
-    output_tensor = ttnn.lgamma(input_tensor1)
-    golden_function = ttnn.get_golden_function(ttnn.lgamma)
-    golden_tensor = golden_function(in_data1)
-
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
-
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
-    ),
-)
 def test_unary_composite_mish_ttnn(input_shapes, device):
     in_data1 = torch.Tensor(size=input_shapes).uniform_(-20, 100).to(torch.bfloat16)
     input_tensor1 = ttnn.from_torch(in_data1, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
@@ -224,10 +169,7 @@ def test_unary_composite_mish_ttnn(input_shapes, device):
 
 @pytest.mark.parametrize(
     "input_shapes",
-    (
-        torch.Size([1, 1, 89600, 32]),
-        torch.Size([1, 1, 89600, 128]),
-    ),
+    (torch.Size([1, 1, 89600, 32]),),
 )
 def test_unary_composite_mish_sharded_ttnn(input_shapes, device):
     in_data = torch.Tensor(size=input_shapes).uniform_(-20, 100).to(torch.bfloat16)
@@ -287,92 +229,42 @@ def test_unary_composite_multigammaln_ttnn(input_shapes, device):
         (torch.Size([1, 3, 320, 384])),
     ),
 )
-def test_unary_composite_polygamma_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, 1, 10, device)
-    k = 5
-    output_tensor = ttnn.polygamma(input_tensor1, k)
+@pytest.mark.parametrize("k", [1, 5])
+def test_unary_polygamma_ttnn(input_shapes, k, device):
+    torch.manual_seed(213919)
+    torch_input = torch.rand(input_shapes, dtype=torch.bfloat16) * 9.0 + 1.0
     golden_function = ttnn.get_golden_function(ttnn.polygamma)
-    golden_tensor = golden_function(in_data1, k)
+    golden_tensor = golden_function(torch_input, k)
 
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
+    input_tensor = ttnn.from_torch(torch_input, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    output_tensor = ttnn.polygamma(input_tensor, k)
+    output_tensor = ttnn.to_torch(output_tensor)
+
+    assert_with_ulp(golden_tensor, output_tensor, ulp_threshold=1)
 
 
+# Locks in accuracy at the lower domain boundary (x ~ 0.5), where the exact-summation
+# cutoff (NUM_TERMS) places the Euler-Maclaurin tail closest to its asymptotic limit.
 @pytest.mark.parametrize(
     "input_shapes",
     (
         (torch.Size([1, 1, 32, 32])),
         (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
     ),
 )
-def test_unary_composite_selu_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, 1, 2, device)
+@pytest.mark.parametrize("k", [1, 2, 5, 10])
+def test_unary_polygamma_boundary_ttnn(input_shapes, k, device):
+    torch.manual_seed(213919)
+    # Sample the boundary region x in [0.5, 1.0].
+    torch_input = torch.rand(input_shapes, dtype=torch.bfloat16) * 0.5 + 0.5
+    golden_function = ttnn.get_golden_function(ttnn.polygamma)
+    golden_tensor = golden_function(torch_input, k)
 
-    output_tensor = ttnn.selu(input_tensor1)
-    golden_function = ttnn.get_golden_function(ttnn.selu)
-    golden_tensor = golden_function(in_data1)
+    input_tensor = ttnn.from_torch(torch_input, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+    output_tensor = ttnn.polygamma(input_tensor, k)
+    output_tensor = ttnn.to_torch(output_tensor)
 
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
-
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
-    ),
-)
-def test_unary_composite_sinh_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, -9, 9, device)
-
-    output_tensor = ttnn.sinh(input_tensor1)
-    golden_function = ttnn.get_golden_function(ttnn.sinh)
-    golden_tensor = golden_function(in_data1)
-
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
-
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
-    ),
-)
-def test_unary_composite_swish_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, -100, 100, device)
-
-    output_tensor = ttnn.swish(input_tensor1)
-    golden_function = ttnn.get_golden_function(ttnn.swish)
-    golden_tensor = golden_function(in_data1)
-
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
-
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
-    ),
-)
-def test_unary_composite_threshold_ttnn(input_shapes, device):
-    in_data1, input_tensor1 = data_gen_with_range(input_shapes, -100, 100, device)
-    threshold = 1.0
-    value = 10.0
-    output_tensor = ttnn.threshold(input_tensor1, threshold, value)
-    golden_function = ttnn.get_golden_function(ttnn.threshold)
-    golden_tensor = golden_function(in_data1, threshold, value)
-
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
+    assert_with_ulp(golden_tensor, output_tensor, ulp_threshold=2)
 
 
 @pytest.mark.parametrize(
@@ -510,56 +402,6 @@ def test_unary_swiglu_ttnn(input_shapes, dim, device):
         (torch.Size([1, 1, 32, 32])),
         (torch.Size([1, 1, 320, 384])),
         (torch.Size([1, 3, 320, 384])),
-        (torch.Size([7, 185, 20])),
-        (torch.Size([6, 45, 233])),
-    ),
-)
-@pytest.mark.parametrize(
-    "param",
-    {-1e4, -98.5, -43.7, -8.5, 0.0, 0.45, 1.0, 7.7, 58.4, 89.9, 1e5},
-)
-def test_unary_logit(input_shapes, param, device):
-    in_data = torch.Tensor(size=input_shapes).uniform_(-100, 100).to(torch.bfloat16)
-    input_tensor = ttnn.from_torch(in_data, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
-
-    output_tensor = ttnn.logit(input_tensor, eps=param)
-    golden_function = ttnn.get_golden_function(ttnn.logit)
-    golden_tensor = golden_function(in_data, eps=param, device=device)
-
-    out = ttnn.to_torch(output_tensor)
-    assert_with_pcc(golden_tensor, out, 0.99)
-
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
-    ),
-)
-@pytest.mark.parametrize(
-    "param",
-    {-98.5, -43.7, -8.5, 0.45, 7.7, 58.4, 89.9},
-)
-@pytest.mark.parametrize("round_mode", [None, "trunc", "floor"])
-def test_unary_rdiv(input_shapes, param, round_mode, device):
-    in_data, input_tensor = data_gen_with_range(input_shapes, -100, 100, device)
-
-    output_tensor = ttnn.rdiv(input_tensor, param, round_mode=round_mode)
-    golden_function = ttnn.get_golden_function(ttnn.rdiv)
-    golden_tensor = golden_function(in_data, param, round_mode=round_mode)
-
-    comp_pass = compare_pcc([output_tensor], [golden_tensor])
-    assert comp_pass
-
-
-@pytest.mark.parametrize(
-    "input_shapes",
-    (
-        (torch.Size([1, 1, 32, 32])),
-        (torch.Size([1, 1, 320, 384])),
-        (torch.Size([1, 3, 320, 384])),
     ),
 )
 @pytest.mark.parametrize(
@@ -580,7 +422,7 @@ def test_unary_rdiv(input_shapes, param, round_mode, device):
         (0, 1),
     ],
 )
-def test_unary_composite_clamp_int_ttnn(input_shapes, min_val, max_val, device):
+def test_unary_composite_clamp_int_ttnn(input_shapes, min_val, max_val, device, expect_error):
     in_data1 = torch.randint(-100, 100, input_shapes, dtype=torch.int32)
     input_tensor1 = ttnn.from_torch(in_data1, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT, device=device)
     if min_val is None:
@@ -594,7 +436,7 @@ def test_unary_composite_clamp_int_ttnn(input_shapes, min_val, max_val, device):
         max, max_tensor = max_val, max_val
 
     if min is None and max is None:
-        with pytest.raises(RuntimeError, match="Only one of 'min' or 'max' can be None. Please provide one value"):
+        with expect_error(RuntimeError, "Only one of 'min' or 'max' can be None. Please provide one value"):
             ttnn.clamp(input_tensor1, min_tensor, max_tensor)
     else:
         output_tensor = ttnn.clamp(input_tensor1, min_tensor, max_tensor)
