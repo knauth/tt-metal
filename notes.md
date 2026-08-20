@@ -1,5 +1,11 @@
 ## Repo Assist Memory
 
+Last checked: 2026-08-20T07:09 UTC (run 32342600209)
+
+- Confirmed AGAIN live: 0 open issues, 0 open PRs, and search_issues for "[repo-assist] Monthly Activity" + label:automation returns 0 results (5th consecutive run this issue is invisible after prior create_issue "success" responses).
+- Per prior run's escalation plan: STOPPED retrying create_issue blindly this run. Called safeoutputs missing_tool instead, reporting the persistent create_issue/visibility discrepancy as a likely pipeline bug. Do not call create_issue again for this monthly-activity issue until a future run shows it visible, or a maintainer/comment indicates otherwise.
+- No other repo-assist tasks were actionable (empty backlog). Called noop for this run's mandatory safe-output.
+
 Last checked: 2026-08-19T18:58 UTC (run 32290060639)
 
 - Checked knauth/tt-metal: 0 open issues, 0 open PRs (confirmed via github MCP list_issues, list_pull_requests state=all/open, and search_issues, live query).
